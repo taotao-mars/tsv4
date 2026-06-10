@@ -11,6 +11,7 @@
 # Purpose: stabilize point exposure forecasts and learn joint 20-week exposure regimes.
 # Long-run balanced preset:
 #   - category_code is kept
+#   - ind_top10_brand is added as a direct binary static/context/encoder feature
 #   - channel-specific zero loss is softened to avoid systematic underprediction
 #   - mean-level penalty is slightly stronger to keep overall ratio near 1
 #   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
@@ -35,8 +36,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.neighbors import NearestNeighbors
 
 
 torch.manual_seed(42)
@@ -277,6 +276,15 @@ def _encode_static_features(df):
         ).clip(0, 1)
         out_cols.append("stock_static__ind_new_asin")
 
+    # ── 新增：ind_top10_brand（binary，静态）─────────────────
+    # 上面的 categorical encoder 仍保留 code/freq；这里额外保留原始0/1信号。
+    if "ind_top10_brand" in df.columns:
+        df["stock_static__ind_top10_brand"] = _safe_numeric(
+            df["ind_top10_brand"]
+        ).fillna(0.0).clip(0, 1)
+        if "stock_static__ind_top10_brand" not in out_cols:
+            out_cols.append("stock_static__ind_top10_brand")
+
     return df, out_cols
 
 
@@ -380,206 +388,7 @@ def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4)
     return out, event_cols
 
 
-
-def _spell_lengths(mask):
-    """Return lengths of consecutive True spells."""
-    lengths = []
-    cur = 0
-    for v in np.asarray(mask).astype(bool):
-        if v:
-            cur += 1
-        else:
-            if cur > 0:
-                lengths.append(cur)
-            cur = 0
-    if cur > 0:
-        lengths.append(cur)
-    return lengths
-
-
-def _build_asin_graph_stats(df_hist):
-    """
-    Build leak-safe ASIN historical summary stats for neighbor graph features.
-
-    These stats are computed from historical rows only. In this single-window
-    setup, historical rows are rows before the final forecast holdout. They are
-    then reused as ASIN-level graph context for all training/validation windows.
-    """
-    rows = []
-    work = df_hist.copy()
-    work["asin"] = work["asin"].astype(str)
-    work["gl_product_group"] = work.get("gl_product_group", "MISSING").astype(str).fillna("MISSING")
-    work["category_code"] = work.get("category_code", "MISSING").astype(str).fillna("MISSING")
-
-    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph", "scot_oos", "ind_promotion", "our_price"]:
-        if c not in work.columns:
-            work[c] = 0.0
-        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0).clip(lower=0.0)
-
-    for asin, g in work.sort_values(["asin", "order_week"]).groupby("asin"):
-        y = g["in_stock_dph"].values.astype(float)
-        b = g["buy_box_dph"].values.astype(float)
-        d = g["fbi_demand"].values.astype(float)
-        oos = g["scot_oos"].values.astype(float)
-        promo = g["ind_promotion"].values.astype(float)
-        price = g["our_price"].values.astype(float)
-
-        active = y > 0
-        zero = ~active
-
-        active_to_zero = 0.0
-        zero_to_active = 0.0
-        if len(y) > 1:
-            active_to_zero = np.mean(active[:-1] & zero[1:])
-            zero_to_active = np.mean(zero[:-1] & active[1:])
-
-        active_spells = _spell_lengths(active)
-        zero_spells = _spell_lengths(zero)
-
-        if y.sum() > 0:
-            top_n = max(1, int(np.ceil(0.20 * len(y))))
-            top20_share = np.sort(y)[-top_n:].sum() / (y.sum() + 1e-8)
-        else:
-            top20_share = 0.0
-
-        mean_y = float(np.mean(y)) if len(y) else 0.0
-        q95_y = float(np.quantile(y, 0.95)) if len(y) else 0.0
-        max_y = float(np.max(y)) if len(y) else 0.0
-        cv_y = float(np.std(y) / (mean_y + 1e-8)) if len(y) else 0.0
-
-        rows.append({
-            "asin": asin,
-            "graph_gl_product_group": str(g["gl_product_group"].iloc[0]) if "gl_product_group" in g else "MISSING",
-            "graph_category_code": str(g["category_code"].iloc[0]) if "category_code" in g else "MISSING",
-            "self_instock_zero_rate": float(np.mean(y <= 0)) if len(y) else 1.0,
-            "self_buybox_zero_rate": float(np.mean(b <= 0)) if len(b) else 1.0,
-            "self_demand_active_rate": float(np.mean(d > 0)) if len(d) else 0.0,
-            "self_oos_rate": float(np.mean(oos)) if len(oos) else 0.0,
-            "self_promo_rate": float(np.mean(promo)) if len(promo) else 0.0,
-            "self_price_mean_log": float(np.log1p(np.mean(price))) if len(price) else 0.0,
-            "self_instock_mean_log": float(np.log1p(mean_y)),
-            "self_instock_q95_log": float(np.log1p(q95_y)),
-            "self_peak_score_log": float(np.log1p(q95_y * (1.0 + top20_share))),
-            "self_instock_cv": float(np.clip(cv_y, 0.0, 20.0)),
-            "self_top20_share": float(np.clip(top20_share, 0.0, 1.0)),
-            "self_max_over_mean_log": float(np.log1p(max_y / (mean_y + 1e-8))) if mean_y > 0 else 0.0,
-            "self_active_to_zero_rate": float(active_to_zero),
-            "self_zero_to_active_rate": float(zero_to_active),
-            "self_avg_active_spell_log": float(np.log1p(np.mean(active_spells))) if active_spells else 0.0,
-            "self_avg_zero_spell_log": float(np.log1p(np.mean(zero_spells))) if zero_spells else 0.0,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def add_neighbor_graph_features(df, horizon=20, k=20, candidate_k=200, verbose=True):
-    """
-    Add category-aware KNN neighbor aggregate features.
-
-    This is the first graph ablation: no GNN yet. It adds both:
-      1) neighbor level/peak features
-      2) neighbor zero/transition features
-
-    The graph is built from historical rows before the final holdout window,
-    so validation/final forecast does not use future exposure values.
-    """
-    out = df.copy()
-    out["asin"] = out["asin"].astype(str)
-    out["order_week"] = pd.to_datetime(out["order_week"])
-
-    weeks = np.array(sorted(out["order_week"].dropna().unique()))
-    if len(weeks) > horizon:
-        forecast_start = pd.Timestamp(weeks[-horizon])
-        hist = out[out["order_week"] < forecast_start].copy()
-    else:
-        forecast_start = out["order_week"].max()
-        hist = out.copy()
-
-    stats = _build_asin_graph_stats(hist)
-    if len(stats) == 0:
-        graph_cols = []
-        return out, graph_cols
-
-    # Fallback: ensure all ASINs in out have a stats row.
-    all_asins = pd.DataFrame({"asin": sorted(out["asin"].dropna().unique())})
-    stats = all_asins.merge(stats, on="asin", how="left")
-    stats["graph_gl_product_group"] = stats["graph_gl_product_group"].fillna("MISSING")
-    stats["graph_category_code"] = stats["graph_category_code"].fillna("MISSING")
-    num_cols = [c for c in stats.columns if c.startswith("self_")]
-    for c in num_cols:
-        stats[c] = pd.to_numeric(stats[c], errors="coerce").fillna(stats[c].median() if stats[c].notna().any() else 0.0)
-
-    feature_cols = [
-        "self_instock_zero_rate", "self_buybox_zero_rate", "self_demand_active_rate",
-        "self_oos_rate", "self_promo_rate", "self_price_mean_log",
-        "self_instock_mean_log", "self_instock_q95_log", "self_peak_score_log",
-        "self_instock_cv", "self_top20_share", "self_max_over_mean_log",
-        "self_active_to_zero_rate", "self_zero_to_active_rate",
-        "self_avg_active_spell_log", "self_avg_zero_spell_log",
-    ]
-    X = stats[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
-    X = StandardScaler().fit_transform(X)
-
-    n = len(stats)
-    nn_k = min(max(k + 1, 2), n)
-    cand = min(max(candidate_k + 1, nn_k), n)
-    nbrs = NearestNeighbors(n_neighbors=cand, metric="cosine")
-    nbrs.fit(X)
-    dist, idx = nbrs.kneighbors(X)
-
-    gl = stats["graph_gl_product_group"].astype(str).values
-    cat = stats["graph_category_code"].astype(str).values
-
-    neighbor_rows = []
-    for i in range(n):
-        cand_idx = idx[i]
-        cand_dist = dist[i]
-        mask = cand_idx != i
-        cand_idx = cand_idx[mask]
-        cand_dist = cand_dist[mask]
-
-        if len(cand_idx) == 0:
-            chosen = np.array([i])
-        else:
-            behavior_sim = 1.0 - cand_dist
-            same_cat = (cat[cand_idx] == cat[i]).astype(float)
-            same_gl = (gl[cand_idx] == gl[i]).astype(float)
-            # Do not let category dominate unknown categories too strongly.
-            if str(cat[i]).lower() in {"unknown", "missing", "nan", "none", ""}:
-                same_cat = same_cat * 0.25
-            score = 0.50 * behavior_sim + 0.30 * same_cat + 0.20 * same_gl
-            order = np.argsort(-score)
-            chosen = cand_idx[order[:min(k, len(order))]]
-
-        g = stats.iloc[chosen]
-        row = {"asin": stats.iloc[i]["asin"]}
-        row["graph_neighbor_instock_zero_rate"] = g["self_instock_zero_rate"].mean()
-        row["graph_neighbor_buybox_zero_rate"] = g["self_buybox_zero_rate"].mean()
-        row["graph_neighbor_active_to_zero_rate"] = g["self_active_to_zero_rate"].mean()
-        row["graph_neighbor_zero_to_active_rate"] = g["self_zero_to_active_rate"].mean()
-        row["graph_neighbor_avg_active_spell_log"] = g["self_avg_active_spell_log"].mean()
-        row["graph_neighbor_avg_zero_spell_log"] = g["self_avg_zero_spell_log"].mean()
-        row["graph_neighbor_instock_mean_log"] = g["self_instock_mean_log"].mean()
-        row["graph_neighbor_instock_q95_log"] = g["self_instock_q95_log"].mean()
-        row["graph_neighbor_peak_score_log"] = g["self_peak_score_log"].mean()
-        row["graph_neighbor_top20_share"] = g["self_top20_share"].mean()
-        neighbor_rows.append(row)
-
-    neigh = pd.DataFrame(neighbor_rows)
-    graph_cols = [c for c in neigh.columns if c != "asin"]
-    out = out.merge(neigh, on="asin", how="left")
-    for c in graph_cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).clip(-10, 10)
-
-    if verbose:
-        print("Graph neighbor features enabled:")
-        print(f"  forecast_start used for graph history: {forecast_start}")
-        print(f"  ASIN nodes: {n} | k={k} | graph feature dim={len(graph_cols)}")
-        print(f"  graph cols: {graph_cols}")
-
-    return out, graph_cols
-
-def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neighbor_k=20, graph_horizon=20):
+def load_exposure_data(data_raw, dph_cap_q=0.995):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
@@ -635,15 +444,6 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neigh
     df, explicit_event_cols = add_explicit_event_features(df, week_col="order_week")
     df, static_cols = _encode_static_features(df)
 
-    graph_cols = []
-    if use_neighbor_graph:
-        df, graph_cols = add_neighbor_graph_features(
-            df,
-            horizon=graph_horizon,
-            k=neighbor_k,
-            verbose=True,
-        )
-
     holiday_cols  = [c for c in df.columns if c.startswith("holiday_indicator_")]
     distance_cols = [c for c in df.columns if c.startswith("distance_")]
     for c in holiday_cols + distance_cols:
@@ -660,7 +460,6 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neigh
         # ── 商品特征（进mag_head）────────────────────────────
         + ["our_price_log_norm", "log_review_count"]
         + static_cols
-        + graph_cols
         # ── 历史anchor──────────────────────────────────────
         + [
             "hist_total_dph_last_log",   "hist_total_dph_mean4_log",   "hist_total_dph_mean13_log",
@@ -728,7 +527,12 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neigh
                       if "stock_static__category_code__is_unknown" in g.columns \
                       else np.zeros(len(g), dtype=np.float32)
 
-        # ── encoder历史特征（19→22维，如果有category_code）────────────────
+        # ── Top-10 brand静态特征：品牌头部效应/稳定性信号 ───────────────
+        top10_brand = g["stock_static__ind_top10_brand"].values.astype(np.float32) \
+                      if "stock_static__ind_top10_brand" in g.columns \
+                      else np.zeros(len(g), dtype=np.float32)
+
+        # ── encoder历史特征（22→23维，如果有ind_top10_brand）────────────
         features = np.stack([
             np.log1p(demand),                               # 历史需求
             (demand > 0).astype(float),                     # 需求active
@@ -753,6 +557,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neigh
             cat_code,     # category_code编码（细粒度品类）
             cat_freq,     # category_code频率（类别大小/稀疏度）
             cat_unknown,  # category_code是否unknown（catalog缺失信号）
+            top10_brand,  # ind_top10_brand（头部品牌稳定性/流量信号）
         ], axis=1).astype(np.float32)
 
         data[asin] = {
@@ -772,6 +577,9 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_neighbor_graph=True, neigh
         n_cat = df["category_code"].astype(str).nunique()
         unk_rate = df.get("stock_static__category_code__is_unknown", pd.Series(0, index=df.index)).mean()
         print(f"Category code enabled: n_category={n_cat} | unknown_rate={unk_rate:.4f}")
+    if "ind_top10_brand" in df.columns:
+        top10_rate = df.get("stock_static__ind_top10_brand", pd.Series(0, index=df.index)).mean()
+        print(f"Top10 brand feature enabled: ind_top10_brand mean={top10_rate:.4f}")
     return data, len(context_cols), context_cols
 
 
@@ -1306,6 +1114,7 @@ class ExposureForecastModelV2(nn.Module):
         "stock_static__category_code__code",
         "stock_static__category_code__freq",
         "stock_static__category_code__is_unknown",
+        "stock_static__ind_top10_brand",
         "log_review_count",        # 新增：review高→active率高（零值率从75%降到22%）
         "order_month", "month_sin", "month_cos",
         "season_winter", "season_spring", "season_summer", "season_fall",
@@ -1313,13 +1122,6 @@ class ExposureForecastModelV2(nn.Module):
         "is_pre_event", "is_post_event",
         "pre_event_proximity", "post_event_decay",
         "hist_demand_active_rate",
-        # neighbor graph zero / transition regime features
-        "graph_neighbor_instock_zero_rate",
-        "graph_neighbor_buybox_zero_rate",
-        "graph_neighbor_active_to_zero_rate",
-        "graph_neighbor_zero_to_active_rate",
-        "graph_neighbor_avg_active_spell_log",
-        "graph_neighbor_avg_zero_spell_log",
     ]
 
     MAG_FEAT_COLS = [
@@ -1334,14 +1136,11 @@ class ExposureForecastModelV2(nn.Module):
         "stock_static__category_code__is_unknown",
         "stock_static__ind_amxl_hb",
         "stock_static__sort_type__norm",
+        "stock_static__ind_top10_brand",
         "stock_static__ind_top10_brand__code",
+        "stock_static__ind_top10_brand__freq",
         "hist_demand_mean13_log",
         "hist_instock_dph_mean13_log",
-        # neighbor graph level / peak regime features
-        "graph_neighbor_instock_mean_log",
-        "graph_neighbor_instock_q95_log",
-        "graph_neighbor_peak_score_log",
-        "graph_neighbor_top20_share",
     ]
 
     def __init__(self, input_dim, context_dim,
@@ -2369,9 +2168,6 @@ def run_exposure_v2(
     peak_quantile=0.80,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
-    use_neighbor_graph=True,
-    neighbor_k=20,
-    val_start_offset=0,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: TCN Full-Seq Encoder + Cross-Attn + SINGLE-HEAD DIRECT")
@@ -2382,13 +2178,7 @@ def run_exposure_v2(
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(
-        df,
-        dph_cap_q=dph_cap_q,
-        use_neighbor_graph=use_neighbor_graph,
-        neighbor_k=neighbor_k,
-        graph_horizon=horizon,
-    )
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
     tr_ds = ExposureDataset(data, history=history, horizon=horizon,
                             mode="train", val_weeks=horizon, anchor_decay=anchor_decay)
@@ -2792,11 +2582,7 @@ def _train_one_exposure_window(
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
         zero_weight=zero_weight,
-        total_zero_weight=total_zero_weight,
-        buy_zero_weight=buy_zero_weight,
-        instock_zero_weight=instock_zero_weight,
         total_zero_consistency_weight=total_zero_consistency_weight,
-        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
@@ -2871,8 +2657,6 @@ def run_exposure_v2(
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
-    use_neighbor_graph=True,
-    neighbor_k=20,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
@@ -2883,18 +2667,10 @@ def run_exposure_v2(
     else:
         df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
-    df = fill_missing_dph_after_scot_merge(df, verbose=True)
-
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(
-        df,
-        dph_cap_q=dph_cap_q,
-        use_neighbor_graph=use_neighbor_graph,
-        neighbor_k=neighbor_k,
-        graph_horizon=horizon,
-    )
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
     out = _train_one_exposure_window(
         data=data,
@@ -2916,11 +2692,7 @@ def run_exposure_v2(
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
         zero_weight=zero_weight,
-        total_zero_weight=total_zero_weight,
-        buy_zero_weight=buy_zero_weight,
-        instock_zero_weight=instock_zero_weight,
         total_zero_consistency_weight=total_zero_consistency_weight,
-        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
@@ -3002,8 +2774,6 @@ def run_exposure_v2_rolling(
     dropout=0.20,
     use_scot_intersection=True,
     use_encoder_self_attn=True,
-    use_neighbor_graph=True,
-    neighbor_k=20,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: ROLLING BACKTEST + SCOT INTERSECTION")
@@ -3015,18 +2785,10 @@ def run_exposure_v2_rolling(
     else:
         df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
-    df = fill_missing_dph_after_scot_merge(df, verbose=True)
-
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(
-        df,
-        dph_cap_q=dph_cap_q,
-        use_neighbor_graph=use_neighbor_graph,
-        neighbor_k=neighbor_k,
-        graph_horizon=horizon,
-    )
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
     results_by_offset = {}
     pred_list = []
@@ -3060,15 +2822,6 @@ def run_exposure_v2_rolling(
                 buy_zero_consistency_weight=buy_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
-                path_zero_weight=path_zero_weight,
-                zero_fp_weight=zero_fp_weight,
-                active_count_weight=active_count_weight,
-                path_sum_weight=path_sum_weight,
-                peak_weight=peak_weight,
-                topk_peak_weight=topk_peak_weight,
-                peak_under_weight=peak_under_weight,
-                peak_topk=peak_topk,
-                peak_quantile=peak_quantile,
                 dropout=dropout,
                 use_encoder_self_attn=use_encoder_self_attn,
             )
@@ -3345,8 +3098,6 @@ def run_exposure_v2_final_scot_5000(
     patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
-    use_neighbor_graph=True,
-    neighbor_k=20,
 ):
     """
     Final single-window setup:
@@ -3369,8 +3120,6 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
-        use_neighbor_graph=use_neighbor_graph,
-        neighbor_k=neighbor_k,
     )
 
 # ============================================================
