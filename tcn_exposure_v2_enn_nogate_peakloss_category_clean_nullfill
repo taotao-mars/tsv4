@@ -1229,6 +1229,8 @@ def exposure_hurdle_loss(
     # ENN/path-regime terms
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     # Peak/path-high regime terms. These prevent zero losses from making the model too conservative.
@@ -1355,6 +1357,14 @@ def exposure_hurdle_loss(
     pred_positive_soft = torch.sigmoid((pred_instock - zero_fp_threshold) / max(zero_fp_temperature, 1e-6))
     zero_fp_loss = (true_zero_instock * pred_positive_soft * horizon_w.squeeze(-1)).mean()
 
+    # Low-exposure overbias loss.
+    # Motivation: reduce false positive floors when true exposure is 0/low,
+    # without globally scaling down high/peak exposure.
+    low_mask = (true_instock_y <= float(low_over_threshold)).float()
+    low_over = F.relu(torch.log1p(pred_instock) - torch.log1p(true_instock_y))
+    low_over_weight_mat = low_mask * horizon_w.squeeze(-1)
+    low_over_loss = (low_over * low_over_weight_mat).sum() / low_over_weight_mat.sum().clamp_min(1.0)
+
     true_active_count = (true_instock_y > 0).float().sum(dim=1)
     pred_active_count = pred_positive_soft.sum(dim=1)
     active_count_loss = F.smooth_l1_loss(pred_active_count, true_active_count)
@@ -1394,6 +1404,7 @@ def exposure_hurdle_loss(
         + zero_loss
         + path_zero_weight * path_zero_loss
         + zero_fp_weight * zero_fp_loss
+        + low_over_weight * low_over_loss
         + active_count_weight * active_count_loss
         + path_sum_weight * path_sum_loss
         + peak_weight * peak_loss
@@ -1420,6 +1431,8 @@ def train_exposure_model_v2(
     horizon_weight_alpha=0.25, high_weight_alpha=0.35,
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     peak_weight=0.08,
@@ -1476,6 +1489,8 @@ def train_exposure_model_v2(
                 peak_quantile=peak_quantile,
                 zero_fp_threshold=zero_fp_threshold,
                 zero_fp_temperature=zero_fp_temperature,
+                low_over_weight=low_over_weight,
+                low_over_threshold=low_over_threshold,
             )
             opt.zero_grad()
             loss.backward()
@@ -2137,6 +2152,8 @@ def run_exposure_v2(
     high_weight_alpha=0.35,
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     peak_weight=0.08,
@@ -2197,6 +2214,8 @@ def run_exposure_v2(
         horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
         zero_fp_weight=zero_fp_weight,
+        low_over_weight=low_over_weight,
+        low_over_threshold=low_over_threshold,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
         peak_weight=peak_weight,
@@ -2496,6 +2515,8 @@ def _train_one_exposure_window(
     high_weight_alpha=0.35,
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     peak_weight=0.08,
@@ -2565,6 +2586,8 @@ def _train_one_exposure_window(
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
         zero_fp_weight=zero_fp_weight,
+        low_over_weight=low_over_weight,
+        low_over_threshold=low_over_threshold,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
         peak_weight=peak_weight,
@@ -2624,6 +2647,8 @@ def run_exposure_v2(
     high_weight_alpha=0.35,
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     peak_weight=0.08,
@@ -2675,6 +2700,8 @@ def run_exposure_v2(
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
         zero_fp_weight=zero_fp_weight,
+        low_over_weight=low_over_weight,
+        low_over_threshold=low_over_threshold,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
         peak_weight=peak_weight,
@@ -2742,6 +2769,8 @@ def run_exposure_v2_rolling(
     high_weight_alpha=0.35,
     path_zero_weight=0.08,
     zero_fp_weight=0.08,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
     active_count_weight=0.05,
     path_sum_weight=0.05,
     peak_weight=0.08,
@@ -3076,6 +3105,8 @@ def run_exposure_v2_final_scot_5000(
     patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
+    low_over_weight=0.06,
+    low_over_threshold=50.0,
 ):
     """
     Final single-window setup:
@@ -3098,6 +3129,8 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
+        low_over_weight=low_over_weight,
+        low_over_threshold=low_over_threshold,
     )
 
 # ============================================================
