@@ -11,10 +11,11 @@
 # Purpose: stabilize point exposure forecasts and learn joint 20-week exposure regimes.
 # Long-run balanced preset:
 #   - category_code is kept
-#   - ind_top10_brand is added as a direct binary static/context/encoder feature
 #   - channel-specific zero loss is softened to avoid systematic underprediction
 #   - mean-level penalty is slightly stronger to keep overall ratio near 1
 #   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
+#   - optional 1-layer GraphSAGE ASIN graph embedding for regime prior
+#     node features include GL/category + ind_top10_brand + zero/peak/transition history
 
 #
 # 改动：
@@ -36,6 +37,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
 
 
 torch.manual_seed(42)
@@ -276,15 +279,6 @@ def _encode_static_features(df):
         ).clip(0, 1)
         out_cols.append("stock_static__ind_new_asin")
 
-    # ── 新增：ind_top10_brand（binary，静态）─────────────────
-    # 上面的 categorical encoder 仍保留 code/freq；这里额外保留原始0/1信号。
-    if "ind_top10_brand" in df.columns:
-        df["stock_static__ind_top10_brand"] = _safe_numeric(
-            df["ind_top10_brand"]
-        ).fillna(0.0).clip(0, 1)
-        if "stock_static__ind_top10_brand" not in out_cols:
-            out_cols.append("stock_static__ind_top10_brand")
-
     return df, out_cols
 
 
@@ -388,7 +382,7 @@ def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4)
     return out, event_cols
 
 
-def load_exposure_data(data_raw, dph_cap_q=0.995):
+def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.5, graph_level_peak_weight=1.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
@@ -527,12 +521,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
                       if "stock_static__category_code__is_unknown" in g.columns \
                       else np.zeros(len(g), dtype=np.float32)
 
-        # ── Top-10 brand静态特征：品牌头部效应/稳定性信号 ───────────────
-        top10_brand = g["stock_static__ind_top10_brand"].values.astype(np.float32) \
-                      if "stock_static__ind_top10_brand" in g.columns \
-                      else np.zeros(len(g), dtype=np.float32)
-
-        # ── encoder历史特征（22→23维，如果有ind_top10_brand）────────────
+        # ── encoder历史特征（19→22维，如果有category_code）────────────────
         features = np.stack([
             np.log1p(demand),                               # 历史需求
             (demand > 0).astype(float),                     # 需求active
@@ -557,7 +546,6 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
             cat_code,     # category_code编码（细粒度品类）
             cat_freq,     # category_code频率（类别大小/稀疏度）
             cat_unknown,  # category_code是否unknown（catalog缺失信号）
-            top10_brand,  # ind_top10_brand（头部品牌稳定性/流量信号）
         ], axis=1).astype(np.float32)
 
         data[asin] = {
@@ -577,10 +565,26 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         n_cat = df["category_code"].astype(str).nunique()
         unk_rate = df.get("stock_static__category_code__is_unknown", pd.Series(0, index=df.index)).mean()
         print(f"Category code enabled: n_category={n_cat} | unknown_rate={unk_rate:.4f}")
-    if "ind_top10_brand" in df.columns:
-        top10_rate = df.get("stock_static__ind_top10_brand", pd.Series(0, index=df.index)).mean()
-        print(f"Top10 brand feature enabled: ind_top10_brand mean={top10_rate:.4f}")
-    return data, len(context_cols), context_cols
+
+    graph_assets = None
+    if use_graphsage:
+        graph_assets = _build_graphsage_assets(
+            df,
+            graph_horizon=graph_horizon,
+            neighbor_k=neighbor_k,
+            graph_zero_weight=graph_zero_weight,
+            graph_level_peak_weight=graph_level_peak_weight,
+            graph_transition_weight=graph_transition_weight,
+            graph_static_weight=graph_static_weight,
+            graph_brand_weight=graph_brand_weight,
+            verbose=True,
+        )
+        # Attach ASIN index for dataset batches. Missing ASINs are assigned 0 defensively.
+        asin_to_idx = graph_assets["asin_to_idx"]
+        for a, dct in data.items():
+            dct["asin_idx"] = int(asin_to_idx.get(str(a), 0))
+
+    return data, len(context_cols), context_cols, graph_assets
 
 
 # ============================================================
@@ -719,6 +723,7 @@ class ExposureDataset(Dataset):
             "future_buy_box_dph":  torch.tensor(d["buy_box_dph"][start+h:start+h+H],  dtype=torch.float32),
             "future_instock_dph":  torch.tensor(d["in_stock_dph"][start+h:start+h+H], dtype=torch.float32),
             "future_demand":       torch.tensor(d["demand"][start+h:start+h+H],        dtype=torch.float32),
+            "asin_idx":            torch.tensor(int(d.get("asin_idx", 0)), dtype=torch.long),
         }
 
 
@@ -734,6 +739,7 @@ def exposure_collate(batch):
         "future_buy_box_dph",
         "future_instock_dph",
         "future_demand",
+        "asin_idx",
     ]
     out = {k: torch.stack([b[k] for b in batch], dim=0) for k in tensor_keys}
     out["asin"] = [b["asin"] for b in batch]
@@ -897,6 +903,36 @@ class HorizonTCNBlock(nn.Module):
         m   = min(z.shape[1], res.shape[1])
         return self.norm(res[:, :m, :] + z[:, :m, :])
 
+
+
+class GraphSAGEEncoder(nn.Module):
+    """
+    Lightweight 1-layer GraphSAGE encoder.
+
+    It learns a soft ASIN graph embedding from:
+      self node feature + scaled mean neighbor message.
+
+    This is intentionally shallow and residual-like to avoid the graph12 failure mode
+    where neighbor zero information dominated and caused systematic underprediction.
+    """
+    def __init__(self, node_feat_dim, graph_dim=16, dropout=0.10, neighbor_message_scale=0.20):
+        super().__init__()
+        self.neighbor_message_scale = float(neighbor_message_scale)
+        self.self_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.neigh_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.out = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(graph_dim, graph_dim),
+            nn.LayerNorm(graph_dim),
+        )
+
+    def forward(self, node_features, neighbor_idx):
+        # node_features: [N,F], neighbor_idx: [N,K]
+        neigh = node_features[neighbor_idx]          # [N,K,F]
+        neigh_mean = neigh.mean(dim=1)               # [N,F]
+        h = self.self_proj(node_features) + self.neighbor_message_scale * self.neigh_proj(neigh_mean)
+        return self.out(h)
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
@@ -1114,7 +1150,6 @@ class ExposureForecastModelV2(nn.Module):
         "stock_static__category_code__code",
         "stock_static__category_code__freq",
         "stock_static__category_code__is_unknown",
-        "stock_static__ind_top10_brand",
         "log_review_count",        # 新增：review高→active率高（零值率从75%降到22%）
         "order_month", "month_sin", "month_cos",
         "season_winter", "season_spring", "season_summer", "season_fall",
@@ -1136,9 +1171,7 @@ class ExposureForecastModelV2(nn.Module):
         "stock_static__category_code__is_unknown",
         "stock_static__ind_amxl_hb",
         "stock_static__sort_type__norm",
-        "stock_static__ind_top10_brand",
         "stock_static__ind_top10_brand__code",
-        "stock_static__ind_top10_brand__freq",
         "hist_demand_mean13_log",
         "hist_instock_dph_mean13_log",
     ]
@@ -1146,11 +1179,30 @@ class ExposureForecastModelV2(nn.Module):
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
-                 use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0):
+                 use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.20):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
         print(f"Exposure ENN regime enabled: {use_enn} | z_dim={z_dim}")
+
+        self.use_graphsage = bool(use_graphsage and graph_assets is not None)
+        self.graph_dim = int(graph_dim) if self.use_graphsage else 0
+        if self.use_graphsage:
+            node_np = graph_assets["node_features"].astype(np.float32)
+            neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
+            self.register_buffer("graph_node_features", torch.tensor(node_np, dtype=torch.float32))
+            self.register_buffer("graph_neighbor_idx", torch.tensor(neigh_np, dtype=torch.long))
+            self.graph_encoder = GraphSAGEEncoder(
+                node_feat_dim=node_np.shape[1],
+                graph_dim=self.graph_dim,
+                dropout=dropout,
+                neighbor_message_scale=graph_message_scale,
+            )
+            print(f"GraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
+        else:
+            self.graph_encoder = None
+            print("GraphSAGE disabled")
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -1200,7 +1252,7 @@ class ExposureForecastModelV2(nn.Module):
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
-            context_dim=context_dim,
+            context_dim=context_dim + self.graph_dim,
             horizon=horizon,
             hidden=max(96, d_model * 2),
             n_heads=n_heads,
@@ -1216,8 +1268,18 @@ class ExposureForecastModelV2(nn.Module):
             gate_temperature=gate_temperature,
         )
 
-    def forward(self, x, future_context, return_aux=False, z=None):
+    def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
         enc_out = self.encoder(x)
+
+        if self.use_graphsage:
+            if asin_idx is None:
+                raise ValueError("asin_idx is required when use_graphsage=True")
+            graph_emb_all = self.graph_encoder(self.graph_node_features, self.graph_neighbor_idx)  # [N,G]
+            g = graph_emb_all[asin_idx.long()]                                                     # [B,G]
+            B, H, _ = future_context.shape
+            g_rep = g[:, None, :].expand(B, H, -1)
+            future_context = torch.cat([future_context, g_rep], dim=-1)
+
         return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
 
 
@@ -1467,7 +1529,7 @@ def train_exposure_model_v2(
 
         for b in tr_ld:
             b = batch_to_device(b, device)
-            aux = model(b["x"], b["future_context"], return_aux=True)
+            aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
             loss = exposure_hurdle_loss(
                 log_hat=aux["log_hat"],
                 true_total=b["future_total_dph"],
@@ -1513,7 +1575,7 @@ def train_exposure_model_v2(
         with torch.no_grad():
             for b in va_ld:
                 b = batch_to_device(b, device)
-                aux = model(b["x"], b["future_context"], return_aux=True)
+                aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
                 loss = exposure_hurdle_loss(
                     log_hat=aux["log_hat"],
                     true_total=b["future_total_dph"],
@@ -1586,7 +1648,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             last_aux = None
             K = max(int(mc_samples), 1)
             for _ in range(K):
-                aux = model(b["x"], b["future_context"], return_aux=True)
+                aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
                 last_aux = aux
                 preds.append(torch.expm1(aux["log_hat"]).clamp(min=0.0))
                 pacts.append(aux["p_active"])
@@ -2167,6 +2229,15 @@ def run_exposure_v2(
     peak_topk=3,
     peak_quantile=0.80,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.20,
+    graph_zero_weight=0.5,
+    graph_level_peak_weight=1.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.5,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -2178,7 +2249,13 @@ def run_exposure_v2(
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
+    )
 
     tr_ds = ExposureDataset(data, history=history, horizon=horizon,
                             mode="train", val_weeks=horizon, anchor_decay=anchor_decay)
@@ -2201,6 +2278,10 @@ def run_exposure_v2(
         dropout=dropout,
         context_cols=context_cols,
         use_encoder_self_attn=use_encoder_self_attn,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -2245,6 +2326,7 @@ def run_exposure_v2(
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
+        "graph_assets": graph_assets,
     }
 
 
@@ -2526,6 +2608,10 @@ def _train_one_exposure_window(
     peak_topk=3,
     peak_quantile=0.80,
     dropout=0.20,
+    use_graphsage=False,
+    graph_assets=None,
+    graph_dim=16,
+    graph_message_scale=0.20,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -2566,6 +2652,10 @@ def _train_one_exposure_window(
         dropout=dropout,
         context_cols=context_cols,
         use_encoder_self_attn=use_encoder_self_attn,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -2582,7 +2672,11 @@ def _train_one_exposure_window(
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
         zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
         total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
@@ -2656,6 +2750,15 @@ def run_exposure_v2(
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.20,
+    graph_zero_weight=0.5,
+    graph_level_peak_weight=1.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.5,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -2670,7 +2773,13 @@ def run_exposure_v2(
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
+    )
 
     out = _train_one_exposure_window(
         data=data,
@@ -2705,6 +2814,10 @@ def run_exposure_v2(
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
         dropout=dropout,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
@@ -2724,6 +2837,7 @@ def run_exposure_v2(
         "context_dim": context_dim,
         "data": data,
         "source_df": df,
+        "graph_assets": graph_assets,
         "gl_diagnostics": gl_diag,
         "gl_horizon_block_diagnostics": gl_block_diag,
         "gl_summary": gl_summary,
@@ -2773,6 +2887,15 @@ def run_exposure_v2_rolling(
     peak_quantile=0.80,
     dropout=0.20,
     use_scot_intersection=True,
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.20,
+    graph_zero_weight=0.5,
+    graph_level_peak_weight=1.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.5,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -2788,7 +2911,13 @@ def run_exposure_v2_rolling(
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
-    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
+    )
 
     results_by_offset = {}
     pred_list = []
@@ -2822,7 +2951,20 @@ def run_exposure_v2_rolling(
                 buy_zero_consistency_weight=buy_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
+                path_zero_weight=path_zero_weight,
+                zero_fp_weight=zero_fp_weight,
+                active_count_weight=active_count_weight,
+                path_sum_weight=path_sum_weight,
+                peak_weight=peak_weight,
+                topk_peak_weight=topk_peak_weight,
+                peak_under_weight=peak_under_weight,
+                peak_topk=peak_topk,
+                peak_quantile=peak_quantile,
                 dropout=dropout,
+                use_graphsage=use_graphsage,
+                graph_assets=graph_assets,
+                graph_dim=graph_dim,
+                graph_message_scale=graph_message_scale,
                 use_encoder_self_attn=use_encoder_self_attn,
             )
             results_by_offset[int(offset)] = res
@@ -2863,6 +3005,7 @@ def run_exposure_v2_rolling(
         "context_dim": context_dim,
         "data": data,
         "source_df": df,
+        "graph_assets": graph_assets,
         "rolling_offsets": list(rolling_offsets),
         "gl_diagnostics": latest_gl_diag,
         "gl_horizon_block_diagnostics": latest_gl_block_diag,
@@ -3097,6 +3240,15 @@ def run_exposure_v2_final_scot_5000(
     epochs=60,
     patience=10,
     batch_size=128,
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.20,
+    graph_zero_weight=0.5,
+    graph_level_peak_weight=1.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.5,
     use_encoder_self_attn=True,
 ):
     """
@@ -3119,6 +3271,15 @@ def run_exposure_v2_final_scot_5000(
         batch_size=batch_size,
         use_scot_intersection=True,
         val_start_offset=0,
+        use_graphsage=use_graphsage,
+        neighbor_k=neighbor_k,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
+        graph_zero_weight=graph_zero_weight,
+        graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight,
+        graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
