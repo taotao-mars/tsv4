@@ -801,6 +801,15 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_hor
     df["our_price"] = _safe_numeric(df.get("our_price", 0.0)).clip(lower=0.0)
     df["scot_oos"]  = _safe_numeric(df.get("scot_oos",  0.0)).clip(0, 1)
 
+    # OOS is assumed available for this experiment. Treat it as a structural-zero
+    # constraint for effective in-stock exposure. Total_dph is not forced to zero
+    # because page/glance exposure may still exist even when the item is unavailable.
+    n_oos = int((df["scot_oos"] >= 0.5).sum())
+    if n_oos > 0:
+        before_sum = float(df.loc[df["scot_oos"] >= 0.5, "in_stock_dph"].sum())
+        df.loc[df["scot_oos"] >= 0.5, "in_stock_dph"] = 0.0
+        print(f"OOS hard target applied: {n_oos} rows | in_stock_dph sum on OOS rows {before_sum:.2f} -> 0")
+
     # ── 新增动态特征 ──────────────────────────────────────────
     # ind_promotion：动态binary，99.1% ASIN有变化，进active_head
     if "ind_promotion" in df.columns:
@@ -848,7 +857,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_hor
 
     context_cols = list(dict.fromkeys(
         # ── 动态特征（时间驱动，进active_head）──────────────
-        ["ind_promotion", "ind_prime_week"]
+        ["ind_promotion", "ind_prime_week", "scot_oos"]
         + holiday_cols
         + distance_cols
         + explicit_event_cols
@@ -1377,7 +1386,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  use_enn=True,
                  z_dim=8,
                  residual_scale=2.0,
-                 gate_temperature=1.0):
+                 gate_temperature=1.0,
+                 oos_index=None,
+                 mask_instock_with_oos=True):
         super().__init__()
         self.horizon = horizon
         self.anchor_indices = anchor_indices
@@ -1387,6 +1398,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.z_dim = int(z_dim)
         self.residual_scale = float(residual_scale)
         self.gate_temperature = float(gate_temperature)
+        self.oos_index = oos_index
+        self.mask_instock_with_oos = bool(mask_instock_with_oos)
 
         if self.use_enn:
             self.z_proj = nn.Sequential(
@@ -1524,7 +1537,17 @@ class TCNDecoderWithCrossAttn(nn.Module):
         # shifting the path prediction itself, not by p_active * magnitude.
         gate = torch.ones_like(p_active)
         pred_level = mag_level
-        log_hat = log_mag
+
+        # Structural OOS mask: if future scot_oos is known and equals 1,
+        # effective in-stock exposure must be exactly 0.  We only mask the
+        # in_stock channel; total_dph/buy_box_dph are left to the model/funnel.
+        oos_mask = None
+        if self.mask_instock_with_oos and self.oos_index is not None:
+            oos_mask = future_context[:, :, self.oos_index].clamp(0.0, 1.0)
+            pred_level = pred_level.clone()
+            pred_level[:, :, 2] = pred_level[:, :, 2] * (1.0 - oos_mask)
+
+        log_hat = torch.log1p(pred_level.clamp(min=0.0))
 
         if return_aux:
             nan_like = torch.full_like(log_hat, float("nan"))
@@ -1538,6 +1561,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "gamma": nan_like,
                 "gate": gate,
                 "residual": residual,
+                "oos_mask": oos_mask if oos_mask is not None else torch.zeros_like(pred_level[:, :, 2]),
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -1632,6 +1656,13 @@ class ExposureForecastModelV2(nn.Module):
 
         col_idx = {c: i for i, c in enumerate(context_cols)} if context_cols else {}
 
+        # future OOS index for structural in-stock mask
+        oos_index = col_idx.get("scot_oos", None)
+        if oos_index is not None:
+            print(f"Future OOS hard mask enabled for in_stock_dph: scot_oos context index={oos_index}")
+        else:
+            print("Warning: scot_oos not found in future_context; OOS hard mask disabled")
+
         # anchor indices（mean13）
         anchor_indices = None
         try:
@@ -1683,6 +1714,8 @@ class ExposureForecastModelV2(nn.Module):
             z_dim=z_dim,
             residual_scale=residual_scale,
             gate_temperature=gate_temperature,
+            oos_index=oos_index,
+            mask_instock_with_oos=True,
         )
 
     def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
@@ -3884,7 +3917,7 @@ def run_exposure_v2_final_scot_5000(
     )
 
 # ============================================================
-# Usage: dual-relation GraphSAGE exposure model
+# Usage: dual-relation GraphSAGE exposure model + OOS hard in-stock mask
 # ============================================================
 # This is the recommended run command for the current version.
 # It uses:
