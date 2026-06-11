@@ -14,7 +14,7 @@
 #   - channel-specific zero loss is softened to avoid systematic underprediction
 #   - mean-level penalty is slightly stronger to keep overall ratio near 1
 #   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
-#   - optional 1-layer GraphSAGE ASIN graph embedding for regime prior
+#   - optional 1-layer GraphSAGE ASIN graph embedding for dynamic residual magnitude correction
 #     node features include GL/category + ind_top10_brand + zero/peak/transition history
 
 #
@@ -1496,7 +1496,10 @@ class ExposureForecastModelV2(nn.Module):
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
-                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10):
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
+                 graph_in_decoder=False,
+                 use_graph_residual_correction=True,
+                 graph_correction_scale=0.10):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1519,6 +1522,18 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.graph_encoder = None
             print("GraphSAGE disabled")
+
+        # Graph usage modes:
+        #   graph_in_decoder=True  -> old behavior: concatenate graph embedding to future_context.
+        #   use_graph_residual_correction=True -> new behavior: keep base decoder clean, then
+        #      apply a small dynamic multiplicative/log residual correction using graph embedding.
+        # The new default is correction-only, because previous concat-to-decoder GraphSAGE runs
+        # improved active/regime diagnostics but systematically compressed active magnitude.
+        self.graph_in_decoder = bool(self.use_graphsage and graph_in_decoder)
+        self.use_graph_residual_correction = bool(self.use_graphsage and use_graph_residual_correction)
+        self.graph_correction_scale = float(graph_correction_scale)
+        if self.use_graphsage:
+            print(f"Graph mode: in_decoder={self.graph_in_decoder} | residual_correction={self.use_graph_residual_correction} | correction_scale={self.graph_correction_scale}")
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -1568,7 +1583,7 @@ class ExposureForecastModelV2(nn.Module):
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
-            context_dim=context_dim + self.graph_dim,
+            context_dim=context_dim + (self.graph_dim if self.graph_in_decoder else 0),
             horizon=horizon,
             hidden=max(96, d_model * 2),
             n_heads=n_heads,
@@ -1584,20 +1599,86 @@ class ExposureForecastModelV2(nn.Module):
             gate_temperature=gate_temperature,
         )
 
+        # Dynamic graph magnitude corrector.
+        # This is NOT a new exposure predictor and NOT a p_active gate.
+        # It starts from the base ENN exposure path, then applies a small horizon-wise
+        # log residual: log_hat_final = log_hat_base + scale * tanh(delta).
+        # The goal is cross-ASIN magnitude transfer: if similar/category/brand neighbors imply
+        # higher active-only scale, lift 80->100 or 150->220 without changing zero regime too much.
+        if self.use_graph_residual_correction:
+            corr_in_dim = self.graph_dim + context_dim + 3 + 2
+            self.graph_correction_head = nn.Sequential(
+                nn.Linear(corr_in_dim, max(64, d_model)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(64, d_model), max(32, d_model // 2)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, d_model // 2), 3),
+                nn.Tanh(),
+            )
+        else:
+            self.graph_correction_head = None
+
     def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
         enc_out = self.encoder(x)
+        orig_future_context = future_context
+        graph_emb_all = None
+        g = None
 
         if self.use_graphsage:
             if asin_idx is None:
                 raise ValueError("asin_idx is required when use_graphsage=True")
             graph_emb_all = self.graph_encoder(self.graph_node_features, self.graph_neighbor_idx)  # [N,G]
             g = graph_emb_all[asin_idx.long()]                                                     # [B,G]
+
+        decoder_context = future_context
+        if self.use_graphsage and self.graph_in_decoder:
             B, H, _ = future_context.shape
             g_rep = g[:, None, :].expand(B, H, -1)
-            future_context = torch.cat([future_context, g_rep], dim=-1)
+            decoder_context = torch.cat([future_context, g_rep], dim=-1)
 
-        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
+        # If graph residual correction is enabled, request auxiliary output so we can correct
+        # the base log_hat and still return the usual diagnostics.
+        need_aux = bool(return_aux or self.use_graph_residual_correction)
+        base_out = self.decoder(enc_out, decoder_context, return_aux=need_aux, z=z)
 
+        if not self.use_graph_residual_correction:
+            return base_out
+
+        if isinstance(base_out, dict):
+            base_log_hat = base_out["log_hat"]
+        else:
+            base_log_hat = base_out
+
+        B, H, _ = base_log_hat.shape
+        h_idx = torch.arange(H, device=base_log_hat.device, dtype=base_log_hat.dtype)
+        h_norm = h_idx.view(1, H, 1).expand(B, H, 1) / max(H, 1)
+        hsin = torch.sin(2 * torch.pi * h_norm)
+        hcos = torch.cos(2 * torch.pi * h_norm)
+        g_rep = g[:, None, :].expand(B, H, -1)
+
+        # Correction sees: base path, ASIN graph embedding, and original future context.
+        # This makes graph act as a small dynamic magnitude corrector, not as the main decoder input.
+        corr_x = torch.cat([base_log_hat, g_rep, orig_future_context, hsin, hcos], dim=-1)
+        graph_delta_raw = self.graph_correction_head(corr_x)  # [-1,1]
+        graph_delta = self.graph_correction_scale * graph_delta_raw
+        corrected_log_hat = torch.clamp(base_log_hat + graph_delta, min=0.0)
+
+        if not return_aux:
+            return corrected_log_hat
+
+        out = dict(base_out)
+        out["base_log_hat"] = base_log_hat
+        out["graph_delta_raw"] = graph_delta_raw
+        out["graph_delta"] = graph_delta
+        out["graph_delta_mean"] = graph_delta.mean(dim=(0, 1)).detach()
+        out["log_hat"] = corrected_log_hat
+        out["pred_level"] = torch.expm1(corrected_log_hat).clamp(min=0.0)
+        # For compatibility with downstream diagnostics that read log_mag/mag_level.
+        out["log_mag"] = corrected_log_hat
+        out["mag_level"] = out["pred_level"]
+        return out
 
 # ============================================================
 # Loss：Hurdle BCE + Magnitude Huber + Mean Penalty
@@ -2549,6 +2630,9 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
+    graph_in_decoder=False,
+    use_graph_residual_correction=True,
+    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -2598,6 +2682,9 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        graph_in_decoder=graph_in_decoder,
+        use_graph_residual_correction=use_graph_residual_correction,
+        graph_correction_scale=graph_correction_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -2929,6 +3016,9 @@ def _train_one_exposure_window(
     graph_assets=None,
     graph_dim=16,
     graph_message_scale=0.10,
+    graph_in_decoder=False,
+    use_graph_residual_correction=True,
+    graph_correction_scale=0.10,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -2973,6 +3063,9 @@ def _train_one_exposure_window(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        graph_in_decoder=graph_in_decoder,
+        use_graph_residual_correction=use_graph_residual_correction,
+        graph_correction_scale=graph_correction_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -3233,6 +3326,9 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
+    graph_in_decoder=False,
+    use_graph_residual_correction=True,
+    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -3301,6 +3397,9 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        graph_in_decoder=graph_in_decoder,
+        use_graph_residual_correction=use_graph_residual_correction,
+        graph_correction_scale=graph_correction_scale,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
@@ -3377,6 +3476,9 @@ def run_exposure_v2_rolling(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
+    graph_in_decoder=False,
+    use_graph_residual_correction=True,
+    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -3730,6 +3832,9 @@ def run_exposure_v2_final_scot_5000(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
+    graph_in_decoder=False,
+    use_graph_residual_correction=True,
+    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
