@@ -14,8 +14,11 @@
 #   - channel-specific zero loss is softened to avoid systematic underprediction
 #   - mean-level penalty is slightly stronger to keep overall ratio near 1
 #   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
-#   - optional 1-layer GraphSAGE ASIN graph embedding for dynamic residual magnitude correction
-#     node features include GL/category + ind_top10_brand + zero/peak/transition history
+#   - optional dual-relation DualGraphSAGE ASIN graph embedding for exposure/click relation modeling
+#     positive edges capture co-movement / similar products
+#     competitive edges capture same-category attention competition
+#     node/edge features include GL/category + hbt + ind_top10_brand + customer_active_review_count
+#       + zero/peak/transition history
 
 #
 # 改动：
@@ -385,7 +388,7 @@ def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4)
 
 
 # ============================================================
-# GraphSAGE assets: ASIN graph construction + diagnostics support
+# DualGraphSAGE assets: ASIN graph construction + diagnostics support
 # ============================================================
 
 def _run_lengths(mask):
@@ -441,7 +444,7 @@ def _build_graphsage_assets(
     verbose=True,
 ):
     """
-    Build a shallow ASIN KNN graph for GraphSAGE.
+    Build a shallow ASIN KNN graph for DualGraphSAGE.
 
     Important design choices:
       1. Use only history before the final forecast window per ASIN.
@@ -461,7 +464,7 @@ def _build_graphsage_assets(
     work = work.sort_values(["asin", "order_week"]).reset_index(drop=True)
 
     for c in ["total_dph", "buy_box_dph", "in_stock_dph", "fbi_demand", "scot_oos", "our_price",
-              "customer_active_review_count", "ind_promotion", "ind_prime_week", "ind_top10_brand"]:
+              "customer_active_review_count", "customer_review_count", "ind_promotion", "ind_prime_week", "ind_top10_brand"]:
         if c in work.columns:
             work[c] = _safe_numeric(work[c]).fillna(0.0)
 
@@ -521,9 +524,12 @@ def _build_graphsage_assets(
 
         gl = str(g0["gl_product_group"].iloc[0]) if "gl_product_group" in g0.columns else "MISSING"
         cat = str(g0["category_code"].iloc[0]) if "category_code" in g0.columns else "MISSING"
+        hbt = str(g0["hbt"].iloc[0]) if "hbt" in g0.columns else "MISSING"
         topbrand = float(_safe_numeric(g0["ind_top10_brand"].iloc[[0]]).iloc[0]) if "ind_top10_brand" in g0.columns else 0.0
         price_mean = float(_safe_numeric(g.get("our_price", 0.0)).clip(lower=0.0).mean()) if "our_price" in g.columns else 0.0
-        review_last = float(_safe_numeric(g.get("customer_active_review_count", 0.0)).clip(lower=0.0).iloc[-1]) if "customer_active_review_count" in g.columns and len(g) else 0.0
+        # Prefer customer_active_review_count if present; fall back to customer_review_count.
+        review_col = "customer_active_review_count" if "customer_active_review_count" in g.columns else ("customer_review_count" if "customer_review_count" in g.columns else None)
+        review_last = float(_safe_numeric(g[review_col]).clip(lower=0.0).iloc[-1]) if review_col is not None and len(g) else 0.0
         promo_rate = float(_safe_numeric(g.get("ind_promotion", 0.0)).clip(0, 1).mean()) if "ind_promotion" in g.columns else 0.0
         prime_rate = float(_safe_numeric(g.get("ind_prime_week", 0.0)).clip(0, 1).mean()) if "ind_prime_week" in g.columns else 0.0
 
@@ -574,15 +580,15 @@ def _build_graphsage_assets(
             "promo_rate": promo_rate,
             "prime_rate": prime_rate,
         })
-        meta_rows.append({"asin": asin, "gl_product_group": gl, "category_code": cat, "ind_top10_brand": topbrand})
+        meta_rows.append({"asin": asin, "gl_product_group": gl, "category_code": cat, "hbt": hbt, "ind_top10_brand": topbrand})
 
     feat = pd.DataFrame(rows).fillna(0.0)
     meta = pd.DataFrame(meta_rows)
     if len(feat) == 0:
-        raise ValueError("No ASINs available to build GraphSAGE assets.")
+        raise ValueError("No ASINs available to build DualGraphSAGE assets.")
 
-    # Encode GL/category as continuous normalized codes + frequencies for node features and KNN.
-    for c in ["gl_product_group", "category_code"]:
+    # Encode GL/category/hbt as continuous normalized codes + frequencies for node features and KNN.
+    for c in ["gl_product_group", "category_code", "hbt"]:
         raw = meta[c].astype(str).fillna("MISSING")
         codes, uniques = pd.factorize(raw)
         denom = max(len(uniques) - 1, 1)
@@ -591,6 +597,12 @@ def _build_graphsage_assets(
         feat[f"{c}_freq"] = raw.map(freq).fillna(0.0).astype(float)
         if c == "category_code":
             feat["category_is_unknown"] = raw.str.lower().isin(["unknown", "missing", "nan", "none", ""]).astype(float)
+        if c == "hbt":
+            hbt_lower = raw.str.lower()
+            feat["hbt_is_unknown"] = hbt_lower.isin(["unknown", "missing", "nan", "none", ""]).astype(float)
+            feat["hbt_is_head"] = hbt_lower.str.contains("head").astype(float)
+            feat["hbt_is_body"] = hbt_lower.str.contains("body").astype(float)
+            feat["hbt_is_tail"] = hbt_lower.str.contains("tail").astype(float)
 
     zero_cols = ["instock_zero_rate", "buybox_zero_rate", "total_zero_rate", "oos_rate"]
     level_peak_cols = [
@@ -601,7 +613,9 @@ def _build_graphsage_assets(
         "active_q95_over_mean", "log_buybox_mean", "log_total_mean",
     ]
     transition_cols = ["active_to_zero_rate", "zero_to_active_rate", "log_avg_active_spell", "log_avg_zero_spell", "last_active_streak", "last_zero_streak", "weeks_since_last_positive"]
-    static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown", "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
+    static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown",
+                   "hbt_code", "hbt_freq", "hbt_is_unknown", "hbt_is_head", "hbt_is_body", "hbt_is_tail",
+                   "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
     brand_cols = ["ind_top10_brand"]
     node_feature_cols = list(dict.fromkeys(zero_cols + level_peak_cols + transition_cols + static_cols + brand_cols + ["instock_active_rate", "instock_active50_rate", "demand_active_rate"]))
     for c in node_feature_cols:
@@ -645,16 +659,75 @@ def _build_graphsage_assets(
             neigh.append(row[:K])
         neigh_idx = np.asarray(neigh, dtype=np.int64)
 
+    # Competitive neighbors: same category/GL candidates that may compete for exposure/clicks.
+    # This is not a similarity average. It is a second relation type meant to capture
+    # attention competition, especially head/top-brand/high-review products vs body/tail products.
+    def _build_competitive_neighbors(meta_df, feat_df, K):
+        N = len(feat_df)
+        if N <= 1:
+            return np.zeros((N, max(1, K)), dtype=np.int64)
+        cat_arr = meta_df["category_code"].astype(str).values
+        gl_arr = meta_df["gl_product_group"].astype(str).values
+        hbt_arr = meta_df["hbt"].astype(str).str.lower().values if "hbt" in meta_df.columns else np.array(["missing"] * N)
+        top_arr = meta_df["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta_df.columns else np.zeros(N)
+        # Strength proxy: category attention winner score.
+        strength_raw = (
+            0.90 * feat_df.get("log_review_last", pd.Series(np.zeros(N))).astype(float).values +
+            0.70 * feat_df.get("log_active_only_q95", pd.Series(np.zeros(N))).astype(float).values +
+            0.50 * feat_df.get("log_instock_q95", pd.Series(np.zeros(N))).astype(float).values +
+            0.50 * top_arr +
+            0.35 * feat_df.get("hbt_is_head", pd.Series(np.zeros(N))).astype(float).values
+        )
+        sr = strength_raw.copy()
+        sr = (sr - np.nanmean(sr)) / (np.nanstd(sr) + 1e-8)
+        out = []
+        all_idx = np.arange(N)
+        for i in range(N):
+            # Prefer same category; fall back to same GL; then global strongest alternatives.
+            cand = all_idx[(cat_arr == cat_arr[i]) & (all_idx != i)]
+            if len(cand) < K:
+                cand = np.unique(np.concatenate([cand, all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]]))
+            if len(cand) == 0:
+                cand = all_idx[all_idx != i]
+            if len(cand) == 0:
+                cand = np.array([i])
+
+            hbt_diff = (hbt_arr[cand] != hbt_arr[i]).astype(float)
+            brand_diff = (top_arr[cand] != top_arr[i]).astype(float)
+            cat_same = (cat_arr[cand] == cat_arr[i]).astype(float)
+            gl_same = (gl_arr[cand] == gl_arr[i]).astype(float)
+            # Stronger candidates matter more for possible attention stealing;
+            # hbt/top-brand/review gaps help distinguish competing rather than similar products.
+            score = (
+                2.00 * cat_same +
+                0.60 * gl_same +
+                0.80 * hbt_diff +
+                0.45 * brand_diff +
+                0.55 * np.maximum(sr[cand] - sr[i], 0.0) +
+                0.20 * np.abs(sr[cand] - sr[i]) +
+                0.25 * sr[cand]
+            )
+            order = np.argsort(-score)
+            chosen = cand[order].tolist()
+            if not chosen:
+                chosen = [i]
+            while len(chosen) < K:
+                chosen.append(chosen[-1])
+            out.append(chosen[:K])
+        return np.asarray(out, dtype=np.int64)
+
+    comp_idx = _build_competitive_neighbors(meta, feat, K)
+
     asin_list = feat["asin"].astype(str).tolist()
     asin_to_idx = {a: i for i, a in enumerate(asin_list)}
 
     if verbose:
         print("\n" + "=" * 100)
-        print("GRAPHSAGE ASSET BUILD")
+        print("DUAL-RELATION GRAPHSAGE ASSET BUILD")
         print("=" * 100)
         print(f"Nodes: {N} | K={K} | node_feat_dim={len(node_feature_cols)}")
         print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
-        print("Key added graph magnitude features: active_only_mean/q90/q95, q95_over_mean, top10/top20_share")
+        print("Key graph features: active_only_mean/q90/q95, q95_over_mean, top10/top20_share, hbt, top10_brand, review_count")
         try:
             nb = neigh_idx
             same_gl = []
@@ -667,7 +740,20 @@ def _build_graphsage_assets(
                 same_gl.append(np.mean(gl_arr[nb[i]] == gl_arr[i]))
                 same_cat.append(np.mean(cat_arr[nb[i]] == cat_arr[i]))
                 same_brand.append(np.mean(br_arr[nb[i]] == br_arr[i]))
-            print(f"Neighbor homophily: same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
+            print(f"Positive-neighbor homophily: same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
+            try:
+                cb = comp_idx
+                comp_same_cat = []
+                comp_diff_hbt = []
+                comp_stronger_brand = []
+                hbt_arr = meta["hbt"].astype(str).values if "hbt" in meta.columns else np.array(["missing"] * N)
+                for i in range(N):
+                    comp_same_cat.append(np.mean(cat_arr[cb[i]] == cat_arr[i]))
+                    comp_diff_hbt.append(np.mean(hbt_arr[cb[i]] != hbt_arr[i]))
+                    comp_stronger_brand.append(np.mean(br_arr[cb[i]] > br_arr[i]))
+                print(f"Competitive-neighbor diagnostic: same_category={np.mean(comp_same_cat):.3f} | diff_HBT={np.mean(comp_diff_hbt):.3f} | stronger_top10_brand={np.mean(comp_stronger_brand):.3f}")
+            except Exception as e2:
+                print(f"Competitive-neighbor diagnostic skipped: {e2}")
         except Exception as e:
             print(f"Neighbor homophily diagnostic skipped: {e}")
 
@@ -676,6 +762,7 @@ def _build_graphsage_assets(
     return {
         "node_features": X_std.astype(np.float32),
         "neighbor_idx": neigh_idx.astype(np.int64),
+        "competitive_neighbor_idx": comp_idx.astype(np.int64),
         "asin_to_idx": asin_to_idx,
         "idx_to_asin": asin_list,
         "node_feature_names": node_feature_cols,
@@ -1221,34 +1308,46 @@ class HorizonTCNBlock(nn.Module):
 
 
 
-class GraphSAGEEncoder(nn.Module):
+class DualGraphSAGEEncoder(nn.Module):
     """
-    Lightweight 1-layer GraphSAGE encoder.
+    Lightweight dual-relation 1-layer DualGraphSAGE encoder.
 
-    It learns a soft ASIN graph embedding from:
-      self node feature + scaled mean neighbor message.
+    It learns an ASIN graph embedding from three pieces:
+      1. self node feature
+      2. positive/co-movement neighbor message
+      3. competitive/attention-stealing neighbor message
 
-    This is intentionally shallow and residual-like to avoid the graph12 failure mode
-    where neighbor zero information dominated and caused systematic underprediction.
+    This is designed for exposure/click-like signals where same-category products
+    can move together, but head/top-brand/high-review products can also compete
+    with body/tail products for user attention.
     """
     def __init__(self, node_feat_dim, graph_dim=16, dropout=0.10, neighbor_message_scale=0.20):
         super().__init__()
         self.neighbor_message_scale = float(neighbor_message_scale)
         self.self_proj = nn.Linear(node_feat_dim, graph_dim)
-        self.neigh_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.pos_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.comp_proj = nn.Linear(node_feat_dim, graph_dim)
         self.out = nn.Sequential(
+            nn.Linear(graph_dim * 3, graph_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(graph_dim, graph_dim),
             nn.LayerNorm(graph_dim),
         )
 
-    def forward(self, node_features, neighbor_idx):
-        # node_features: [N,F], neighbor_idx: [N,K]
-        neigh = node_features[neighbor_idx]          # [N,K,F]
-        neigh_mean = neigh.mean(dim=1)               # [N,F]
-        h = self.self_proj(node_features) + self.neighbor_message_scale * self.neigh_proj(neigh_mean)
-        return self.out(h)
+    def forward(self, node_features, neighbor_idx, competitive_neighbor_idx=None):
+        # node_features: [N,F], neighbor_idx: [N,K], competitive_neighbor_idx: [N,K]
+        pos = node_features[neighbor_idx].mean(dim=1)
+        if competitive_neighbor_idx is None:
+            comp = torch.zeros_like(pos)
+        else:
+            comp = node_features[competitive_neighbor_idx].mean(dim=1)
+        h_self = self.self_proj(node_features)
+        h_pos = self.neighbor_message_scale * self.pos_proj(pos)
+        h_comp = self.neighbor_message_scale * self.comp_proj(comp)
+        # Do not hard subtract competitive message. Let the MLP learn whether
+        # competitive context should suppress or boost each target.
+        return self.out(torch.cat([h_self, h_pos, h_comp], dim=-1))
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
@@ -1496,10 +1595,7 @@ class ExposureForecastModelV2(nn.Module):
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
-                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
-                 graph_in_decoder=False,
-                 use_graph_residual_correction=True,
-                 graph_correction_scale=0.10):
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1510,30 +1606,20 @@ class ExposureForecastModelV2(nn.Module):
         if self.use_graphsage:
             node_np = graph_assets["node_features"].astype(np.float32)
             neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
+            comp_np = graph_assets.get("competitive_neighbor_idx", graph_assets["neighbor_idx"]).astype(np.int64)
             self.register_buffer("graph_node_features", torch.tensor(node_np, dtype=torch.float32))
             self.register_buffer("graph_neighbor_idx", torch.tensor(neigh_np, dtype=torch.long))
-            self.graph_encoder = GraphSAGEEncoder(
+            self.register_buffer("graph_competitive_neighbor_idx", torch.tensor(comp_np, dtype=torch.long))
+            self.graph_encoder = DualGraphSAGEEncoder(
                 node_feat_dim=node_np.shape[1],
                 graph_dim=self.graph_dim,
                 dropout=dropout,
                 neighbor_message_scale=graph_message_scale,
             )
-            print(f"GraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
+            print(f"DualGraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
         else:
             self.graph_encoder = None
-            print("GraphSAGE disabled")
-
-        # Graph usage modes:
-        #   graph_in_decoder=True  -> old behavior: concatenate graph embedding to future_context.
-        #   use_graph_residual_correction=True -> new behavior: keep base decoder clean, then
-        #      apply a small dynamic multiplicative/log residual correction using graph embedding.
-        # The new default is correction-only, because previous concat-to-decoder GraphSAGE runs
-        # improved active/regime diagnostics but systematically compressed active magnitude.
-        self.graph_in_decoder = bool(self.use_graphsage and graph_in_decoder)
-        self.use_graph_residual_correction = bool(self.use_graphsage and use_graph_residual_correction)
-        self.graph_correction_scale = float(graph_correction_scale)
-        if self.use_graphsage:
-            print(f"Graph mode: in_decoder={self.graph_in_decoder} | residual_correction={self.use_graph_residual_correction} | correction_scale={self.graph_correction_scale}")
+            print("DualGraphSAGE disabled")
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -1583,7 +1669,7 @@ class ExposureForecastModelV2(nn.Module):
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
-            context_dim=context_dim + (self.graph_dim if self.graph_in_decoder else 0),
+            context_dim=context_dim + self.graph_dim,
             horizon=horizon,
             hidden=max(96, d_model * 2),
             n_heads=n_heads,
@@ -1599,86 +1685,20 @@ class ExposureForecastModelV2(nn.Module):
             gate_temperature=gate_temperature,
         )
 
-        # Dynamic graph magnitude corrector.
-        # This is NOT a new exposure predictor and NOT a p_active gate.
-        # It starts from the base ENN exposure path, then applies a small horizon-wise
-        # log residual: log_hat_final = log_hat_base + scale * tanh(delta).
-        # The goal is cross-ASIN magnitude transfer: if similar/category/brand neighbors imply
-        # higher active-only scale, lift 80->100 or 150->220 without changing zero regime too much.
-        if self.use_graph_residual_correction:
-            corr_in_dim = self.graph_dim + context_dim + 3 + 2
-            self.graph_correction_head = nn.Sequential(
-                nn.Linear(corr_in_dim, max(64, d_model)),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(max(64, d_model), max(32, d_model // 2)),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(max(32, d_model // 2), 3),
-                nn.Tanh(),
-            )
-        else:
-            self.graph_correction_head = None
-
     def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
         enc_out = self.encoder(x)
-        orig_future_context = future_context
-        graph_emb_all = None
-        g = None
 
         if self.use_graphsage:
             if asin_idx is None:
                 raise ValueError("asin_idx is required when use_graphsage=True")
-            graph_emb_all = self.graph_encoder(self.graph_node_features, self.graph_neighbor_idx)  # [N,G]
+            graph_emb_all = self.graph_encoder(self.graph_node_features, self.graph_neighbor_idx, self.graph_competitive_neighbor_idx)  # [N,G]
             g = graph_emb_all[asin_idx.long()]                                                     # [B,G]
-
-        decoder_context = future_context
-        if self.use_graphsage and self.graph_in_decoder:
             B, H, _ = future_context.shape
             g_rep = g[:, None, :].expand(B, H, -1)
-            decoder_context = torch.cat([future_context, g_rep], dim=-1)
+            future_context = torch.cat([future_context, g_rep], dim=-1)
 
-        # If graph residual correction is enabled, request auxiliary output so we can correct
-        # the base log_hat and still return the usual diagnostics.
-        need_aux = bool(return_aux or self.use_graph_residual_correction)
-        base_out = self.decoder(enc_out, decoder_context, return_aux=need_aux, z=z)
+        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
 
-        if not self.use_graph_residual_correction:
-            return base_out
-
-        if isinstance(base_out, dict):
-            base_log_hat = base_out["log_hat"]
-        else:
-            base_log_hat = base_out
-
-        B, H, _ = base_log_hat.shape
-        h_idx = torch.arange(H, device=base_log_hat.device, dtype=base_log_hat.dtype)
-        h_norm = h_idx.view(1, H, 1).expand(B, H, 1) / max(H, 1)
-        hsin = torch.sin(2 * torch.pi * h_norm)
-        hcos = torch.cos(2 * torch.pi * h_norm)
-        g_rep = g[:, None, :].expand(B, H, -1)
-
-        # Correction sees: base path, ASIN graph embedding, and original future context.
-        # This makes graph act as a small dynamic magnitude corrector, not as the main decoder input.
-        corr_x = torch.cat([base_log_hat, g_rep, orig_future_context, hsin, hcos], dim=-1)
-        graph_delta_raw = self.graph_correction_head(corr_x)  # [-1,1]
-        graph_delta = self.graph_correction_scale * graph_delta_raw
-        corrected_log_hat = torch.clamp(base_log_hat + graph_delta, min=0.0)
-
-        if not return_aux:
-            return corrected_log_hat
-
-        out = dict(base_out)
-        out["base_log_hat"] = base_log_hat
-        out["graph_delta_raw"] = graph_delta_raw
-        out["graph_delta"] = graph_delta
-        out["graph_delta_mean"] = graph_delta.mean(dim=(0, 1)).detach()
-        out["log_hat"] = corrected_log_hat
-        out["pred_level"] = torch.expm1(corrected_log_hat).clamp(min=0.0)
-        # For compatibility with downstream diagnostics that read log_mag/mag_level.
-        out["log_mag"] = corrected_log_hat
-        out["mag_level"] = out["pred_level"]
-        return out
 
 # ============================================================
 # Loss：Hurdle BCE + Magnitude Huber + Mean Penalty
@@ -2369,7 +2389,7 @@ def print_exposure_diagnostics(pred_df):
 # Encoder / Decoder diagnostics
 # ============================================================
 
-def diagnose_encoder_decoder_performance(model, va_ld, pred_df=None, max_batches=None, device=None):
+def _diagnose_encoder_decoder_performance_impl(model, va_ld, pred_df=None, max_batches=None, device=None):
     """
     Quick diagnostic for whether encoder and decoder learned useful signals.
 
@@ -2401,7 +2421,9 @@ def diagnose_encoder_decoder_performance(model, va_ld, pred_df=None, max_batches
             fc = b["future_context"]
             enc_out = model.encoder(x)
             h_last = enc_out[:, -1, :]
-            aux = model.decoder(enc_out, fc, return_aux=True)
+            # Important: call the full model instead of model.decoder(...) so graph context
+            # (asin_idx -> graph embedding -> augmented future_context) is included.
+            aux = model(x, fc, return_aux=True, asin_idx=b.get("asin_idx"))
 
             pred_level = torch.expm1(aux["log_hat"]).clamp(min=0.0)
             y_stack = torch.stack([
@@ -2625,14 +2647,13 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
-    graph_in_decoder=False,
-    use_graph_residual_correction=True,
-    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -2682,9 +2703,6 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
-        graph_in_decoder=graph_in_decoder,
-        use_graph_residual_correction=use_graph_residual_correction,
-        graph_correction_scale=graph_correction_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -2710,13 +2728,13 @@ def run_exposure_v2(
         peak_under_weight=peak_under_weight,
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
+        zero_fp_threshold=zero_fp_threshold,
+        zero_fp_temperature=zero_fp_temperature,
     )
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     exposure_hat_for_demand = make_external_hat_df(pred_df)
 
     return {
@@ -3011,14 +3029,13 @@ def _train_one_exposure_window(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
     dropout=0.20,
     use_graphsage=False,
     graph_assets=None,
     graph_dim=16,
     graph_message_scale=0.10,
-    graph_in_decoder=False,
-    use_graph_residual_correction=True,
-    graph_correction_scale=0.10,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -3063,9 +3080,6 @@ def _train_one_exposure_window(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
-        graph_in_decoder=graph_in_decoder,
-        use_graph_residual_correction=use_graph_residual_correction,
-        graph_correction_scale=graph_correction_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -3098,6 +3112,8 @@ def _train_one_exposure_window(
         peak_under_weight=peak_under_weight,
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
+        zero_fp_threshold=zero_fp_threshold,
+        zero_fp_temperature=zero_fp_temperature,
     )
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
@@ -3105,8 +3121,6 @@ def _train_one_exposure_window(
     pred_df["backtest_offset"] = int(val_start_offset)
 
     diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     return {
         "model": model,
         "forecast_df": pred_df,
@@ -3121,12 +3135,12 @@ def _train_one_exposure_window(
 
 
 # ============================================================
-# GraphSAGE diagnostics: is graph embedding useful, and for what?
+# DualGraphSAGE diagnostics: is graph embedding useful, and for what?
 # ============================================================
 
-def diagnose_graphsage_signal(model, graph_assets, pred_df, target="instock", verbose=True):
+def diagnose_dualgraph_signal(model, graph_assets, pred_df, target="instock", verbose=True):
     """
-    Probe whether GraphSAGE embedding carries useful information.
+    Probe whether DualGraphSAGE embedding carries useful information.
 
     Prints/returns:
       1. neighbor homophily: does KNN graph actually connect similar GL/category/brand nodes?
@@ -3137,7 +3151,7 @@ def diagnose_graphsage_signal(model, graph_assets, pred_df, target="instock", ve
     """
     if graph_assets is None or model is None or not getattr(model, "use_graphsage", False):
         if verbose:
-            print("GraphSAGE diagnostics skipped: graph is disabled.")
+            print("DualGraphSAGE diagnostics skipped: graph is disabled.")
         return {}
 
     diag = {}
@@ -3145,7 +3159,8 @@ def diagnose_graphsage_signal(model, graph_assets, pred_df, target="instock", ve
         with torch.no_grad():
             node_feat = model.graph_node_features
             neigh_idx = model.graph_neighbor_idx
-            emb = model.graph_encoder(node_feat, neigh_idx).detach().cpu().numpy()
+            comp_idx = getattr(model, "graph_competitive_neighbor_idx", neigh_idx)
+            emb = model.graph_encoder(node_feat, neigh_idx, comp_idx).detach().cpu().numpy()
         idx_to_asin = graph_assets.get("idx_to_asin", [str(i) for i in range(emb.shape[0])])
         emb_cols = [f"g{i}" for i in range(emb.shape[1])]
         emb_df = pd.DataFrame(emb, columns=emb_cols)
@@ -3262,7 +3277,7 @@ def diagnose_graphsage_signal(model, graph_assets, pred_df, target="instock", ve
 
     if verbose:
         print("\n" + "=" * 100)
-        print("GRAPHSAGE EFFECT DIAGNOSTICS")
+        print("DUAL-RELATION GRAPHSAGE EFFECT DIAGNOSTICS")
         print("=" * 100)
         if "neighbor_homophily" in diag:
             print("Neighbor homophily:", {k: round(v, 4) for k, v in diag["neighbor_homophily"].items()})
@@ -3319,6 +3334,8 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
@@ -3326,9 +3343,6 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
-    graph_in_decoder=False,
-    use_graph_residual_correction=True,
-    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -3397,9 +3411,6 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
-        graph_in_decoder=graph_in_decoder,
-        use_graph_residual_correction=use_graph_residual_correction,
-        graph_correction_scale=graph_correction_scale,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
@@ -3413,7 +3424,7 @@ def run_exposure_v2(
     out["diagnostics"]["gl_horizon_block"] = gl_block_diag
     out["diagnostics"]["gl_summary"] = gl_summary
 
-    graph_diagnostics = diagnose_graphsage_signal(out.get("model"), graph_assets, pred_df, target="instock", verbose=True) if use_graphsage else {}
+    graph_diagnostics = diagnose_dualgraph_signal(out.get("model"), graph_assets, pred_df, target="instock", verbose=True) if use_graphsage else {}
     out["diagnostics"]["graph"] = graph_diagnostics
 
     out.update({
@@ -3470,15 +3481,14 @@ def run_exposure_v2_rolling(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
     dropout=0.20,
     use_scot_intersection=True,
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
-    graph_in_decoder=False,
-    use_graph_residual_correction=True,
-    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -3548,6 +3558,8 @@ def run_exposure_v2_rolling(
                 peak_under_weight=peak_under_weight,
                 peak_topk=peak_topk,
                 peak_quantile=peak_quantile,
+                zero_fp_threshold=zero_fp_threshold,
+                zero_fp_temperature=zero_fp_temperature,
                 dropout=dropout,
                 use_graphsage=use_graphsage,
                 graph_assets=graph_assets,
@@ -3832,9 +3844,6 @@ def run_exposure_v2_final_scot_5000(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.10,
-    graph_in_decoder=False,
-    use_graph_residual_correction=True,
-    graph_correction_scale=0.10,
     graph_zero_weight=0.2,
     graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
@@ -3875,12 +3884,18 @@ def run_exposure_v2_final_scot_5000(
     )
 
 # ============================================================
-# Usage
+# Usage: dual-relation GraphSAGE exposure model
 # ============================================================
-# Final setup: 5000 sample + SCOT intersection + latest 20-week holdout.
-# Training samples are sliding windows; validation/test is the final 20-week window.
+# This is the recommended run command for the current version.
+# It uses:
+#   - no extra zero/occurrence loss
+#   - NaN DPH -> 0 handling
+#   - category_code
+#   - dual-relation GraphSAGE using positive + competitive neighbors
+#   - hbt, customer_active_review_count / customer_review_count, ind_top10_brand
+#   - graph diagnostics only; heavy encoder/decoder diagnostics are disabled
 #
-# %run -i tcn_exposure_v2_single_head_direct_gl_diag.py
+# %run -i tcn_exposure_v2_enn_nogate_peakloss_category_dualgraph_hbt_review_gpu_CLEAN.py
 #
 # result = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
@@ -3891,17 +3906,34 @@ def run_exposure_v2_final_scot_5000(
 #     patience=6,
 #     batch_size=128,
 #     use_encoder_self_attn=True,
+#
+#     use_graphsage=True,
+#     neighbor_k=10,
+#     graph_dim=16,
+#     graph_message_scale=0.10,
+#
+#     graph_zero_weight=0.2,
+#     graph_level_peak_weight=1.5,
+#     graph_transition_weight=1.0,
+#     graph_static_weight=1.0,
+#     graph_brand_weight=0.5,
 # )
 #
 # pred_df = result["forecast_df"]
 # exposure_hat_for_demand = result["exposure_hat_for_demand"]
 # diagnostics = result["diagnostics"]
+# graph_diag = diagnostics.get("graph", {})
 # gl_diag = result["gl_diagnostics"]
 # gl_block_diag = result["gl_horizon_block_diagnostics"]
 # gl_summary = result["gl_summary"]
 #
-# Optional no-attention ablation:
-# result_no_attn = run_exposure_v2_final_scot_5000(
+# Quick ablations:
+#   1) If GraphSAGE underpredicts, reduce graph_message_scale to 0.05.
+#   2) If graph signal is too weak, increase graph_dim to 32.
+#   3) If zero smoothing is still too strong, set graph_zero_weight=0.0 or 0.1.
+#
+# No-graph baseline:
+# result_no_graph = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     history=13,
@@ -3909,10 +3941,11 @@ def run_exposure_v2_final_scot_5000(
 #     epochs=30,
 #     patience=6,
 #     batch_size=128,
-#     use_encoder_self_attn=False,
+#     use_encoder_self_attn=True,
+#     use_graphsage=False,
 # )
 #
-# Rolling backtest is still available for robustness checks:
+# Rolling backtest is available but slower:
 # result_roll = run_exposure_v2_rolling(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
@@ -3925,8 +3958,16 @@ def run_exposure_v2_final_scot_5000(
 #     batch_size=128,
 #     use_scot_intersection=True,
 #     use_encoder_self_attn=True,
+#     use_graphsage=True,
+#     neighbor_k=10,
+#     graph_dim=16,
+#     graph_message_scale=0.10,
+#     graph_zero_weight=0.2,
+#     graph_level_peak_weight=1.5,
+#     graph_transition_weight=1.0,
+#     graph_static_weight=1.0,
+#     graph_brand_weight=0.5,
 # )
-
 
 # ============================================================
 # CLEAN DIAGNOSTICS OVERRIDE
@@ -4084,8 +4125,3 @@ def print_exposure_diagnostics(pred_df):
         "asin_sum": asin_sum,
         "final_summary": final_summary,
     }
-
-
-def diagnose_encoder_decoder_performance(*args, **kwargs):
-    """Disabled in clean version to reduce output noise and runtime."""
-    return {}
