@@ -1,0 +1,17 @@
+df = pred_df.copy()
+
+zero_df = df[df["true_instock_dph"] <= 0].copy()
+nonzero_df = df[df["true_instock_dph"] > 0].copy()
+
+print("=== Predicted in_stock on true zero rows ===")
+print(zero_df["pred_instock_dph"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
+
+print("\n=== Predicted in_stock on true nonzero rows ===")
+print(nonzero_df["pred_instock_dph"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
+
+if "p_active_instock" in df.columns:
+    print("\n=== p_active on true zero rows ===")
+    print(zero_df["p_active_instock"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]))
+
+    print("\n=== p_active on true nonzero rows ===")
+    print(nonzero_df["p_active_instock"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]))
