@@ -451,6 +451,8 @@ def _build_graphsage_assets(
       2. Strengthen active-only magnitude / peak features so graph is not only a zero detector.
       3. Include ind_top10_brand as graph node feature and edge-similarity signal.
       4. Down-weight zero features in KNN similarity to avoid graph12-style underprediction.
+      5. OOS is historical-only: past OOS enters encoder and graph summaries, but future
+         scot_oos is NOT used as a known future covariate and no future hard mask is applied.
 
     Returns:
       node_features: standardized ASIN node feature matrix [N,F]
@@ -485,6 +487,14 @@ def _build_graphsage_assets(
         total = _safe_numeric(g.get("total_dph", 0.0)).clip(lower=0.0).values.astype(float)
         demand = _safe_numeric(g.get("fbi_demand", 0.0)).clip(lower=0.0).values.astype(float)
         oos = _safe_numeric(g.get("scot_oos", 0.0)).clip(0, 1).values.astype(float) if "scot_oos" in g.columns else np.zeros(len(g))
+        # Historical-only OOS summaries. These are safe because g excludes the final forecast horizon.
+        oos_bool = oos >= 0.5
+        oos_rate_all = float(np.mean(oos_bool)) if len(oos_bool) else 0.0
+        oos_rate_13 = float(np.mean(oos_bool[-13:])) if len(oos_bool) else 0.0
+        oos_rate_26 = float(np.mean(oos_bool[-26:])) if len(oos_bool) else 0.0
+        last_oos = float(oos_bool[-1]) if len(oos_bool) else 0.0
+        oos_streak = float(_last_run_length(oos_bool, True)) if len(oos_bool) else 0.0
+        weeks_since_last_oos = float((len(oos_bool) - 1 - np.where(oos_bool)[0][-1]) if np.any(oos_bool) else len(oos_bool)) if len(oos_bool) else 0.0
 
         active = instock > 0
         active50 = instock > 50
@@ -542,7 +552,12 @@ def _build_graphsage_assets(
             "instock_active_rate": float(np.mean(instock > 0)) if len(instock) else 0.0,
             "instock_active50_rate": float(np.mean(active50)) if len(instock) else 0.0,
             "demand_active_rate": float(np.mean(demand > 0)) if len(demand) else 0.0,
-            "oos_rate": float(np.mean(oos)) if len(oos) else 0.0,
+            "oos_rate": oos_rate_all,
+            "oos_rate_13": oos_rate_13,
+            "oos_rate_26": oos_rate_26,
+            "last_oos": last_oos,
+            "log_oos_streak": np.log1p(oos_streak),
+            "log_weeks_since_last_oos": np.log1p(weeks_since_last_oos),
             # level / peak: overall
             "log_instock_mean": np.log1p(instock_mean),
             "log_instock_median": np.log1p(instock_median),
@@ -604,7 +619,11 @@ def _build_graphsage_assets(
             feat["hbt_is_body"] = hbt_lower.str.contains("body").astype(float)
             feat["hbt_is_tail"] = hbt_lower.str.contains("tail").astype(float)
 
-    zero_cols = ["instock_zero_rate", "buybox_zero_rate", "total_zero_rate", "oos_rate"]
+    zero_cols = [
+        "instock_zero_rate", "buybox_zero_rate", "total_zero_rate",
+        "oos_rate", "oos_rate_13", "oos_rate_26", "last_oos",
+        "log_oos_streak", "log_weeks_since_last_oos",
+    ]
     level_peak_cols = [
         "log_instock_mean", "log_instock_median", "log_instock_q75", "log_instock_q90",
         "log_instock_q95", "log_instock_max", "instock_cv", "instock_gini",
@@ -800,15 +819,8 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_hor
 
     df["our_price"] = _safe_numeric(df.get("our_price", 0.0)).clip(lower=0.0)
     df["scot_oos"]  = _safe_numeric(df.get("scot_oos",  0.0)).clip(0, 1)
-
-    # OOS is assumed available for this experiment. Treat it as a structural-zero
-    # constraint for effective in-stock exposure. Total_dph is not forced to zero
-    # because page/glance exposure may still exist even when the item is unavailable.
-    n_oos = int((df["scot_oos"] >= 0.5).sum())
-    if n_oos > 0:
-        before_sum = float(df.loc[df["scot_oos"] >= 0.5, "in_stock_dph"].sum())
-        df.loc[df["scot_oos"] >= 0.5, "in_stock_dph"] = 0.0
-        print(f"OOS hard target applied: {n_oos} rows | in_stock_dph sum on OOS rows {before_sum:.2f} -> 0")
+    # IMPORTANT: scot_oos is used as historical input only. It is NOT included in
+    # future_context and there is no future OOS hard mask, avoiding leakage.
 
     # ── 新增动态特征 ──────────────────────────────────────────
     # ind_promotion：动态binary，99.1% ASIN有变化，进active_head
@@ -857,7 +869,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_hor
 
     context_cols = list(dict.fromkeys(
         # ── 动态特征（时间驱动，进active_head）──────────────
-        ["ind_promotion", "ind_prime_week", "scot_oos"]
+        ["ind_promotion", "ind_prime_week"]
         + holiday_cols
         + distance_cols
         + explicit_event_cols
@@ -1386,9 +1398,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  use_enn=True,
                  z_dim=8,
                  residual_scale=2.0,
-                 gate_temperature=1.0,
-                 oos_index=None,
-                 mask_instock_with_oos=True):
+                 gate_temperature=1.0):
         super().__init__()
         self.horizon = horizon
         self.anchor_indices = anchor_indices
@@ -1398,8 +1408,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.z_dim = int(z_dim)
         self.residual_scale = float(residual_scale)
         self.gate_temperature = float(gate_temperature)
-        self.oos_index = oos_index
-        self.mask_instock_with_oos = bool(mask_instock_with_oos)
 
         if self.use_enn:
             self.z_proj = nn.Sequential(
@@ -1537,17 +1545,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         # shifting the path prediction itself, not by p_active * magnitude.
         gate = torch.ones_like(p_active)
         pred_level = mag_level
-
-        # Structural OOS mask: if future scot_oos is known and equals 1,
-        # effective in-stock exposure must be exactly 0.  We only mask the
-        # in_stock channel; total_dph/buy_box_dph are left to the model/funnel.
-        oos_mask = None
-        if self.mask_instock_with_oos and self.oos_index is not None:
-            oos_mask = future_context[:, :, self.oos_index].clamp(0.0, 1.0)
-            pred_level = pred_level.clone()
-            pred_level[:, :, 2] = pred_level[:, :, 2] * (1.0 - oos_mask)
-
-        log_hat = torch.log1p(pred_level.clamp(min=0.0))
+        log_hat = log_mag
 
         if return_aux:
             nan_like = torch.full_like(log_hat, float("nan"))
@@ -1561,7 +1559,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "gamma": nan_like,
                 "gate": gate,
                 "residual": residual,
-                "oos_mask": oos_mask if oos_mask is not None else torch.zeros_like(pred_level[:, :, 2]),
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -1656,13 +1653,6 @@ class ExposureForecastModelV2(nn.Module):
 
         col_idx = {c: i for i, c in enumerate(context_cols)} if context_cols else {}
 
-        # future OOS index for structural in-stock mask
-        oos_index = col_idx.get("scot_oos", None)
-        if oos_index is not None:
-            print(f"Future OOS hard mask enabled for in_stock_dph: scot_oos context index={oos_index}")
-        else:
-            print("Warning: scot_oos not found in future_context; OOS hard mask disabled")
-
         # anchor indices（mean13）
         anchor_indices = None
         try:
@@ -1714,8 +1704,6 @@ class ExposureForecastModelV2(nn.Module):
             z_dim=z_dim,
             residual_scale=residual_scale,
             gate_temperature=gate_temperature,
-            oos_index=oos_index,
-            mask_instock_with_oos=True,
         )
 
     def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
@@ -2629,8 +2617,169 @@ def _diagnose_encoder_decoder_performance_impl(model, va_ld, pred_df=None, max_b
         "attn_diag": attn_diag,
     }
 
-def make_external_hat_df(pred_df):
-    out = pred_df[["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]].copy()
+def _safe_sigmoid_np(x):
+    x = np.asarray(x, dtype=float)
+    x = np.clip(x, -60, 60)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def find_best_instock_zero_threshold(
+    pred_df,
+    p_col="p_active_instock",
+    true_col="true_instock_dph",
+    pred_col="pred_instock_dph",
+    metric="wape_then_bal_acc",
+    grid=None,
+    verbose=True,
+):
+    """
+    Learn a validation-only p_active threshold for turning clear inactive weeks into exact zero.
+
+    This does NOT use future OOS. It only uses the model's own p_active signal.
+    In production, learn this threshold on a validation/backtest window and reuse it.
+    """
+    if grid is None:
+        grid = np.round(np.arange(0.05, 0.951, 0.025), 3)
+
+    if p_col not in pred_df.columns or true_col not in pred_df.columns or pred_col not in pred_df.columns:
+        if verbose:
+            print("Zero calibration skipped: p_active/true/pred columns not found.")
+        return 0.25, pd.DataFrame()
+
+    y = (pred_df[true_col].values > 0).astype(int)
+    p = pred_df[p_col].values.astype(float)
+    pred_raw = pred_df[pred_col].values.astype(float)
+    true = pred_df[true_col].values.astype(float)
+
+    rows = []
+    for th in grid:
+        active_hat = (p >= th).astype(int)
+        pred_adj = pred_raw.copy()
+        pred_adj[p < th] = 0.0
+
+        tp = int(((active_hat == 1) & (y == 1)).sum())
+        tn = int(((active_hat == 0) & (y == 0)).sum())
+        fp = int(((active_hat == 1) & (y == 0)).sum())
+        fn = int(((active_hat == 0) & (y == 1)).sum())
+        tpr = tp / max(tp + fn, 1)
+        tnr = tn / max(tn + fp, 1)
+        bal_acc = 0.5 * (tpr + tnr)
+        precision = tp / max(tp + fp, 1)
+        recall = tpr
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        zero_recall = tnr
+        false_zero_rate = fn / max((y == 1).sum(), 1)
+        wape = np.abs(pred_adj - true).sum() / (np.abs(true).sum() + 1e-8)
+        ratio = pred_adj.sum() / (true.sum() + 1e-8)
+        exact_zero_share = float((pred_adj <= 0).mean())
+        rows.append({
+            "threshold": float(th),
+            "WAPE_after_zero": float(wape),
+            "ratio_after_zero": float(ratio),
+            "balanced_accuracy": float(bal_acc),
+            "F1_active": float(f1),
+            "active_recall": float(recall),
+            "zero_recall": float(zero_recall),
+            "false_zero_rate_on_active": float(false_zero_rate),
+            "exact_zero_share": exact_zero_share,
+        })
+
+    tbl = pd.DataFrame(rows)
+    if len(tbl) == 0:
+        return 0.25, tbl
+
+    # Prefer good WAPE while avoiding too many false zero active weeks.
+    # We constrain ratio to a reasonable range and false-zero rate to avoid killing magnitude.
+    candidates = tbl[(tbl["ratio_after_zero"].between(0.92, 1.08)) & (tbl["false_zero_rate_on_active"] <= 0.12)].copy()
+    if len(candidates) == 0:
+        candidates = tbl.copy()
+
+    if metric == "balanced_accuracy":
+        best_idx = candidates["balanced_accuracy"].idxmax()
+    elif metric == "f1":
+        best_idx = candidates["F1_active"].idxmax()
+    else:
+        # lower WAPE first, then higher balanced accuracy
+        candidates = candidates.sort_values(["WAPE_after_zero", "balanced_accuracy"], ascending=[True, False])
+        best_idx = candidates.index[0]
+
+    best_th = float(tbl.loc[best_idx, "threshold"])
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("IN-STOCK ZERO CALIBRATION THRESHOLD SEARCH")
+        print("=" * 100)
+        print(f"Best p_active_instock threshold: {best_th:.3f}")
+        show = tbl.sort_values("WAPE_after_zero").head(8)
+        print(show.round(4).to_string(index=False))
+
+    return best_th, tbl
+
+
+def make_external_hat_df(
+    pred_df,
+    zero_calibrate=False,
+    p_threshold="auto",
+    hard_zero_threshold=None,
+    soft_temperature=None,
+    keep_aux_cols=True,
+):
+    """
+    Build the exposure_hat_for_demand table.
+
+    zero_calibrate=False:
+        original raw direct-head exposure prediction.
+
+    zero_calibrate=True:
+        use p_active_instock to set clear inactive weeks to exact zero.
+        This handles the failure mode where softplus/direct regression never outputs exact 0.
+        It does not use future OOS, so it does not introduce OOS leakage.
+    """
+    base_cols = ["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    extra_cols = []
+    for c in ["p_active_total", "p_active_buy_box", "p_active_instock", "horizon"]:
+        if keep_aux_cols and c in pred_df.columns:
+            extra_cols.append(c)
+
+    out = pred_df[base_cols + extra_cols].copy()
+
+    if zero_calibrate:
+        out["pred_instock_dph_raw"] = out["pred_instock_dph"].astype(float)
+
+        if "p_active_instock" in out.columns:
+            if p_threshold == "auto":
+                th, th_tbl = find_best_instock_zero_threshold(pred_df, verbose=True)
+            else:
+                th = float(p_threshold)
+                th_tbl = pd.DataFrame()
+
+            out["zero_calib_p_threshold"] = float(th)
+            out["pred_instock_active_flag"] = (out["p_active_instock"] >= th).astype(float)
+
+            if soft_temperature is not None:
+                temp = max(float(soft_temperature), 1e-6)
+                soft_mask = _safe_sigmoid_np((out["p_active_instock"].values - th) / temp)
+                out["pred_instock_dph_softcalib"] = out["pred_instock_dph_raw"].values * soft_mask
+                out["pred_instock_dph"] = out["pred_instock_dph_softcalib"]
+
+            # Hard exact zero. This is the piece that fixes "pred never equals 0".
+            hth = th if hard_zero_threshold is None else float(hard_zero_threshold)
+            out.loc[out["p_active_instock"] < hth, "pred_instock_dph"] = 0.0
+            out["zero_calib_hard_threshold"] = float(hth)
+        else:
+            # Fallback if p_active is not saved: only zero very tiny predictions.
+            value_th = 1.0 if hard_zero_threshold is None else float(hard_zero_threshold)
+            out["pred_instock_dph_raw"] = out["pred_instock_dph"].astype(float)
+            out.loc[out["pred_instock_dph"] < value_th, "pred_instock_dph"] = 0.0
+            out["zero_calib_value_threshold"] = float(value_th)
+
+    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    out[pred_cols] = out[pred_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+
+    # Enforce funnel without in-place tensor issues; this is pandas post-processing only.
+    out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
+    out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
+
     out["external_total_dph_hat_log"]    = np.log1p(out["pred_total_dph"].clip(lower=0.0))
     out["external_buy_box_dph_hat_log"]  = np.log1p(out["pred_buy_box_dph"].clip(lower=0.0))
     out["external_instock_dph_hat_log"]  = np.log1p(out["pred_instock_dph"].clip(lower=0.0))
@@ -2775,6 +2924,7 @@ def run_exposure_v2(
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
         "exposure_hat_for_demand": exposure_hat_for_demand,
+        "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -3462,6 +3612,7 @@ def run_exposure_v2(
 
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
+        "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
@@ -3917,7 +4068,7 @@ def run_exposure_v2_final_scot_5000(
     )
 
 # ============================================================
-# Usage: dual-relation GraphSAGE exposure model + OOS hard in-stock mask
+# Usage: dual-relation GraphSAGE exposure model + historical-only OOS
 # ============================================================
 # This is the recommended run command for the current version.
 # It uses:
