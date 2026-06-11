@@ -2511,6 +2511,7 @@ class ExposureDatasetRolling(Dataset):
             "future_buy_box_dph": torch.tensor(d["buy_box_dph"][start + h:start + h + H], dtype=torch.float32),
             "future_instock_dph": torch.tensor(d["in_stock_dph"][start + h:start + h + H], dtype=torch.float32),
             "future_demand": torch.tensor(d["demand"][start + h:start + h + H], dtype=torch.float32),
+            "asin_idx": torch.tensor(int(d.get("asin_idx", 0)), dtype=torch.long),
         }
 
 
@@ -2801,7 +2802,11 @@ def run_exposure_v2(
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
         zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
         total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         path_zero_weight=path_zero_weight,
