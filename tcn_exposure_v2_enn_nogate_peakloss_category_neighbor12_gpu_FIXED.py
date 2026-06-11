@@ -382,7 +382,323 @@ def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4)
     return out, event_cols
 
 
-def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.5, graph_level_peak_weight=1.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
+
+
+# ============================================================
+# GraphSAGE assets: ASIN graph construction + diagnostics support
+# ============================================================
+
+def _run_lengths(mask):
+    """Return lengths of consecutive True runs in a boolean array."""
+    arr = np.asarray(mask).astype(bool)
+    runs = []
+    cur = 0
+    for v in arr:
+        if v:
+            cur += 1
+        else:
+            if cur > 0:
+                runs.append(cur)
+            cur = 0
+    if cur > 0:
+        runs.append(cur)
+    return runs
+
+
+def _top_share(x, frac=0.20):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    x = x[x > 0]
+    if len(x) == 0 or x.sum() <= 0:
+        return 0.0
+    k = max(1, int(np.ceil(len(x) * frac)))
+    return float(np.sort(x)[::-1][:k].sum() / (x.sum() + 1e-8))
+
+
+def _last_run_length(mask, value=True):
+    arr = np.asarray(mask).astype(bool)
+    if len(arr) == 0:
+        return 0.0
+    target = bool(value)
+    cnt = 0
+    for v in arr[::-1]:
+        if bool(v) == target:
+            cnt += 1
+        else:
+            break
+    return float(cnt)
+
+
+def _build_graphsage_assets(
+    df,
+    graph_horizon=20,
+    neighbor_k=10,
+    graph_zero_weight=0.2,
+    graph_level_peak_weight=1.5,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.5,
+    verbose=True,
+):
+    """
+    Build a shallow ASIN KNN graph for GraphSAGE.
+
+    Important design choices:
+      1. Use only history before the final forecast window per ASIN.
+      2. Strengthen active-only magnitude / peak features so graph is not only a zero detector.
+      3. Include ind_top10_brand as graph node feature and edge-similarity signal.
+      4. Down-weight zero features in KNN similarity to avoid graph12-style underprediction.
+
+    Returns:
+      node_features: standardized ASIN node feature matrix [N,F]
+      neighbor_idx:  top-k neighbor indices [N,K]
+      asin_to_idx:   mapping used by Dataset batches
+      meta_df/raw_feature_df for graph diagnostics
+    """
+    work = df.copy()
+    work["asin"] = work["asin"].astype(str)
+    work["order_week"] = pd.to_datetime(work["order_week"])
+    work = work.sort_values(["asin", "order_week"]).reset_index(drop=True)
+
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph", "fbi_demand", "scot_oos", "our_price",
+              "customer_active_review_count", "ind_promotion", "ind_prime_week", "ind_top10_brand"]:
+        if c in work.columns:
+            work[c] = _safe_numeric(work[c]).fillna(0.0)
+
+    rows = []
+    meta_rows = []
+    for asin, g0 in work.groupby("asin", sort=False):
+        g0 = g0.sort_values("order_week").reset_index(drop=True)
+        # avoid leakage: drop the final forecast horizon from graph statistics
+        if len(g0) > graph_horizon:
+            g = g0.iloc[:-int(graph_horizon)].copy()
+        else:
+            g = g0.copy()
+        if len(g) == 0:
+            g = g0.copy()
+
+        instock = _safe_numeric(g.get("in_stock_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        buy = _safe_numeric(g.get("buy_box_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        total = _safe_numeric(g.get("total_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        demand = _safe_numeric(g.get("fbi_demand", 0.0)).clip(lower=0.0).values.astype(float)
+        oos = _safe_numeric(g.get("scot_oos", 0.0)).clip(0, 1).values.astype(float) if "scot_oos" in g.columns else np.zeros(len(g))
+
+        active = instock > 0
+        active50 = instock > 50
+        zero = ~active
+        active_prev = active[:-1] if len(active) > 1 else np.array([], dtype=bool)
+        active_next = active[1:] if len(active) > 1 else np.array([], dtype=bool)
+        a2z = float(np.sum(active_prev & (~active_next)) / (np.sum(active_prev) + 1e-8)) if len(active_prev) else 0.0
+        z2a = float(np.sum((~active_prev) & active_next) / (np.sum(~active_prev) + 1e-8)) if len(active_prev) else 0.0
+        active_runs = _run_lengths(active)
+        zero_runs = _run_lengths(zero)
+
+        pos_instock = instock[instock > 0]
+        active_only_mean = float(pos_instock.mean()) if len(pos_instock) else 0.0
+        active_only_q75 = float(np.quantile(pos_instock, 0.75)) if len(pos_instock) else 0.0
+        active_only_q90 = float(np.quantile(pos_instock, 0.90)) if len(pos_instock) else 0.0
+        active_only_q95 = float(np.quantile(pos_instock, 0.95)) if len(pos_instock) else 0.0
+
+        instock_mean = float(np.mean(instock)) if len(instock) else 0.0
+        instock_median = float(np.median(instock)) if len(instock) else 0.0
+        instock_q75 = float(np.quantile(instock, 0.75)) if len(instock) else 0.0
+        instock_q90 = float(np.quantile(instock, 0.90)) if len(instock) else 0.0
+        instock_q95 = float(np.quantile(instock, 0.95)) if len(instock) else 0.0
+        instock_max = float(np.max(instock)) if len(instock) else 0.0
+        instock_std = float(np.std(instock)) if len(instock) else 0.0
+        instock_cv = instock_std / (instock_mean + 1e-8)
+        max_over_mean = instock_max / (instock_mean + 1e-8)
+        q95_over_mean = instock_q95 / (instock_mean + 1e-8)
+        active_q95_over_mean = active_only_q95 / (active_only_mean + 1e-8)
+
+        # approximate concentration / burst features
+        sorted_x = np.sort(np.asarray(instock, dtype=float))
+        if len(sorted_x) > 0 and sorted_x.sum() > 0:
+            n = len(sorted_x)
+            gini = float((2 * np.arange(1, n + 1) @ sorted_x) / (n * sorted_x.sum() + 1e-8) - (n + 1) / n)
+        else:
+            gini = 0.0
+
+        gl = str(g0["gl_product_group"].iloc[0]) if "gl_product_group" in g0.columns else "MISSING"
+        cat = str(g0["category_code"].iloc[0]) if "category_code" in g0.columns else "MISSING"
+        topbrand = float(_safe_numeric(g0["ind_top10_brand"].iloc[[0]]).iloc[0]) if "ind_top10_brand" in g0.columns else 0.0
+        price_mean = float(_safe_numeric(g.get("our_price", 0.0)).clip(lower=0.0).mean()) if "our_price" in g.columns else 0.0
+        review_last = float(_safe_numeric(g.get("customer_active_review_count", 0.0)).clip(lower=0.0).iloc[-1]) if "customer_active_review_count" in g.columns and len(g) else 0.0
+        promo_rate = float(_safe_numeric(g.get("ind_promotion", 0.0)).clip(0, 1).mean()) if "ind_promotion" in g.columns else 0.0
+        prime_rate = float(_safe_numeric(g.get("ind_prime_week", 0.0)).clip(0, 1).mean()) if "ind_prime_week" in g.columns else 0.0
+
+        rows.append({
+            "asin": asin,
+            # zero / active
+            "instock_zero_rate": float(np.mean(instock <= 0)) if len(instock) else 1.0,
+            "buybox_zero_rate": float(np.mean(buy <= 0)) if len(buy) else 1.0,
+            "total_zero_rate": float(np.mean(total <= 0)) if len(total) else 1.0,
+            "instock_active_rate": float(np.mean(instock > 0)) if len(instock) else 0.0,
+            "instock_active50_rate": float(np.mean(active50)) if len(instock) else 0.0,
+            "demand_active_rate": float(np.mean(demand > 0)) if len(demand) else 0.0,
+            "oos_rate": float(np.mean(oos)) if len(oos) else 0.0,
+            # level / peak: overall
+            "log_instock_mean": np.log1p(instock_mean),
+            "log_instock_median": np.log1p(instock_median),
+            "log_instock_q75": np.log1p(instock_q75),
+            "log_instock_q90": np.log1p(instock_q90),
+            "log_instock_q95": np.log1p(instock_q95),
+            "log_instock_max": np.log1p(instock_max),
+            "instock_cv": float(np.clip(instock_cv, 0, 50)),
+            "instock_gini": gini,
+            "top10_share": _top_share(instock, 0.10),
+            "top20_share": _top_share(instock, 0.20),
+            "max_over_mean": float(np.clip(max_over_mean, 0, 100)),
+            "q95_over_mean": float(np.clip(q95_over_mean, 0, 100)),
+            # level / peak: active-only, key to avoid graph under active weeks
+            "log_active_only_mean": np.log1p(active_only_mean),
+            "log_active_only_q75": np.log1p(active_only_q75),
+            "log_active_only_q90": np.log1p(active_only_q90),
+            "log_active_only_q95": np.log1p(active_only_q95),
+            "active_q95_over_mean": float(np.clip(active_q95_over_mean, 0, 100)),
+            # buybox / total scale for funnel information
+            "log_buybox_mean": np.log1p(float(np.mean(buy)) if len(buy) else 0.0),
+            "log_total_mean": np.log1p(float(np.mean(total)) if len(total) else 0.0),
+            # transition
+            "active_to_zero_rate": a2z,
+            "zero_to_active_rate": z2a,
+            "log_avg_active_spell": np.log1p(float(np.mean(active_runs)) if active_runs else 0.0),
+            "log_avg_zero_spell": np.log1p(float(np.mean(zero_runs)) if zero_runs else 0.0),
+            "last_active_streak": np.log1p(_last_run_length(active, True)),
+            "last_zero_streak": np.log1p(_last_run_length(active, False)),
+            "weeks_since_last_positive": np.log1p((len(active) - 1 - np.where(active)[0][-1]) if np.any(active) else len(active)),
+            # static / business
+            "ind_top10_brand": topbrand,
+            "log_price_mean": np.log1p(price_mean),
+            "log_review_last": np.log1p(review_last),
+            "promo_rate": promo_rate,
+            "prime_rate": prime_rate,
+        })
+        meta_rows.append({"asin": asin, "gl_product_group": gl, "category_code": cat, "ind_top10_brand": topbrand})
+
+    feat = pd.DataFrame(rows).fillna(0.0)
+    meta = pd.DataFrame(meta_rows)
+    if len(feat) == 0:
+        raise ValueError("No ASINs available to build GraphSAGE assets.")
+
+    # Encode GL/category as continuous normalized codes + frequencies for node features and KNN.
+    for c in ["gl_product_group", "category_code"]:
+        raw = meta[c].astype(str).fillna("MISSING")
+        codes, uniques = pd.factorize(raw)
+        denom = max(len(uniques) - 1, 1)
+        feat[f"{c}_code"] = codes.astype(float) / denom
+        freq = raw.value_counts(normalize=True)
+        feat[f"{c}_freq"] = raw.map(freq).fillna(0.0).astype(float)
+        if c == "category_code":
+            feat["category_is_unknown"] = raw.str.lower().isin(["unknown", "missing", "nan", "none", ""]).astype(float)
+
+    zero_cols = ["instock_zero_rate", "buybox_zero_rate", "total_zero_rate", "oos_rate"]
+    level_peak_cols = [
+        "log_instock_mean", "log_instock_median", "log_instock_q75", "log_instock_q90",
+        "log_instock_q95", "log_instock_max", "instock_cv", "instock_gini",
+        "top10_share", "top20_share", "max_over_mean", "q95_over_mean",
+        "log_active_only_mean", "log_active_only_q75", "log_active_only_q90", "log_active_only_q95",
+        "active_q95_over_mean", "log_buybox_mean", "log_total_mean",
+    ]
+    transition_cols = ["active_to_zero_rate", "zero_to_active_rate", "log_avg_active_spell", "log_avg_zero_spell", "last_active_streak", "last_zero_streak", "weeks_since_last_positive"]
+    static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown", "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
+    brand_cols = ["ind_top10_brand"]
+    node_feature_cols = list(dict.fromkeys(zero_cols + level_peak_cols + transition_cols + static_cols + brand_cols + ["instock_active_rate", "instock_active50_rate", "demand_active_rate"]))
+    for c in node_feature_cols:
+        if c not in feat.columns:
+            feat[c] = 0.0
+
+    X_raw = feat[node_feature_cols].astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0).values
+    scaler = StandardScaler()
+    X_std = scaler.fit_transform(X_raw).astype(np.float32)
+
+    # Weighted KNN features. Zero is down-weighted; active-only level/peak is emphasized.
+    weight_map = {c: 1.0 for c in node_feature_cols}
+    for c in zero_cols:
+        weight_map[c] = float(graph_zero_weight)
+    for c in level_peak_cols:
+        weight_map[c] = float(graph_level_peak_weight)
+    for c in transition_cols:
+        weight_map[c] = float(graph_transition_weight)
+    for c in static_cols:
+        weight_map[c] = float(graph_static_weight)
+    for c in brand_cols:
+        weight_map[c] = float(graph_brand_weight)
+    W = np.asarray([weight_map.get(c, 1.0) for c in node_feature_cols], dtype=np.float32)
+    X_knn = X_std * W[None, :]
+
+    N = X_knn.shape[0]
+    K = max(1, min(int(neighbor_k), max(N - 1, 1)))
+    if N <= 1:
+        neigh_idx = np.zeros((N, K), dtype=np.int64)
+    else:
+        nn = NearestNeighbors(n_neighbors=min(K + 1, N), metric="cosine")
+        nn.fit(X_knn)
+        _, idx = nn.kneighbors(X_knn)
+        neigh = []
+        for i, row in enumerate(idx):
+            row = [j for j in row.tolist() if j != i]
+            if len(row) == 0:
+                row = [i]
+            while len(row) < K:
+                row.append(row[-1])
+            neigh.append(row[:K])
+        neigh_idx = np.asarray(neigh, dtype=np.int64)
+
+    asin_list = feat["asin"].astype(str).tolist()
+    asin_to_idx = {a: i for i, a in enumerate(asin_list)}
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("GRAPHSAGE ASSET BUILD")
+        print("=" * 100)
+        print(f"Nodes: {N} | K={K} | node_feat_dim={len(node_feature_cols)}")
+        print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
+        print("Key added graph magnitude features: active_only_mean/q90/q95, q95_over_mean, top10/top20_share")
+        try:
+            nb = neigh_idx
+            same_gl = []
+            same_cat = []
+            same_brand = []
+            gl_arr = meta["gl_product_group"].astype(str).values
+            cat_arr = meta["category_code"].astype(str).values
+            br_arr = meta["ind_top10_brand"].astype(float).values
+            for i in range(N):
+                same_gl.append(np.mean(gl_arr[nb[i]] == gl_arr[i]))
+                same_cat.append(np.mean(cat_arr[nb[i]] == cat_arr[i]))
+                same_brand.append(np.mean(br_arr[nb[i]] == br_arr[i]))
+            print(f"Neighbor homophily: same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
+        except Exception as e:
+            print(f"Neighbor homophily diagnostic skipped: {e}")
+
+    raw_feature_df = pd.concat([feat[["asin"]].reset_index(drop=True), feat[node_feature_cols].reset_index(drop=True)], axis=1)
+
+    return {
+        "node_features": X_std.astype(np.float32),
+        "neighbor_idx": neigh_idx.astype(np.int64),
+        "asin_to_idx": asin_to_idx,
+        "idx_to_asin": asin_list,
+        "node_feature_names": node_feature_cols,
+        "raw_feature_df": raw_feature_df,
+        "meta_df": meta.reset_index(drop=True),
+        "feature_groups": {
+            "zero": zero_cols,
+            "level_peak": level_peak_cols,
+            "transition": transition_cols,
+            "static": static_cols,
+            "brand": brand_cols,
+        },
+        "weights": {
+            "zero": graph_zero_weight,
+            "level_peak": graph_level_peak_weight,
+            "transition": graph_transition_weight,
+            "static": graph_static_weight,
+            "brand": graph_brand_weight,
+        },
+    }
+
+
+def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.2, graph_level_peak_weight=1.5, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
@@ -1180,7 +1496,7 @@ class ExposureForecastModelV2(nn.Module):
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
-                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.20):
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -2232,9 +2548,9 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.20,
-    graph_zero_weight=0.5,
-    graph_level_peak_weight=1.2,
+    graph_message_scale=0.10,
+    graph_zero_weight=0.2,
+    graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -2612,7 +2928,7 @@ def _train_one_exposure_window(
     use_graphsage=False,
     graph_assets=None,
     graph_dim=16,
-    graph_message_scale=0.20,
+    graph_message_scale=0.10,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -2709,6 +3025,168 @@ def _train_one_exposure_window(
     }
 
 
+
+
+# ============================================================
+# GraphSAGE diagnostics: is graph embedding useful, and for what?
+# ============================================================
+
+def diagnose_graphsage_signal(model, graph_assets, pred_df, target="instock", verbose=True):
+    """
+    Probe whether GraphSAGE embedding carries useful information.
+
+    Prints/returns:
+      1. neighbor homophily: does KNN graph actually connect similar GL/category/brand nodes?
+      2. graph embedding probes: can graph embedding alone explain ASIN-level true 20w sum?
+      3. graph norm quartiles: are high/low graph regimes associated with different true/pred levels?
+
+    This is diagnostic only; it does not affect predictions.
+    """
+    if graph_assets is None or model is None or not getattr(model, "use_graphsage", False):
+        if verbose:
+            print("GraphSAGE diagnostics skipped: graph is disabled.")
+        return {}
+
+    diag = {}
+    try:
+        with torch.no_grad():
+            node_feat = model.graph_node_features
+            neigh_idx = model.graph_neighbor_idx
+            emb = model.graph_encoder(node_feat, neigh_idx).detach().cpu().numpy()
+        idx_to_asin = graph_assets.get("idx_to_asin", [str(i) for i in range(emb.shape[0])])
+        emb_cols = [f"g{i}" for i in range(emb.shape[1])]
+        emb_df = pd.DataFrame(emb, columns=emb_cols)
+        emb_df["asin"] = [str(a) for a in idx_to_asin]
+        emb_df["graph_norm"] = np.linalg.norm(emb, axis=1)
+        diag["graph_embedding_df"] = emb_df
+    except Exception as e:
+        if verbose:
+            print(f"Graph embedding extraction failed: {e}")
+        return {"error": str(e)}
+
+    # Homophily over constructed neighbors.
+    try:
+        meta = graph_assets.get("meta_df", pd.DataFrame()).copy()
+        nb = graph_assets["neighbor_idx"]
+        gl = meta["gl_product_group"].astype(str).values if "gl_product_group" in meta.columns else None
+        cat = meta["category_code"].astype(str).values if "category_code" in meta.columns else None
+        br = meta["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta.columns else None
+        hom = {}
+        if gl is not None:
+            hom["same_gl"] = float(np.mean([np.mean(gl[nb[i]] == gl[i]) for i in range(len(nb))]))
+        if cat is not None:
+            hom["same_category"] = float(np.mean([np.mean(cat[nb[i]] == cat[i]) for i in range(len(nb))]))
+        if br is not None:
+            hom["same_top10_brand_state"] = float(np.mean([np.mean(br[nb[i]] == br[i]) for i in range(len(nb))]))
+        diag["neighbor_homophily"] = hom
+    except Exception as e:
+        diag["neighbor_homophily_error"] = str(e)
+
+    # ASIN-level target/pred summary.
+    true_col = f"true_{target}_dph" if f"true_{target}_dph" in pred_df.columns else "true_instock_dph"
+    pred_col = f"pred_{target}_dph" if f"pred_{target}_dph" in pred_df.columns else "pred_instock_dph"
+    if true_col not in pred_df.columns or pred_col not in pred_df.columns:
+        if verbose:
+            print("Graph diagnostics warning: target/pred columns not found in pred_df.")
+        return diag
+
+    asin_sum = (
+        pred_df.groupby("asin")
+        .agg(
+            true_sum=(true_col, "sum"),
+            pred_sum=(pred_col, "sum"),
+            true_mean=(true_col, "mean"),
+            pred_mean=(pred_col, "mean"),
+            active_rate=(true_col, lambda x: np.mean(np.asarray(x) > 0)),
+        )
+        .reset_index()
+    )
+    asin_sum["asin"] = asin_sum["asin"].astype(str)
+    m = emb_df.merge(asin_sum, on="asin", how="inner")
+    if len(m) == 0:
+        return diag
+
+    # Ridge probe: graph embedding alone -> log true 20w sum.
+    probe_rows = []
+    try:
+        from sklearn.linear_model import Ridge, LogisticRegression
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import r2_score, roc_auc_score
+        X = m[emb_cols].values.astype(float)
+        y = np.log1p(m["true_sum"].values.astype(float))
+        if len(m) >= 50 and np.std(y) > 1e-8:
+            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.30, random_state=42)
+            reg = Ridge(alpha=1.0).fit(X_tr, y_tr)
+            y_hat = reg.predict(X_te)
+            probe_rows.append({
+                "probe": "graph_emb_to_log_true_sum_R2",
+                "value": float(r2_score(y_te, y_hat)),
+                "note": "higher means graph embedding carries magnitude/scale information",
+            })
+        # active path probe
+        yb = (m["active_rate"].values.astype(float) > 0.5).astype(int)
+        if len(np.unique(yb)) == 2 and len(m) >= 50:
+            X_tr, X_te, y_tr, y_te = train_test_split(X, yb, test_size=0.30, random_state=42, stratify=yb)
+            clf = LogisticRegression(max_iter=500, C=1.0).fit(X_tr, y_tr)
+            score = clf.predict_proba(X_te)[:, 1]
+            probe_rows.append({
+                "probe": "graph_emb_to_active_path_AUC",
+                "value": float(roc_auc_score(y_te, score)),
+                "note": "higher means graph embedding carries active/zero regime information",
+            })
+    except Exception as e:
+        probe_rows.append({"probe": "graph_probe_error", "value": np.nan, "note": str(e)})
+
+    # Correlation and quartile summary.
+    m["ratio"] = m["pred_sum"] / (m["true_sum"] + 1e-8)
+    try:
+        spearman_norm_true = _safe_spearman(m["graph_norm"], m["true_sum"])
+        spearman_norm_ratio = _safe_spearman(m["graph_norm"], m["ratio"])
+        probe_rows.append({"probe": "spearman_graph_norm_true_sum", "value": float(spearman_norm_true), "note": "graph norm vs true 20w level"})
+        probe_rows.append({"probe": "spearman_graph_norm_pred_true_ratio", "value": float(spearman_norm_ratio), "note": "positive/negative indicates graph norm is linked to bias"})
+    except Exception:
+        pass
+
+    probe_df = pd.DataFrame(probe_rows)
+    diag["graph_probe"] = probe_df
+
+    try:
+        m["graph_norm_bucket"] = pd.qcut(m["graph_norm"], q=4, duplicates="drop")
+        bucket = (
+            m.groupby("graph_norm_bucket")
+            .agg(
+                n_asins=("asin", "nunique"),
+                true_sum_mean=("true_sum", "mean"),
+                pred_sum_mean=("pred_sum", "mean"),
+                ratio=("ratio", "median"),
+                active_rate=("active_rate", "mean"),
+            )
+            .reset_index()
+        )
+        diag["graph_norm_bucket"] = bucket
+    except Exception as e:
+        diag["graph_norm_bucket_error"] = str(e)
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("GRAPHSAGE EFFECT DIAGNOSTICS")
+        print("=" * 100)
+        if "neighbor_homophily" in diag:
+            print("Neighbor homophily:", {k: round(v, 4) for k, v in diag["neighbor_homophily"].items()})
+        if len(probe_df):
+            print("\nGraph embedding probes:")
+            print(probe_df.round(4).to_string(index=False))
+        if "graph_norm_bucket" in diag:
+            print("\nGraph norm bucket summary:")
+            print(diag["graph_norm_bucket"].round(4).to_string(index=False))
+        print("\nInterpretation:")
+        print("- Good active AUC but low R2 to true_sum => graph mainly learns occurrence/regime, not magnitude.")
+        print("- Low ratio in high graph_norm buckets => graph message may be conservative/smoothing too much.")
+        print("- If same_category/same_brand are very low, edges may be too behavior-only; if too high, graph may be too static/clustered.")
+
+    return diag
+
+
 def run_exposure_v2(
     data_raw1,
     scot_df=None,
@@ -2754,9 +3232,9 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.20,
-    graph_zero_weight=0.5,
-    graph_level_peak_weight=1.2,
+    graph_message_scale=0.10,
+    graph_zero_weight=0.2,
+    graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -2836,6 +3314,9 @@ def run_exposure_v2(
     out["diagnostics"]["gl_horizon_block"] = gl_block_diag
     out["diagnostics"]["gl_summary"] = gl_summary
 
+    graph_diagnostics = diagnose_graphsage_signal(out.get("model"), graph_assets, pred_df, target="instock", verbose=True) if use_graphsage else {}
+    out["diagnostics"]["graph"] = graph_diagnostics
+
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
         "context_cols": context_cols,
@@ -2895,9 +3376,9 @@ def run_exposure_v2_rolling(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.20,
-    graph_zero_weight=0.5,
-    graph_level_peak_weight=1.2,
+    graph_message_scale=0.10,
+    graph_zero_weight=0.2,
+    graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -3248,9 +3729,9 @@ def run_exposure_v2_final_scot_5000(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.20,
-    graph_zero_weight=0.5,
-    graph_level_peak_weight=1.2,
+    graph_message_scale=0.10,
+    graph_zero_weight=0.2,
+    graph_level_peak_weight=1.5,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
