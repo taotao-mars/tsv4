@@ -1,19 +1,62 @@
-# 1. 先跑 exposure model
-result = run_exposure_v2_final_scot_5000(...)
+# =====================================================
+# Check NB-distribution exposure hat, then run demand
+# =====================================================
 
-# 2. 从 exposure result 里取 category-aware zero calibrated exposure hat
-hat_cat_zero = result["exposure_hat_for_demand_category_zero_calib"]
-cat_zero_diag = result["category_zero_calib"]
+exposure_hat_for_demand = exposure_result["exposure_hat_for_demand"].copy()
 
-# 3. 简单检查一下
-print(hat_cat_zero[["pred_instock_dph"]].describe())
-print("exact zero share:", (hat_cat_zero["pred_instock_dph"] == 0).mean())
+pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+pred_cols = [c for c in pred_cols if c in exposure_hat_for_demand.columns]
 
-# 4. 再接 demand
+print("\n" + "=" * 80)
+print("EXPOSURE HAT CHECK BEFORE DEMAND")
+print("=" * 80)
+
+print("\nShape:")
+print(exposure_hat_for_demand.shape)
+
+print("\nColumns used:")
+print(pred_cols)
+
+print("\nPredicted exposure describe:")
+print(exposure_hat_for_demand[pred_cols].describe())
+
+print("\nExact zero share:")
+print((exposure_hat_for_demand[pred_cols] == 0).mean())
+
+print("\nNegative value count:")
+print((exposure_hat_for_demand[pred_cols] < 0).sum())
+
+print("\nNaN count:")
+print(exposure_hat_for_demand[pred_cols].isna().sum())
+
+print("\nInstock only quick check:")
+print(exposure_hat_for_demand[["pred_instock_dph"]].describe())
+print(
+    "pred_instock exact zero share:",
+    (exposure_hat_for_demand["pred_instock_dph"] == 0).mean()
+)
+
+# Optional: enforce nonnegative just in case
+exposure_hat_for_demand[pred_cols] = (
+    exposure_hat_for_demand[pred_cols]
+    .replace([np.inf, -np.inf], np.nan)
+    .fillna(0.0)
+    .clip(lower=0.0)
+)
+
+print("\nAfter safety cleanup:")
+print(exposure_hat_for_demand[pred_cols].describe())
+print("zero share after cleanup:")
+print((exposure_hat_for_demand[pred_cols] == 0).mean())
+
+print("\n" + "=" * 80)
+print("RUN DEMAND MODEL WITH NB-DISTRIBUTION EXPOSURE HAT")
+print("=" * 80)
+
 demand_result_instock = run_demand_with_predicted_exposure_instock_only(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    exposure_result_or_hat=hat_cat_zero,
+    exposure_result_or_hat=exposure_hat_for_demand,
     n_asins=5000,
     epochs=60,
     history=52,
