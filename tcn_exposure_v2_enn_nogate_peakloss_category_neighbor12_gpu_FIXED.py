@@ -2739,12 +2739,92 @@ def _diagnose_encoder_decoder_performance_impl(model, va_ld, pred_df=None, max_b
         "attn_diag": attn_diag,
     }
 
-def make_external_hat_df(pred_df):
-    out = pred_df[["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]].copy()
+def make_external_hat_df(pred_df, hat_source="mu"):
+    """
+    Build external exposure hat for the downstream demand model.
+
+    IMPORTANT:
+    In the NB-distribution exposure version, pred_*_dph is the sampled distribution
+    median / p50 by default. That is useful for zero diagnostics, but it is often too
+    conservative as a demand covariate.
+
+    Default hat_source="mu" therefore uses pred_*_dph_mu as the demand covariate:
+      - mu = expected exposure level / intensity
+      - p50 = conservative median, useful for zero-risk diagnostics
+
+    Options:
+      hat_source="mu"        -> use pred_*_dph_mu for demand input, recommended
+      hat_source="p50"       -> use pred_*_dph / sampled median
+      hat_source="dist_mean" -> use pred_*_dph_dist_mean
+    """
+    df = pred_df.copy()
+
+    if hat_source == "mu":
+        source_cols = {
+            "pred_total_dph_mu": "pred_total_dph",
+            "pred_buy_box_dph_mu": "pred_buy_box_dph",
+            "pred_instock_dph_mu": "pred_instock_dph",
+        }
+    elif hat_source == "dist_mean":
+        source_cols = {
+            "pred_total_dph_dist_mean": "pred_total_dph",
+            "pred_buy_box_dph_dist_mean": "pred_buy_box_dph",
+            "pred_instock_dph_dist_mean": "pred_instock_dph",
+        }
+    elif hat_source == "p50":
+        source_cols = {
+            "pred_total_dph": "pred_total_dph",
+            "pred_buy_box_dph": "pred_buy_box_dph",
+            "pred_instock_dph": "pred_instock_dph",
+        }
+    else:
+        raise ValueError(f"Unknown hat_source={hat_source}. Use 'mu', 'p50', or 'dist_mean'.")
+
+    missing = [c for c in source_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns for hat_source={hat_source}: {missing}")
+
+    out = df[["asin", "order_week"] + list(source_cols.keys())].copy()
+    out = out.rename(columns=source_cols)
+
+    # Safety cleanup only; normally model outputs should already be finite and nonnegative.
+    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    out[pred_cols] = (
+        out[pred_cols]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    # Enforce funnel for demand input: total >= buy_box >= instock.
+    out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
+    out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
+
     out["external_total_dph_hat_log"]    = np.log1p(out["pred_total_dph"].clip(lower=0.0))
     out["external_buy_box_dph_hat_log"]  = np.log1p(out["pred_buy_box_dph"].clip(lower=0.0))
     out["external_instock_dph_hat_log"]  = np.log1p(out["pred_instock_dph"].clip(lower=0.0))
+    out["hat_source"] = hat_source
     return out
+
+
+def summarize_hat_for_demand(hat, title="EXPOSURE HAT FOR DEMAND"):
+    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    pred_cols = [c for c in pred_cols if c in hat.columns]
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+    print("shape:", hat.shape)
+    if "hat_source" in hat.columns:
+        print("hat_source:", hat["hat_source"].iloc[0])
+    print("\ndescribe:")
+    print(hat[pred_cols].describe())
+    print("\nzero share:")
+    print((hat[pred_cols] == 0).mean())
+    print("\nnegative count:")
+    print((hat[pred_cols] < 0).sum())
+    print("\nNaN count:")
+    print(hat[pred_cols].isna().sum())
+    return None
 
 
 # ============================================================
@@ -2879,13 +2959,20 @@ def run_exposure_v2(
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
-    exposure_hat_for_demand = make_external_hat_df(pred_df)
+    exposure_hat_for_demand = make_external_hat_df(pred_df, hat_source="mu")
+    exposure_hat_for_demand_p50 = make_external_hat_df(pred_df, hat_source="p50")
+    exposure_hat_for_demand_dist_mean = make_external_hat_df(pred_df, hat_source="dist_mean")
+
+    summarize_hat_for_demand(exposure_hat_for_demand, title="EXPOSURE HAT FOR DEMAND (MU / EXPECTED LEVEL)")
 
     return {
         "model": model,
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
         "exposure_hat_for_demand": exposure_hat_for_demand,
+        "exposure_hat_for_demand_mu": exposure_hat_for_demand,
+        "exposure_hat_for_demand_p50": exposure_hat_for_demand_p50,
+        "exposure_hat_for_demand_dist_mean": exposure_hat_for_demand_dist_mean,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -3574,7 +3661,10 @@ def run_exposure_v2(
     out["diagnostics"]["graph"] = graph_diagnostics
 
     out.update({
-        "exposure_hat_for_demand": make_external_hat_df(pred_df),
+        "exposure_hat_for_demand": make_external_hat_df(pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_mu": make_external_hat_df(pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_p50": make_external_hat_df(pred_df, hat_source="p50"),
+        "exposure_hat_for_demand_dist_mean": make_external_hat_df(pred_df, hat_source="dist_mean"),
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
@@ -3747,7 +3837,10 @@ def run_exposure_v2_rolling(
         "rolling_forecast_df": rolling_pred_df,
         "forecast_df": latest_pred_df,
         "diagnostics": rolling_diagnostics,
-        "exposure_hat_for_demand": make_external_hat_df(latest_pred_df),
+        "exposure_hat_for_demand": make_external_hat_df(latest_pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_mu": make_external_hat_df(latest_pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_p50": make_external_hat_df(latest_pred_df, hat_source="p50"),
+        "exposure_hat_for_demand_dist_mean": make_external_hat_df(latest_pred_df, hat_source="dist_mean"),
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
@@ -4272,3 +4365,47 @@ def print_exposure_diagnostics(pred_df):
         "asin_sum": asin_sum,
         "final_summary": final_summary,
     }
+
+
+# ============================================================
+# USAGE: NB distribution exposure with MU hat for demand
+# ============================================================
+# %run -i tcn_exposure_v2_dualgraph_historical_oos_nb_mu_hat_gpu.py
+#
+# exposure_result = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#     use_graphsage=True,
+#     neighbor_k=10,
+#     graph_dim=16,
+#     graph_message_scale=0.10,
+#     graph_zero_weight=0.2,
+#     graph_level_peak_weight=1.5,
+#     graph_transition_weight=1.0,
+#     graph_static_weight=1.0,
+#     graph_brand_weight=0.5,
+#     use_encoder_self_attn=True,
+# )
+#
+# # Recommended demand input: MU / expected exposure level
+# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"]
+# summarize_hat_for_demand(exposure_hat_for_demand, title="MU HAT BEFORE DEMAND")
+#
+# demand_result_instock = run_demand_with_predicted_exposure_instock_only(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     exposure_result_or_hat=exposure_hat_for_demand,
+#     n_asins=5000,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+# )
+#
+# # Diagnostic only: p50 / median exposure has better zero behavior but is often too conservative.
+# exposure_hat_p50 = exposure_result["exposure_hat_for_demand_p50"]
+# summarize_hat_for_demand(exposure_hat_p50, title="P50 HAT DIAGNOSTIC ONLY")
