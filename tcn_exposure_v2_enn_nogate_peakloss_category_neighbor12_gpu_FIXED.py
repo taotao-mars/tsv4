@@ -1,3 +1,5 @@
+# SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
+# to avoid namespace collision with demand model functions when using %run -i.
 # ============================================================
 # TCN Exposure Model V2
 # Single-head direct update + category_code static features:
@@ -31,6 +33,7 @@
 # 不变：
 #   数据加载、ExposureDataset、评估函数、训练loop接口
 #   forward(x, future_context) → log_hat [B, H, 3]
+#   explicit NB sampling inference: mc_reduce="p50"/"nb_sample" uses alpha_head
 # ============================================================
 
 import numpy as np
@@ -147,7 +150,7 @@ def _auc(y_binary, score):
 # 数据加载（不变，完整保留）
 # ============================================================
 
-def prepare_data_from_sample(
+def prepare_exposure_data_from_sample(
     data_raw1, scot_df=None, n_asins=5000, seed=42,
 ):
     """
@@ -178,10 +181,10 @@ def prepare_data_from_sample(
 
 
 # 向后兼容：保留旧函数名
-def prepare_data_from_sample_scot_intersection(
+def prepare_exposure_data_from_sample_scot_intersection(
     data_raw1, scot_df=None, n_asins=5000, seed=42,
 ):
-    return prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+    return prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
 
 def filter_extreme_asins(data_raw, q=0.99):
@@ -2156,7 +2159,7 @@ def predict_exposure_v2(
     apply_funnel_constraint=True,
     device=None,
     mc_samples=50,
-    mc_reduce="median",
+    mc_reduce="p50",
     use_distributional_samples=True,
 ):
     """
@@ -2200,14 +2203,35 @@ def predict_exposure_v2(
             pact_stack = torch.stack(pacts, dim=0)
             gate_stack = torch.stack(gates, dim=0)
 
-            if mc_reduce == "mean":
-                pred_t = sample_stack.mean(dim=0)
-            else:
-                pred_t = sample_stack.median(dim=0).values
-
+            # ------------------------------------------------------------
+            # IMPORTANT: inference reduction path
+            # ------------------------------------------------------------
+            # mu / direct / expected:
+            #   use direct mean path expm1(log_hat); alpha is NOT used here.
+            # mean / nb_mean / dist_mean:
+            #   use Monte Carlo mean from NegativeBinomial samples.
+            # median / p50 / nb_sample:
+            #   use Monte Carlo median/p50 from NegativeBinomial samples.
+            #
+            # This makes the NB sampling path explicit; alpha_head is only
+            # activated for mean/median/p50/nb_sample reductions when
+            # use_distributional_samples=True.
             mu_t = mu_stack.mean(dim=0)
             dist_mean_t = sample_stack.mean(dim=0)
             dist_p50_t = sample_stack.median(dim=0).values
+
+            reduce_key = str(mc_reduce).lower()
+            if reduce_key in ["mu", "direct", "expected"]:
+                pred_t = mu_t
+            elif reduce_key in ["mean", "nb_mean", "dist_mean"]:
+                pred_t = dist_mean_t
+            elif reduce_key in ["median", "p50", "nb_sample", "sample_median"]:
+                pred_t = dist_p50_t
+            else:
+                raise ValueError(
+                    f"Unknown mc_reduce={mc_reduce}. Use one of: "
+                    "'mu', 'mean'/'nb_mean', 'median'/'p50'/'nb_sample'."
+                )
             pact_t = pact_stack.mean(dim=0)
             gate_t = gate_stack.median(dim=0).values
 
@@ -2890,7 +2914,7 @@ def run_exposure_v2(
     print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
     print("=" * 100)
 
-    df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+    df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
@@ -3016,7 +3040,7 @@ def run_exposure_v2(
 # Added after original definitions; these functions override/use the fixed ABC model above.
 # ============================================================
 
-def prepare_data_from_sample_scot_intersection(
+def prepare_exposure_data_from_sample_scot_intersection(
     data_raw1,
     scot_df=None,
     n_asins=5000,
@@ -3588,9 +3612,9 @@ def run_exposure_v2(
     print("=" * 100)
 
     if use_scot_intersection:
-        df = prepare_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+        df = prepare_exposure_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
     else:
-        df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+        df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
@@ -3739,9 +3763,9 @@ def run_exposure_v2_rolling(
     print(f"n_asins={n_asins} | history={history} | rolling_offsets={list(rolling_offsets)} | epochs={epochs} | patience={patience} | encoder_attn={use_encoder_self_attn}")
 
     if use_scot_intersection:
-        df = prepare_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+        df = prepare_exposure_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
     else:
-        df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+        df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
