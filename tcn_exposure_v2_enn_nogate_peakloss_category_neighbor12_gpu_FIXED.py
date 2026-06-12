@@ -1372,7 +1372,7 @@ class DualGraphSAGEEncoder(nn.Module):
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
-    TCN Decoder + Cross-Attention + SINGLE direct exposure head.
+    TCN Decoder + Cross-Attention + distributional exposure head.
 
     Why this version:
         Recent two-head runs showed unstable compensation:
@@ -1451,7 +1451,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Linear(hidden, 3),
         )
 
-        # Direct single-head exposure head. With ENN, z controls level/peak/zero regime.
+        # Direct mean exposure head. With ENN, z controls level/peak/zero regime.
         # IMPORTANT: p_active is auxiliary only and does NOT gate final predictions.
         direct_in = d_model + z_extra + max(active_feat_dim, 0) + max(mag_feat_dim, 0)
         self.direct_head = nn.Sequential(
@@ -1463,6 +1463,19 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden // 2, 3),
             nn.Tanh(),
+        )
+
+        # Distributional over-dispersion head. This is the key difference from
+        # the previous direct-softplus exposure model: prediction can be sampled
+        # from a count distribution, so p50 can naturally be exactly zero.
+        self.alpha_head = nn.Sequential(
+            nn.Linear(direct_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 3),
         )
 
     def forward(self, enc_out, future_context, return_aux=False, z=None):
@@ -1524,8 +1537,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
 
         direct_in = torch.cat(direct_parts, dim=-1)
         residual = self.direct_head(direct_in)  # [-1, 1]
+        alpha_raw = self.alpha_head(direct_in)
+        alpha = F.softplus(alpha_raw) + 1e-4
 
-        # Anchor-residual magnitude log forecast.
+        # Anchor-residual mean log forecast.
         if self.anchor_indices is not None:
             ti, bi, ii = self.anchor_indices
             anchor = torch.stack([
@@ -1555,7 +1570,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "p_active": p_active,
                 "log_mag": log_mag,             # ungated magnitude log1p prediction
                 "mag_level": mag_level,
-                "pred_level": pred_level,
+                "pred_level": pred_level,       # mean / mu on level scale
+                "mu_level": pred_level,
+                "alpha": alpha,                   # NB over-dispersion, same shape [B,H,3]
                 "gamma": nan_like,
                 "gate": gate,
                 "residual": residual,
@@ -1722,8 +1739,34 @@ class ExposureForecastModelV2(nn.Module):
 
 
 # ============================================================
-# Loss：Hurdle BCE + Magnitude Huber + Mean Penalty
+# Loss：Distributional NB + Hurdle BCE + Magnitude Huber + Mean Penalty
 # ============================================================
+
+def exposure_negbin_nll_elementwise(y, mu, alpha):
+    """
+    Negative-binomial NLL for nonnegative exposure counts.
+    y can be float-valued DPH; lgamma form is stable and works as a quasi-likelihood.
+    mu is the expected exposure level and alpha is over-dispersion.
+    """
+    eps = 1e-6
+    y = y.clamp(min=0.0)
+    mu = mu.clamp(min=eps)
+    alpha = alpha.clamp(min=1e-4, max=100.0)
+    r = (1.0 / alpha).clamp(min=eps, max=1e6)
+    p = (mu * alpha / (1.0 + mu * alpha)).clamp(eps, 1.0 - eps)
+    return -(
+        torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1.0)
+        + r * torch.log1p(-p) + y * torch.log(p)
+    )
+
+
+def exposure_tail_weighted_nb_nll(true, mu, alpha, channel_weights, high_weight_alpha=0.25):
+    """Tail-weighted NB quasi-NLL for exposure distribution learning."""
+    nll = exposure_negbin_nll_elementwise(true, mu, alpha)
+    denom = torch.log1p(true).detach().mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+    high_w = 1.0 + high_weight_alpha * torch.log1p(true).detach() / denom
+    w = channel_weights.view(1, 1, 3) * high_w
+    return (nll * w).sum() / w.sum().clamp_min(1.0)
 
 def exposure_hurdle_loss(
     log_hat,        # [B,H,3] direct log1p prediction
@@ -1732,6 +1775,8 @@ def exposure_hurdle_loss(
     true_instock,   # [B,H]
     active_logit,   # [B,H,3] auxiliary occurrence logits only
     log_mag=None,   # unused; kept for interface compatibility
+    alpha=None,      # [B,H,3] NB over-dispersion for distributional exposure head
+    nb_weight=0.25,
     w_total=0.30,
     w_buy=0.60,
     w_instock=1.00,
@@ -1801,6 +1846,22 @@ def exposure_hurdle_loss(
     # 1) Main direct log loss.
     log_err = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
     direct_loss = (log_err * sample_w * tw).mean()
+
+    # Distributional NB quasi-likelihood. This teaches over-dispersion so that
+    # sparse exposure paths can produce exact-zero sample quantiles, similar to
+    # the demand model's NB sampling mechanism. The mean path is still controlled
+    # by log_hat / pred_level, so we do not hard-threshold or gate predictions.
+    if alpha is not None and nb_weight > 0:
+        mu_for_nb = torch.expm1(log_hat).clamp(min=1e-6)
+        nb_loss = exposure_tail_weighted_nb_nll(
+            true=true,
+            mu=mu_for_nb,
+            alpha=alpha,
+            channel_weights=tw.view(3),
+            high_weight_alpha=high_weight_alpha,
+        )
+    else:
+        nb_loss = torch.zeros((), dtype=log_hat.dtype, device=log_hat.device)
 
     # Shared zero error: target log is zero when target exposure is zero.
     zero_err = F.huber_loss(log_hat, torch.zeros_like(log_hat), delta=0.5, reduction="none")
@@ -1909,7 +1970,8 @@ def exposure_hurdle_loss(
     peak_under_loss = (peak_under * high_mask).sum() / high_mask.sum().clamp_min(1.0)
 
     return (
-        mag_weight * direct_loss
+        nb_weight * nb_loss
+        + mag_weight * direct_loss
         + mean_weight * mean_loss
         + bce_weight * bce_loss
         + active_calib_weight * active_calib_loss
@@ -1933,6 +1995,7 @@ def train_exposure_model_v2(
     w_total=0.30, w_buy=0.60, w_instock=1.00,
     bce_weight=0.15, mag_weight=1.00, mean_weight=0.35,
     active_calib_weight=0.05,
+    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -1975,6 +2038,8 @@ def train_exposure_model_v2(
                 true_instock=b["future_instock_dph"],
                 active_logit=aux["active_logit"],
                 log_mag=aux["log_mag"],
+                alpha=aux.get("alpha", None),
+                nb_weight=nb_weight,
                 w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                 bce_weight=bce_weight, mag_weight=mag_weight,
                 mean_weight=mean_weight,
@@ -2021,6 +2086,8 @@ def train_exposure_model_v2(
                     true_instock=b["future_instock_dph"],
                     active_logit=aux["active_logit"],
                     log_mag=aux["log_mag"],
+                    alpha=aux.get("alpha", None),
+                    nb_weight=nb_weight,
                     w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                     bce_weight=bce_weight, mag_weight=mag_weight,
                     mean_weight=mean_weight,
@@ -2072,7 +2139,38 @@ def train_exposure_model_v2(
 # 预测（输出格式与原版完全相同，多了p_active诊断列）
 # ============================================================
 
-def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None, mc_samples=20, mc_reduce="median"):
+def _nb_sample_from_mu_alpha(mu, alpha):
+    """Sample from NB parameterized by mean mu and over-dispersion alpha."""
+    eps = 1e-6
+    mu = mu.clamp(min=eps)
+    alpha = alpha.clamp(min=1e-4, max=100.0)
+    total_count = (1.0 / alpha).clamp(min=1e-4, max=1e6)
+    probs = (mu * alpha / (1.0 + mu * alpha)).clamp(eps, 1.0 - eps)
+    dist = torch.distributions.NegativeBinomial(total_count=total_count, probs=probs)
+    return dist.sample().float()
+
+
+def predict_exposure_v2(
+    model,
+    va_ld,
+    apply_funnel_constraint=True,
+    device=None,
+    mc_samples=50,
+    mc_reduce="median",
+    use_distributional_samples=True,
+):
+    """
+    Predict exposure paths.
+
+    When use_distributional_samples=True and the model returns aux["alpha"], the main
+    pred_*_dph columns are NB-sample quantiles, like the demand model's p50 logic.
+    This allows exact-zero exposure predictions without hard zero calibration.
+
+    Extra diagnostics:
+      pred_*_dph_mu: direct mean path expm1(log_hat)
+      pred_*_dph_dist_mean: MC mean of sampled distribution
+      pred_*_dph_dist_p50: MC median of sampled distribution
+    """
     device = get_device(device)
     model = model.to(device)
     rows = []
@@ -2080,38 +2178,52 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
     with torch.no_grad():
         for b in va_ld:
             b = batch_to_device(b, device)
-            # MC inference over ENN z. Median is more robust than mean for exposure hats,
-            # because mean can be pulled up by high-regime samples.
-            preds, pacts, gates = [], [], []
+            sample_preds, mu_preds, pacts, gates = [], [], [], []
             last_aux = None
             K = max(int(mc_samples), 1)
             for _ in range(K):
                 aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
                 last_aux = aux
-                preds.append(torch.expm1(aux["log_hat"]).clamp(min=0.0))
+                mu_level = torch.expm1(aux["log_hat"]).clamp(min=0.0)
+                mu_preds.append(mu_level)
+
+                if use_distributional_samples and aux.get("alpha", None) is not None:
+                    sample_level = _nb_sample_from_mu_alpha(mu_level, aux["alpha"])
+                else:
+                    sample_level = mu_level
+                sample_preds.append(sample_level)
                 pacts.append(aux["p_active"])
                 gates.append(aux.get("gate", torch.full_like(aux["p_active"], float("nan"))))
 
-            pred_stack = torch.stack(preds, dim=0)
+            sample_stack = torch.stack(sample_preds, dim=0)  # [K,B,H,3]
+            mu_stack = torch.stack(mu_preds, dim=0)
             pact_stack = torch.stack(pacts, dim=0)
             gate_stack = torch.stack(gates, dim=0)
+
             if mc_reduce == "mean":
-                pred_t = pred_stack.mean(dim=0)
-                pact_t = pact_stack.mean(dim=0)
-                gate_t = gate_stack.mean(dim=0)
+                pred_t = sample_stack.mean(dim=0)
             else:
-                pred_t = pred_stack.median(dim=0).values
-                pact_t = pact_stack.mean(dim=0)
-                gate_t = gate_stack.median(dim=0).values
+                pred_t = sample_stack.median(dim=0).values
+
+            mu_t = mu_stack.mean(dim=0)
+            dist_mean_t = sample_stack.mean(dim=0)
+            dist_p50_t = sample_stack.median(dim=0).values
+            pact_t = pact_stack.mean(dim=0)
+            gate_t = gate_stack.median(dim=0).values
 
             pred = pred_t.cpu().numpy()
+            mu_np = mu_t.cpu().numpy()
+            dist_mean_np = dist_mean_t.cpu().numpy()
+            dist_p50_np = dist_p50_t.cpu().numpy()
             pact = pact_t.cpu().numpy()
             gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
             gate_np = gate_t.cpu().numpy()
 
             if apply_funnel_constraint:
-                pred[:, :, 1] = np.minimum(pred[:, :, 1], pred[:, :, 0])
-                pred[:, :, 2] = np.minimum(pred[:, :, 2], pred[:, :, 1])
+                # apply funnel to all prediction views
+                for arr in (pred, mu_np, dist_mean_np, dist_p50_np):
+                    arr[:, :, 1] = np.minimum(arr[:, :, 1], arr[:, :, 0])
+                    arr[:, :, 2] = np.minimum(arr[:, :, 2], arr[:, :, 1])
 
             B, H = b["future_instock_dph"].shape
             for i in range(B):
@@ -2127,7 +2239,17 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                         "true_instock_dph":  b["future_instock_dph"][i, h].item(),
                         "pred_instock_dph":  pred[i, h, 2],
                         "true_demand":       b["future_demand"][i, h].item(),
-                        # 诊断列
+
+                        "pred_total_dph_mu":       mu_np[i, h, 0],
+                        "pred_buy_box_dph_mu":     mu_np[i, h, 1],
+                        "pred_instock_dph_mu":     mu_np[i, h, 2],
+                        "pred_total_dph_dist_mean":   dist_mean_np[i, h, 0],
+                        "pred_buy_box_dph_dist_mean": dist_mean_np[i, h, 1],
+                        "pred_instock_dph_dist_mean": dist_mean_np[i, h, 2],
+                        "pred_total_dph_dist_p50":    dist_p50_np[i, h, 0],
+                        "pred_buy_box_dph_dist_p50":  dist_p50_np[i, h, 1],
+                        "pred_instock_dph_dist_p50":  dist_p50_np[i, h, 2],
+
                         "p_active_total":    pact[i, h, 0],
                         "p_active_buy_box":  pact[i, h, 1],
                         "p_active_instock":  pact[i, h, 2],
@@ -2617,512 +2739,12 @@ def _diagnose_encoder_decoder_performance_impl(model, va_ld, pred_df=None, max_b
         "attn_diag": attn_diag,
     }
 
-def _safe_sigmoid_np(x):
-    x = np.asarray(x, dtype=float)
-    x = np.clip(x, -60, 60)
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def find_best_instock_zero_threshold(
-    pred_df,
-    p_col="p_active_instock",
-    true_col="true_instock_dph",
-    pred_col="pred_instock_dph",
-    metric="wape_then_bal_acc",
-    grid=None,
-    verbose=True,
-):
-    """
-    Learn a validation-only p_active threshold for turning clear inactive weeks into exact zero.
-
-    This does NOT use future OOS. It only uses the model's own p_active signal.
-    In production, learn this threshold on a validation/backtest window and reuse it.
-    """
-    if grid is None:
-        grid = np.round(np.arange(0.05, 0.951, 0.025), 3)
-
-    if p_col not in pred_df.columns or true_col not in pred_df.columns or pred_col not in pred_df.columns:
-        if verbose:
-            print("Zero calibration skipped: p_active/true/pred columns not found.")
-        return 0.25, pd.DataFrame()
-
-    y = (pred_df[true_col].values > 0).astype(int)
-    p = pred_df[p_col].values.astype(float)
-    pred_raw = pred_df[pred_col].values.astype(float)
-    true = pred_df[true_col].values.astype(float)
-
-    rows = []
-    for th in grid:
-        active_hat = (p >= th).astype(int)
-        pred_adj = pred_raw.copy()
-        pred_adj[p < th] = 0.0
-
-        tp = int(((active_hat == 1) & (y == 1)).sum())
-        tn = int(((active_hat == 0) & (y == 0)).sum())
-        fp = int(((active_hat == 1) & (y == 0)).sum())
-        fn = int(((active_hat == 0) & (y == 1)).sum())
-        tpr = tp / max(tp + fn, 1)
-        tnr = tn / max(tn + fp, 1)
-        bal_acc = 0.5 * (tpr + tnr)
-        precision = tp / max(tp + fp, 1)
-        recall = tpr
-        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
-        zero_recall = tnr
-        false_zero_rate = fn / max((y == 1).sum(), 1)
-        wape = np.abs(pred_adj - true).sum() / (np.abs(true).sum() + 1e-8)
-        ratio = pred_adj.sum() / (true.sum() + 1e-8)
-        exact_zero_share = float((pred_adj <= 0).mean())
-        rows.append({
-            "threshold": float(th),
-            "WAPE_after_zero": float(wape),
-            "ratio_after_zero": float(ratio),
-            "balanced_accuracy": float(bal_acc),
-            "F1_active": float(f1),
-            "active_recall": float(recall),
-            "zero_recall": float(zero_recall),
-            "false_zero_rate_on_active": float(false_zero_rate),
-            "exact_zero_share": exact_zero_share,
-        })
-
-    tbl = pd.DataFrame(rows)
-    if len(tbl) == 0:
-        return 0.25, tbl
-
-    # Prefer good WAPE while avoiding too many false zero active weeks.
-    # We constrain ratio to a reasonable range and false-zero rate to avoid killing magnitude.
-    candidates = tbl[(tbl["ratio_after_zero"].between(0.92, 1.08)) & (tbl["false_zero_rate_on_active"] <= 0.12)].copy()
-    if len(candidates) == 0:
-        candidates = tbl.copy()
-
-    if metric == "balanced_accuracy":
-        best_idx = candidates["balanced_accuracy"].idxmax()
-    elif metric == "f1":
-        best_idx = candidates["F1_active"].idxmax()
-    else:
-        # lower WAPE first, then higher balanced accuracy
-        candidates = candidates.sort_values(["WAPE_after_zero", "balanced_accuracy"], ascending=[True, False])
-        best_idx = candidates.index[0]
-
-    best_th = float(tbl.loc[best_idx, "threshold"])
-
-    if verbose:
-        print("\n" + "=" * 100)
-        print("IN-STOCK ZERO CALIBRATION THRESHOLD SEARCH")
-        print("=" * 100)
-        print(f"Best p_active_instock threshold: {best_th:.3f}")
-        show = tbl.sort_values("WAPE_after_zero").head(8)
-        print(show.round(4).to_string(index=False))
-
-    return best_th, tbl
-
-
-def make_external_hat_df(
-    pred_df,
-    zero_calibrate=False,
-    p_threshold="auto",
-    hard_zero_threshold=None,
-    soft_temperature=None,
-    keep_aux_cols=True,
-):
-    """
-    Build the exposure_hat_for_demand table.
-
-    zero_calibrate=False:
-        original raw direct-head exposure prediction.
-
-    zero_calibrate=True:
-        use p_active_instock to set clear inactive weeks to exact zero.
-        This handles the failure mode where softplus/direct regression never outputs exact 0.
-        It does not use future OOS, so it does not introduce OOS leakage.
-    """
-    base_cols = ["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
-    extra_cols = []
-    for c in ["p_active_total", "p_active_buy_box", "p_active_instock", "horizon"]:
-        if keep_aux_cols and c in pred_df.columns:
-            extra_cols.append(c)
-
-    out = pred_df[base_cols + extra_cols].copy()
-
-    if zero_calibrate:
-        out["pred_instock_dph_raw"] = out["pred_instock_dph"].astype(float)
-
-        if "p_active_instock" in out.columns:
-            if p_threshold == "auto":
-                th, th_tbl = find_best_instock_zero_threshold(pred_df, verbose=True)
-            else:
-                th = float(p_threshold)
-                th_tbl = pd.DataFrame()
-
-            out["zero_calib_p_threshold"] = float(th)
-            out["pred_instock_active_flag"] = (out["p_active_instock"] >= th).astype(float)
-
-            if soft_temperature is not None:
-                temp = max(float(soft_temperature), 1e-6)
-                soft_mask = _safe_sigmoid_np((out["p_active_instock"].values - th) / temp)
-                out["pred_instock_dph_softcalib"] = out["pred_instock_dph_raw"].values * soft_mask
-                out["pred_instock_dph"] = out["pred_instock_dph_softcalib"]
-
-            # Hard exact zero. This is the piece that fixes "pred never equals 0".
-            hth = th if hard_zero_threshold is None else float(hard_zero_threshold)
-            out.loc[out["p_active_instock"] < hth, "pred_instock_dph"] = 0.0
-            out["zero_calib_hard_threshold"] = float(hth)
-        else:
-            # Fallback if p_active is not saved: only zero very tiny predictions.
-            value_th = 1.0 if hard_zero_threshold is None else float(hard_zero_threshold)
-            out["pred_instock_dph_raw"] = out["pred_instock_dph"].astype(float)
-            out.loc[out["pred_instock_dph"] < value_th, "pred_instock_dph"] = 0.0
-            out["zero_calib_value_threshold"] = float(value_th)
-
-    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
-    out[pred_cols] = out[pred_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
-
-    # Enforce funnel without in-place tensor issues; this is pandas post-processing only.
-    out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
-    out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
-
+def make_external_hat_df(pred_df):
+    out = pred_df[["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]].copy()
     out["external_total_dph_hat_log"]    = np.log1p(out["pred_total_dph"].clip(lower=0.0))
     out["external_buy_box_dph_hat_log"]  = np.log1p(out["pred_buy_box_dph"].clip(lower=0.0))
     out["external_instock_dph_hat_log"]  = np.log1p(out["pred_instock_dph"].clip(lower=0.0))
     return out
-
-
-# ============================================================
-# Category-aware zero calibration
-# ============================================================
-
-def _attach_static_group_cols(pred_df, source_df=None):
-    """
-    Attach category_code / gl_product_group / hbt / brand columns to pred_df by ASIN.
-    Uses only static ASIN-level columns from the source dataframe.
-    """
-    out = pred_df.copy()
-    if source_df is None:
-        return out
-
-    needed = ["category_code", "gl_product_group", "hbt", "ind_top10_brand"]
-    have = [c for c in needed if c in source_df.columns]
-    if len(have) == 0 or "asin" not in source_df.columns:
-        return out
-
-    meta = source_df[["asin"] + have].copy()
-    meta["asin"] = meta["asin"].astype(str)
-    meta = meta.drop_duplicates("asin")
-
-    out["asin"] = out["asin"].astype(str)
-    for c in have:
-        if c in out.columns:
-            out = out.drop(columns=[c])
-    out = out.merge(meta, on="asin", how="left")
-    return out
-
-
-def _zero_calibration_metrics_for_threshold(
-    df,
-    threshold,
-    p_col="p_active_instock",
-    pred_col="pred_instock_dph",
-    true_col="true_instock_dph",
-):
-    d = df[[p_col, pred_col, true_col]].replace([np.inf, -np.inf], np.nan).dropna().copy()
-    if len(d) == 0:
-        return None
-
-    y = d[true_col].astype(float).values
-    p = d[p_col].astype(float).values
-    pred_raw = d[pred_col].astype(float).values.copy()
-    true_active = y > 0
-    true_sum = float(y.sum()) + 1e-8
-
-    pred = pred_raw.copy()
-    pred[p < threshold] = 0.0
-
-    exact_zero = pred <= 0
-    return {
-        "threshold": float(threshold),
-        "n_rows": int(len(d)),
-        "true_sum": float(y.sum()),
-        "pred_sum": float(pred.sum()),
-        "ratio_after_zero": float(pred.sum() / true_sum),
-        "WAPE_after_zero": float(np.abs(pred - y).sum() / true_sum),
-        "false_zero_rate_on_active": float((exact_zero & true_active).sum() / max(1, true_active.sum())),
-        "zero_recall": float((exact_zero & (~true_active)).sum() / max(1, (~true_active).sum())),
-        "exact_zero_share": float(exact_zero.mean()),
-        "true_zero_share": float((~true_active).mean()),
-    }
-
-
-def find_best_zero_threshold_conservative(
-    df,
-    p_col="p_active_instock",
-    pred_col="pred_instock_dph",
-    true_col="true_instock_dph",
-    grid=None,
-    min_ratio=0.95,
-    max_false_zero_active=0.08,
-    prefer_more_zero=True,
-):
-    """
-    Conservative threshold search for one segment.
-
-    If p_active < threshold, pred_instock_dph is set to exact zero.
-    We prioritize avoiding false zero on true-active weeks, so this is safer for demand.
-    """
-    if grid is None:
-        grid = np.round(np.arange(0.35, 0.751, 0.025), 3)
-
-    required = [p_col, pred_col, true_col]
-    if any(c not in df.columns for c in required):
-        return None, pd.DataFrame()
-
-    rows = []
-    for th in grid:
-        m = _zero_calibration_metrics_for_threshold(
-            df, th, p_col=p_col, pred_col=pred_col, true_col=true_col
-        )
-        if m is not None:
-            rows.append(m)
-
-    tbl = pd.DataFrame(rows)
-    if len(tbl) == 0:
-        return None, tbl
-
-    feasible = tbl[
-        (tbl["ratio_after_zero"] >= min_ratio)
-        & (tbl["false_zero_rate_on_active"] <= max_false_zero_active)
-    ].copy()
-
-    if len(feasible) == 0:
-        # Most conservative fallback: minimize false-zero damage first.
-        feasible = tbl.sort_values(
-            ["false_zero_rate_on_active", "WAPE_after_zero"],
-            ascending=[True, True],
-        ).head(5).copy()
-
-    # Main objective: WAPE, but keep false-zero damage low.
-    sort_cols = ["WAPE_after_zero", "false_zero_rate_on_active"]
-    ascending = [True, True]
-    if prefer_more_zero:
-        sort_cols.append("zero_recall")
-        ascending.append(False)
-
-    best = feasible.sort_values(sort_cols, ascending=ascending).iloc[0]
-    return float(best["threshold"]), tbl
-
-
-def category_aware_zero_calibration(
-    pred_df,
-    source_df=None,
-    p_col="p_active_instock",
-    pred_col="pred_instock_dph",
-    true_col="true_instock_dph",
-    category_col="category_code",
-    gl_col="gl_product_group",
-    min_category_rows=300,
-    min_gl_rows=500,
-    global_threshold=0.55,
-    min_ratio=0.95,
-    max_false_zero_active=0.08,
-    grid=None,
-    verbose=True,
-):
-    """
-    Category-aware zero calibration with fallback:
-      category_code threshold -> gl_product_group threshold -> global threshold.
-
-    This fixes the softplus/direct-head issue where final predictions never equal exact 0,
-    but avoids global over-aggressive thresholding.
-    """
-    df = _attach_static_group_cols(pred_df, source_df=source_df)
-    if grid is None:
-        grid = np.round(np.arange(0.35, 0.751, 0.025), 3)
-
-    if pred_col not in df.columns:
-        raise KeyError(f"{pred_col} not found in pred_df")
-    if true_col not in df.columns:
-        raise KeyError(f"{true_col} not found in pred_df")
-
-    if "pred_instock_dph_raw" not in df.columns:
-        df["pred_instock_dph_raw"] = df[pred_col].astype(float)
-
-    # Global fallback fit.
-    global_fit, global_tbl = find_best_zero_threshold_conservative(
-        df,
-        p_col=p_col,
-        pred_col=pred_col,
-        true_col=true_col,
-        grid=grid,
-        min_ratio=min_ratio,
-        max_false_zero_active=max_false_zero_active,
-    )
-    if global_fit is not None:
-        global_threshold = float(global_fit)
-
-    cat_thresholds, gl_thresholds = {}, {}
-    cat_diag_rows, gl_diag_rows = [], []
-
-    # Category thresholds.
-    if category_col in df.columns and p_col in df.columns:
-        for cat, g in df.groupby(category_col, dropna=False):
-            if len(g) < min_category_rows:
-                continue
-            th, tbl = find_best_zero_threshold_conservative(
-                g,
-                p_col=p_col,
-                pred_col=pred_col,
-                true_col=true_col,
-                grid=grid,
-                min_ratio=min_ratio,
-                max_false_zero_active=max_false_zero_active,
-            )
-            if th is None:
-                continue
-            cat_thresholds[cat] = th
-            row = tbl.loc[(tbl["threshold"] - th).abs().idxmin()].to_dict()
-            row[category_col] = cat
-            row["calib_level"] = "category"
-            cat_diag_rows.append(row)
-
-    # GL fallback thresholds.
-    if gl_col in df.columns and p_col in df.columns:
-        for gl, g in df.groupby(gl_col, dropna=False):
-            if len(g) < min_gl_rows:
-                continue
-            th, tbl = find_best_zero_threshold_conservative(
-                g,
-                p_col=p_col,
-                pred_col=pred_col,
-                true_col=true_col,
-                grid=grid,
-                min_ratio=min_ratio,
-                max_false_zero_active=max_false_zero_active,
-            )
-            if th is None:
-                continue
-            gl_thresholds[gl] = th
-            row = tbl.loc[(tbl["threshold"] - th).abs().idxmin()].to_dict()
-            row[gl_col] = gl
-            row["calib_level"] = "gl"
-            gl_diag_rows.append(row)
-
-    def _pick_threshold(row):
-        cat = row.get(category_col, None)
-        gl = row.get(gl_col, None)
-        if cat in cat_thresholds:
-            return float(cat_thresholds[cat]), "category"
-        if gl in gl_thresholds:
-            return float(gl_thresholds[gl]), "gl"
-        return float(global_threshold), "global"
-
-    picks = df.apply(_pick_threshold, axis=1)
-    df["zero_calib_p_threshold"] = [p[0] for p in picks]
-    df["zero_calib_level"] = [p[1] for p in picks]
-
-    if p_col in df.columns:
-        df["pred_instock_active_flag"] = (df[p_col] >= df["zero_calib_p_threshold"]).astype(float)
-        zero_mask = df[p_col] < df["zero_calib_p_threshold"]
-    else:
-        zero_mask = df[pred_col] <= 1.0
-        df["zero_calib_level"] = "value_fallback"
-
-    df["pred_instock_dph_zero_calib"] = df["pred_instock_dph_raw"].astype(float)
-    df.loc[zero_mask, "pred_instock_dph_zero_calib"] = 0.0
-
-    # Make the main pred column calibrated for direct demand consumption.
-    df[pred_col] = df["pred_instock_dph_zero_calib"].astype(float)
-
-    # Re-enforce funnel after in-stock calibration.
-    if "pred_total_dph" in df.columns and "pred_buy_box_dph" in df.columns:
-        df["pred_total_dph"] = df["pred_total_dph"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
-        df["pred_buy_box_dph"] = df["pred_buy_box_dph"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
-        df["pred_buy_box_dph"] = np.minimum(df["pred_buy_box_dph"], df["pred_total_dph"])
-        df[pred_col] = np.minimum(df[pred_col].clip(lower=0.0), df["pred_buy_box_dph"])
-
-    # External log hat columns for demand.
-    if "pred_total_dph" in df.columns:
-        df["external_total_dph_hat_log"] = np.log1p(df["pred_total_dph"].clip(lower=0.0))
-    if "pred_buy_box_dph" in df.columns:
-        df["external_buy_box_dph_hat_log"] = np.log1p(df["pred_buy_box_dph"].clip(lower=0.0))
-    df["external_instock_dph_hat_log"] = np.log1p(df[pred_col].clip(lower=0.0))
-
-    overall = _zero_calibration_metrics_for_threshold(
-        df.assign(**{p_col: df[p_col] if p_col in df.columns else 1.0}),
-        threshold=-1.0,  # no additional threshold; pred column is already calibrated
-        p_col=p_col if p_col in df.columns else pred_col,
-        pred_col=pred_col,
-        true_col=true_col,
-    )
-    if overall is None:
-        overall = {}
-    # Correct threshold=-1 makes no more zeroing; exact_zero_share/ratio based on calibrated pred.
-    y = df[true_col].astype(float).values
-    pcal = df[pred_col].astype(float).values
-    true_active = y > 0
-    overall.update({
-        "ratio_after_zero": float(pcal.sum() / (y.sum() + 1e-8)),
-        "WAPE_after_zero": float(np.abs(pcal - y).sum() / (y.sum() + 1e-8)),
-        "false_zero_rate_on_active": float(((pcal <= 0) & true_active).sum() / max(1, true_active.sum())),
-        "zero_recall": float(((pcal <= 0) & (~true_active)).sum() / max(1, (~true_active).sum())),
-        "exact_zero_share": float((pcal <= 0).mean()),
-        "true_zero_share": float((~true_active).mean()),
-    })
-
-    if verbose:
-        print("\n" + "=" * 100)
-        print("CATEGORY-AWARE IN-STOCK ZERO CALIBRATION")
-        print("=" * 100)
-        print(f"Global fallback threshold: {global_threshold:.3f}")
-        print(f"Category thresholds learned: {len(cat_thresholds)}")
-        print(f"GL thresholds learned: {len(gl_thresholds)}")
-        print("Calibration level share:")
-        print(df["zero_calib_level"].value_counts(normalize=True).round(4).to_string())
-        print("\nOverall after category-aware zero calibration:")
-        for k in ["ratio_after_zero", "WAPE_after_zero", "false_zero_rate_on_active", "zero_recall", "exact_zero_share", "true_zero_share"]:
-            print(f"{k}: {overall.get(k, np.nan):.4f}")
-
-        cat_diag = pd.DataFrame(cat_diag_rows)
-        if len(cat_diag) > 0:
-            print("\nTop category thresholds by rows:")
-            show_cols = [category_col, "n_rows", "threshold", "ratio_after_zero", "WAPE_after_zero", "false_zero_rate_on_active", "zero_recall", "exact_zero_share"]
-            print(cat_diag.sort_values("n_rows", ascending=False)[show_cols].head(15).round(4).to_string(index=False))
-
-    return {
-        "forecast_df_zero_calib": df,
-        "category_thresholds": cat_thresholds,
-        "gl_thresholds": gl_thresholds,
-        "category_diag": pd.DataFrame(cat_diag_rows),
-        "gl_diag": pd.DataFrame(gl_diag_rows),
-        "global_threshold": float(global_threshold),
-        "global_threshold_table": global_tbl,
-        "overall": overall,
-    }
-
-
-def make_external_hat_df_category_aware(
-    pred_df,
-    source_df=None,
-    **kwargs,
-):
-    """
-    Directly build demand-ready exposure_hat using category-aware zero calibration.
-    """
-    out = category_aware_zero_calibration(pred_df, source_df=source_df, **kwargs)
-    df = out["forecast_df_zero_calib"].copy()
-    base_cols = ["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
-    keep = [c for c in base_cols + [
-        "pred_instock_dph_raw",
-        "pred_instock_dph_zero_calib",
-        "p_active_instock",
-        "pred_instock_active_flag",
-        "zero_calib_p_threshold",
-        "zero_calib_level",
-        "category_code",
-        "gl_product_group",
-        "hbt",
-        "external_total_dph_hat_log",
-        "external_buy_box_dph_hat_log",
-        "external_instock_dph_hat_log",
-    ] if c in df.columns]
-    return df[keep].copy(), out
 
 
 # ============================================================
@@ -3151,6 +2773,7 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -3263,9 +2886,6 @@ def run_exposure_v2(
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
         "exposure_hat_for_demand": exposure_hat_for_demand,
-        "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
-        "exposure_hat_for_demand_category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[0],
-        "category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[1],
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -3536,6 +3156,7 @@ def _train_one_exposure_window(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -3841,6 +3462,7 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -3953,9 +3575,6 @@ def run_exposure_v2(
 
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
-        "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
-        "exposure_hat_for_demand_category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[0],
-        "category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[1],
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
@@ -3991,6 +3610,7 @@ def run_exposure_v2_rolling(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
