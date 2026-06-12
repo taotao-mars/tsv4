@@ -1,17 +1,21 @@
-df = pred_df.copy()
+# 1. 先跑 exposure model
+result = run_exposure_v2_final_scot_5000(...)
 
-zero_df = df[df["true_instock_dph"] <= 0].copy()
-nonzero_df = df[df["true_instock_dph"] > 0].copy()
+# 2. 从 exposure result 里取 category-aware zero calibrated exposure hat
+hat_cat_zero = result["exposure_hat_for_demand_category_zero_calib"]
+cat_zero_diag = result["category_zero_calib"]
 
-print("=== Predicted in_stock on true zero rows ===")
-print(zero_df["pred_instock_dph"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
+# 3. 简单检查一下
+print(hat_cat_zero[["pred_instock_dph"]].describe())
+print("exact zero share:", (hat_cat_zero["pred_instock_dph"] == 0).mean())
 
-print("\n=== Predicted in_stock on true nonzero rows ===")
-print(nonzero_df["pred_instock_dph"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
-
-if "p_active_instock" in df.columns:
-    print("\n=== p_active on true zero rows ===")
-    print(zero_df["p_active_instock"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]))
-
-    print("\n=== p_active on true nonzero rows ===")
-    print(nonzero_df["p_active_instock"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]))
+# 4. 再接 demand
+demand_result_instock = run_demand_with_predicted_exposure_instock_only(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    exposure_result_or_hat=hat_cat_zero,
+    n_asins=5000,
+    epochs=60,
+    history=52,
+    horizon=20,
+)
