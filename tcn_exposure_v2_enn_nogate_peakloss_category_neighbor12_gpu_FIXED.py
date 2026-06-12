@@ -2787,6 +2787,345 @@ def make_external_hat_df(
 
 
 # ============================================================
+# Category-aware zero calibration
+# ============================================================
+
+def _attach_static_group_cols(pred_df, source_df=None):
+    """
+    Attach category_code / gl_product_group / hbt / brand columns to pred_df by ASIN.
+    Uses only static ASIN-level columns from the source dataframe.
+    """
+    out = pred_df.copy()
+    if source_df is None:
+        return out
+
+    needed = ["category_code", "gl_product_group", "hbt", "ind_top10_brand"]
+    have = [c for c in needed if c in source_df.columns]
+    if len(have) == 0 or "asin" not in source_df.columns:
+        return out
+
+    meta = source_df[["asin"] + have].copy()
+    meta["asin"] = meta["asin"].astype(str)
+    meta = meta.drop_duplicates("asin")
+
+    out["asin"] = out["asin"].astype(str)
+    for c in have:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+    out = out.merge(meta, on="asin", how="left")
+    return out
+
+
+def _zero_calibration_metrics_for_threshold(
+    df,
+    threshold,
+    p_col="p_active_instock",
+    pred_col="pred_instock_dph",
+    true_col="true_instock_dph",
+):
+    d = df[[p_col, pred_col, true_col]].replace([np.inf, -np.inf], np.nan).dropna().copy()
+    if len(d) == 0:
+        return None
+
+    y = d[true_col].astype(float).values
+    p = d[p_col].astype(float).values
+    pred_raw = d[pred_col].astype(float).values.copy()
+    true_active = y > 0
+    true_sum = float(y.sum()) + 1e-8
+
+    pred = pred_raw.copy()
+    pred[p < threshold] = 0.0
+
+    exact_zero = pred <= 0
+    return {
+        "threshold": float(threshold),
+        "n_rows": int(len(d)),
+        "true_sum": float(y.sum()),
+        "pred_sum": float(pred.sum()),
+        "ratio_after_zero": float(pred.sum() / true_sum),
+        "WAPE_after_zero": float(np.abs(pred - y).sum() / true_sum),
+        "false_zero_rate_on_active": float((exact_zero & true_active).sum() / max(1, true_active.sum())),
+        "zero_recall": float((exact_zero & (~true_active)).sum() / max(1, (~true_active).sum())),
+        "exact_zero_share": float(exact_zero.mean()),
+        "true_zero_share": float((~true_active).mean()),
+    }
+
+
+def find_best_zero_threshold_conservative(
+    df,
+    p_col="p_active_instock",
+    pred_col="pred_instock_dph",
+    true_col="true_instock_dph",
+    grid=None,
+    min_ratio=0.95,
+    max_false_zero_active=0.08,
+    prefer_more_zero=True,
+):
+    """
+    Conservative threshold search for one segment.
+
+    If p_active < threshold, pred_instock_dph is set to exact zero.
+    We prioritize avoiding false zero on true-active weeks, so this is safer for demand.
+    """
+    if grid is None:
+        grid = np.round(np.arange(0.35, 0.751, 0.025), 3)
+
+    required = [p_col, pred_col, true_col]
+    if any(c not in df.columns for c in required):
+        return None, pd.DataFrame()
+
+    rows = []
+    for th in grid:
+        m = _zero_calibration_metrics_for_threshold(
+            df, th, p_col=p_col, pred_col=pred_col, true_col=true_col
+        )
+        if m is not None:
+            rows.append(m)
+
+    tbl = pd.DataFrame(rows)
+    if len(tbl) == 0:
+        return None, tbl
+
+    feasible = tbl[
+        (tbl["ratio_after_zero"] >= min_ratio)
+        & (tbl["false_zero_rate_on_active"] <= max_false_zero_active)
+    ].copy()
+
+    if len(feasible) == 0:
+        # Most conservative fallback: minimize false-zero damage first.
+        feasible = tbl.sort_values(
+            ["false_zero_rate_on_active", "WAPE_after_zero"],
+            ascending=[True, True],
+        ).head(5).copy()
+
+    # Main objective: WAPE, but keep false-zero damage low.
+    sort_cols = ["WAPE_after_zero", "false_zero_rate_on_active"]
+    ascending = [True, True]
+    if prefer_more_zero:
+        sort_cols.append("zero_recall")
+        ascending.append(False)
+
+    best = feasible.sort_values(sort_cols, ascending=ascending).iloc[0]
+    return float(best["threshold"]), tbl
+
+
+def category_aware_zero_calibration(
+    pred_df,
+    source_df=None,
+    p_col="p_active_instock",
+    pred_col="pred_instock_dph",
+    true_col="true_instock_dph",
+    category_col="category_code",
+    gl_col="gl_product_group",
+    min_category_rows=300,
+    min_gl_rows=500,
+    global_threshold=0.55,
+    min_ratio=0.95,
+    max_false_zero_active=0.08,
+    grid=None,
+    verbose=True,
+):
+    """
+    Category-aware zero calibration with fallback:
+      category_code threshold -> gl_product_group threshold -> global threshold.
+
+    This fixes the softplus/direct-head issue where final predictions never equal exact 0,
+    but avoids global over-aggressive thresholding.
+    """
+    df = _attach_static_group_cols(pred_df, source_df=source_df)
+    if grid is None:
+        grid = np.round(np.arange(0.35, 0.751, 0.025), 3)
+
+    if pred_col not in df.columns:
+        raise KeyError(f"{pred_col} not found in pred_df")
+    if true_col not in df.columns:
+        raise KeyError(f"{true_col} not found in pred_df")
+
+    if "pred_instock_dph_raw" not in df.columns:
+        df["pred_instock_dph_raw"] = df[pred_col].astype(float)
+
+    # Global fallback fit.
+    global_fit, global_tbl = find_best_zero_threshold_conservative(
+        df,
+        p_col=p_col,
+        pred_col=pred_col,
+        true_col=true_col,
+        grid=grid,
+        min_ratio=min_ratio,
+        max_false_zero_active=max_false_zero_active,
+    )
+    if global_fit is not None:
+        global_threshold = float(global_fit)
+
+    cat_thresholds, gl_thresholds = {}, {}
+    cat_diag_rows, gl_diag_rows = [], []
+
+    # Category thresholds.
+    if category_col in df.columns and p_col in df.columns:
+        for cat, g in df.groupby(category_col, dropna=False):
+            if len(g) < min_category_rows:
+                continue
+            th, tbl = find_best_zero_threshold_conservative(
+                g,
+                p_col=p_col,
+                pred_col=pred_col,
+                true_col=true_col,
+                grid=grid,
+                min_ratio=min_ratio,
+                max_false_zero_active=max_false_zero_active,
+            )
+            if th is None:
+                continue
+            cat_thresholds[cat] = th
+            row = tbl.loc[(tbl["threshold"] - th).abs().idxmin()].to_dict()
+            row[category_col] = cat
+            row["calib_level"] = "category"
+            cat_diag_rows.append(row)
+
+    # GL fallback thresholds.
+    if gl_col in df.columns and p_col in df.columns:
+        for gl, g in df.groupby(gl_col, dropna=False):
+            if len(g) < min_gl_rows:
+                continue
+            th, tbl = find_best_zero_threshold_conservative(
+                g,
+                p_col=p_col,
+                pred_col=pred_col,
+                true_col=true_col,
+                grid=grid,
+                min_ratio=min_ratio,
+                max_false_zero_active=max_false_zero_active,
+            )
+            if th is None:
+                continue
+            gl_thresholds[gl] = th
+            row = tbl.loc[(tbl["threshold"] - th).abs().idxmin()].to_dict()
+            row[gl_col] = gl
+            row["calib_level"] = "gl"
+            gl_diag_rows.append(row)
+
+    def _pick_threshold(row):
+        cat = row.get(category_col, None)
+        gl = row.get(gl_col, None)
+        if cat in cat_thresholds:
+            return float(cat_thresholds[cat]), "category"
+        if gl in gl_thresholds:
+            return float(gl_thresholds[gl]), "gl"
+        return float(global_threshold), "global"
+
+    picks = df.apply(_pick_threshold, axis=1)
+    df["zero_calib_p_threshold"] = [p[0] for p in picks]
+    df["zero_calib_level"] = [p[1] for p in picks]
+
+    if p_col in df.columns:
+        df["pred_instock_active_flag"] = (df[p_col] >= df["zero_calib_p_threshold"]).astype(float)
+        zero_mask = df[p_col] < df["zero_calib_p_threshold"]
+    else:
+        zero_mask = df[pred_col] <= 1.0
+        df["zero_calib_level"] = "value_fallback"
+
+    df["pred_instock_dph_zero_calib"] = df["pred_instock_dph_raw"].astype(float)
+    df.loc[zero_mask, "pred_instock_dph_zero_calib"] = 0.0
+
+    # Make the main pred column calibrated for direct demand consumption.
+    df[pred_col] = df["pred_instock_dph_zero_calib"].astype(float)
+
+    # Re-enforce funnel after in-stock calibration.
+    if "pred_total_dph" in df.columns and "pred_buy_box_dph" in df.columns:
+        df["pred_total_dph"] = df["pred_total_dph"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+        df["pred_buy_box_dph"] = df["pred_buy_box_dph"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+        df["pred_buy_box_dph"] = np.minimum(df["pred_buy_box_dph"], df["pred_total_dph"])
+        df[pred_col] = np.minimum(df[pred_col].clip(lower=0.0), df["pred_buy_box_dph"])
+
+    # External log hat columns for demand.
+    if "pred_total_dph" in df.columns:
+        df["external_total_dph_hat_log"] = np.log1p(df["pred_total_dph"].clip(lower=0.0))
+    if "pred_buy_box_dph" in df.columns:
+        df["external_buy_box_dph_hat_log"] = np.log1p(df["pred_buy_box_dph"].clip(lower=0.0))
+    df["external_instock_dph_hat_log"] = np.log1p(df[pred_col].clip(lower=0.0))
+
+    overall = _zero_calibration_metrics_for_threshold(
+        df.assign(**{p_col: df[p_col] if p_col in df.columns else 1.0}),
+        threshold=-1.0,  # no additional threshold; pred column is already calibrated
+        p_col=p_col if p_col in df.columns else pred_col,
+        pred_col=pred_col,
+        true_col=true_col,
+    )
+    if overall is None:
+        overall = {}
+    # Correct threshold=-1 makes no more zeroing; exact_zero_share/ratio based on calibrated pred.
+    y = df[true_col].astype(float).values
+    pcal = df[pred_col].astype(float).values
+    true_active = y > 0
+    overall.update({
+        "ratio_after_zero": float(pcal.sum() / (y.sum() + 1e-8)),
+        "WAPE_after_zero": float(np.abs(pcal - y).sum() / (y.sum() + 1e-8)),
+        "false_zero_rate_on_active": float(((pcal <= 0) & true_active).sum() / max(1, true_active.sum())),
+        "zero_recall": float(((pcal <= 0) & (~true_active)).sum() / max(1, (~true_active).sum())),
+        "exact_zero_share": float((pcal <= 0).mean()),
+        "true_zero_share": float((~true_active).mean()),
+    })
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("CATEGORY-AWARE IN-STOCK ZERO CALIBRATION")
+        print("=" * 100)
+        print(f"Global fallback threshold: {global_threshold:.3f}")
+        print(f"Category thresholds learned: {len(cat_thresholds)}")
+        print(f"GL thresholds learned: {len(gl_thresholds)}")
+        print("Calibration level share:")
+        print(df["zero_calib_level"].value_counts(normalize=True).round(4).to_string())
+        print("\nOverall after category-aware zero calibration:")
+        for k in ["ratio_after_zero", "WAPE_after_zero", "false_zero_rate_on_active", "zero_recall", "exact_zero_share", "true_zero_share"]:
+            print(f"{k}: {overall.get(k, np.nan):.4f}")
+
+        cat_diag = pd.DataFrame(cat_diag_rows)
+        if len(cat_diag) > 0:
+            print("\nTop category thresholds by rows:")
+            show_cols = [category_col, "n_rows", "threshold", "ratio_after_zero", "WAPE_after_zero", "false_zero_rate_on_active", "zero_recall", "exact_zero_share"]
+            print(cat_diag.sort_values("n_rows", ascending=False)[show_cols].head(15).round(4).to_string(index=False))
+
+    return {
+        "forecast_df_zero_calib": df,
+        "category_thresholds": cat_thresholds,
+        "gl_thresholds": gl_thresholds,
+        "category_diag": pd.DataFrame(cat_diag_rows),
+        "gl_diag": pd.DataFrame(gl_diag_rows),
+        "global_threshold": float(global_threshold),
+        "global_threshold_table": global_tbl,
+        "overall": overall,
+    }
+
+
+def make_external_hat_df_category_aware(
+    pred_df,
+    source_df=None,
+    **kwargs,
+):
+    """
+    Directly build demand-ready exposure_hat using category-aware zero calibration.
+    """
+    out = category_aware_zero_calibration(pred_df, source_df=source_df, **kwargs)
+    df = out["forecast_df_zero_calib"].copy()
+    base_cols = ["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    keep = [c for c in base_cols + [
+        "pred_instock_dph_raw",
+        "pred_instock_dph_zero_calib",
+        "p_active_instock",
+        "pred_instock_active_flag",
+        "zero_calib_p_threshold",
+        "zero_calib_level",
+        "category_code",
+        "gl_product_group",
+        "hbt",
+        "external_total_dph_hat_log",
+        "external_buy_box_dph_hat_log",
+        "external_instock_dph_hat_log",
+    ] if c in df.columns]
+    return df[keep].copy(), out
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -2925,6 +3264,8 @@ def run_exposure_v2(
         "diagnostics": diagnostics,
         "exposure_hat_for_demand": exposure_hat_for_demand,
         "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
+        "exposure_hat_for_demand_category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[0],
+        "category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[1],
         "tr_ld": tr_ld,
         "va_ld": va_ld,
         "context_cols": context_cols,
@@ -3613,6 +3954,8 @@ def run_exposure_v2(
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
         "exposure_hat_for_demand_zero_calib": make_external_hat_df(pred_df, zero_calibrate=True, p_threshold="auto", hard_zero_threshold=None, soft_temperature=None),
+        "exposure_hat_for_demand_category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[0],
+        "category_zero_calib": make_external_hat_df_category_aware(pred_df, source_df=df)[1],
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
