@@ -1,57 +1,9 @@
-# =====================================================
-# Check NB-distribution exposure hat, then run demand
-# =====================================================
+exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"]
 
-exposure_hat_for_demand = exposure_result["exposure_hat_for_demand"].copy()
-
-pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
-pred_cols = [c for c in pred_cols if c in exposure_hat_for_demand.columns]
-
-print("\n" + "=" * 80)
-print("EXPOSURE HAT CHECK BEFORE DEMAND")
-print("=" * 80)
-
-print("\nShape:")
-print(exposure_hat_for_demand.shape)
-
-print("\nColumns used:")
-print(pred_cols)
-
-print("\nPredicted exposure describe:")
-print(exposure_hat_for_demand[pred_cols].describe())
-
-print("\nExact zero share:")
-print((exposure_hat_for_demand[pred_cols] == 0).mean())
-
-print("\nNegative value count:")
-print((exposure_hat_for_demand[pred_cols] < 0).sum())
-
-print("\nNaN count:")
-print(exposure_hat_for_demand[pred_cols].isna().sum())
-
-print("\nInstock only quick check:")
-print(exposure_hat_for_demand[["pred_instock_dph"]].describe())
-print(
-    "pred_instock exact zero share:",
-    (exposure_hat_for_demand["pred_instock_dph"] == 0).mean()
+summarize_hat_for_demand(
+    exposure_hat_for_demand,
+    title="MU HAT BEFORE DEMAND"
 )
-
-# Optional: enforce nonnegative just in case
-exposure_hat_for_demand[pred_cols] = (
-    exposure_hat_for_demand[pred_cols]
-    .replace([np.inf, -np.inf], np.nan)
-    .fillna(0.0)
-    .clip(lower=0.0)
-)
-
-print("\nAfter safety cleanup:")
-print(exposure_hat_for_demand[pred_cols].describe())
-print("zero share after cleanup:")
-print((exposure_hat_for_demand[pred_cols] == 0).mean())
-
-print("\n" + "=" * 80)
-print("RUN DEMAND MODEL WITH NB-DISTRIBUTION EXPOSURE HAT")
-print("=" * 80)
 
 demand_result_instock = run_demand_with_predicted_exposure_instock_only(
     data_raw1=data_raw1,
