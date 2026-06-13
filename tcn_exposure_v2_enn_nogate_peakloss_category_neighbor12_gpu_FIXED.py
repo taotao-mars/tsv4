@@ -2159,15 +2159,18 @@ def predict_exposure_v2(
     apply_funnel_constraint=True,
     device=None,
     mc_samples=50,
-    mc_reduce="p50",
+    mc_reduce="mu",
     use_distributional_samples=True,
 ):
     """
     Predict exposure paths.
 
-    When use_distributional_samples=True and the model returns aux["alpha"], the main
-    pred_*_dph columns are NB-sample quantiles, like the demand model's p50 logic.
-    This allows exact-zero exposure predictions without hard zero calibration.
+    Default mc_reduce="mu": the main pred_*_dph columns use the direct expected level
+    expm1(log_hat). This is the recommended exposure covariate for the demand model.
+
+    NB sampling is still explicit and available via mc_reduce="p50"/"nb_sample" or
+    mc_reduce="nb_mean". The sampled p50 is kept as a zero/active diagnostic, but is
+    usually too conservative to pass directly into demand.
 
     Extra diagnostics:
       pred_*_dph_mu: direct mean path expm1(log_hat)
@@ -2313,6 +2316,43 @@ def exposure_metrics(pred_df, prefix="pred"):
         })
     return pd.DataFrame(rows)
 
+
+
+
+def make_p50_diagnostic_view(pred_df):
+    """Return a copy where main pred_* columns are replaced by NB sampled p50.
+    Use only for zero/active diagnostics, not for demand handoff.
+    """
+    out = pred_df.copy()
+    mapping = {
+        "pred_total_dph": "pred_total_dph_dist_p50",
+        "pred_buy_box_dph": "pred_buy_box_dph_dist_p50",
+        "pred_instock_dph": "pred_instock_dph_dist_p50",
+    }
+    for dst, src in mapping.items():
+        if src in out.columns:
+            out[dst] = out[src]
+    return out
+
+
+def print_mu_vs_p50_quick_diagnostics(pred_df):
+    print("\n" + "=" * 100)
+    print("MU vs NB-P50 QUICK DIAGNOSTICS")
+    print("=" * 100)
+    print("\n[MU / expected level as main pred_* columns]  <-- use for demand hat")
+    print(exposure_metrics(pred_df, prefix="pred").round(5).to_string(index=False))
+    p50_df = make_p50_diagnostic_view(pred_df)
+    print("\n[NB sampled P50 diagnostic]  <-- zero/active diagnostic only")
+    print(exposure_metrics(p50_df, prefix="pred").round(5).to_string(index=False))
+    cols = ["pred_total_dph_dist_p50", "pred_buy_box_dph_dist_p50", "pred_instock_dph_dist_p50"]
+    cols = [c for c in cols if c in pred_df.columns]
+    if cols:
+        print("\nNB-P50 exact-zero share:")
+        print((pred_df[cols] == 0).mean().round(5).to_string())
+    return {
+        "mu_metrics": exposure_metrics(pred_df, prefix="pred"),
+        "p50_metrics": exposure_metrics(p50_df, prefix="pred"),
+    }
 
 def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
     idx   = {c: i for i, c in enumerate(context_cols)}
@@ -2855,6 +2895,12 @@ def summarize_hat_for_demand(hat, title="EXPOSURE HAT FOR DEMAND"):
 # 主入口
 # ============================================================
 
+
+# Exposure-only public alias. Use this name to avoid confusion with demand utilities.
+def summarize_exposure_hat_for_demand(hat, title="EXPOSURE HAT FOR DEMAND"):
+    return summarize_hat_for_demand(hat, title=title)
+
+
 def run_exposure_v2(
     data_raw1,
     scot_df=None,    # 不再使用，保留接口兼容
@@ -2980,9 +3026,10 @@ def run_exposure_v2(
         zero_fp_temperature=zero_fp_temperature,
     )
 
-    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
+    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint, mc_reduce="mu")
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
+    diagnostics_views = print_mu_vs_p50_quick_diagnostics(pred_df)
     exposure_hat_for_demand = make_external_hat_df(pred_df, hat_source="mu")
     exposure_hat_for_demand_p50 = make_external_hat_df(pred_df, hat_source="p50")
     exposure_hat_for_demand_dist_mean = make_external_hat_df(pred_df, hat_source="dist_mean")
@@ -2993,6 +3040,7 @@ def run_exposure_v2(
         "model": model,
         "forecast_df": pred_df,
         "diagnostics": diagnostics,
+        "diagnostics_views": diagnostics_views,
         "exposure_hat_for_demand": exposure_hat_for_demand,
         "exposure_hat_for_demand_mu": exposure_hat_for_demand,
         "exposure_hat_for_demand_p50": exposure_hat_for_demand_p50,
@@ -3372,7 +3420,7 @@ def _train_one_exposure_window(
         zero_fp_temperature=zero_fp_temperature,
     )
 
-    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
+    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint, mc_reduce="mu")
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     pred_df["backtest_offset"] = int(val_start_offset)
 
@@ -4392,9 +4440,9 @@ def print_exposure_diagnostics(pred_df):
 
 
 # ============================================================
-# USAGE: NB distribution exposure with MU hat for demand
+# USAGE: exposure only; pass only the final hat dataframe to demand
 # ============================================================
-# %run -i tcn_exposure_v2_dualgraph_historical_oos_nb_mu_hat_gpu.py
+# %run -i exposure_model_only_nb_mu_hats_v2.py
 #
 # exposure_result = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
@@ -4416,20 +4464,7 @@ def print_exposure_diagnostics(pred_df):
 #     use_encoder_self_attn=True,
 # )
 #
-# # Recommended demand input: MU / expected exposure level
-# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"]
-# summarize_hat_for_demand(exposure_hat_for_demand, title="MU HAT BEFORE DEMAND")
+# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
+# summarize_exposure_hat_for_demand(exposure_hat_for_demand, title="MU HAT TO PASS INTO DEMAND")
 #
-# demand_result_instock = run_demand_with_predicted_exposure_instock_only(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     exposure_result_or_hat=exposure_hat_for_demand,
-#     n_asins=5000,
-#     epochs=60,
-#     history=52,
-#     horizon=20,
-# )
-#
-# # Diagnostic only: p50 / median exposure has better zero behavior but is often too conservative.
-# exposure_hat_p50 = exposure_result["exposure_hat_for_demand_p50"]
-# summarize_hat_for_demand(exposure_hat_p50, title="P50 HAT DIAGNOSTIC ONLY")
+# Then run the demand model in a separate cell/file and pass only exposure_hat_for_demand.
