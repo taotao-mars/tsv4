@@ -1,16 +1,9 @@
-exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"]
-
-summarize_hat_for_demand(
-    exposure_hat_for_demand,
-    title="MU HAT BEFORE DEMAND"
-)
-
-demand_result_instock = run_demand_with_predicted_exposure_instock_only(
+out = prepare_data_from_sample_scot_intersection(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    exposure_result_or_hat=exposure_hat_for_demand,
-    n_asins=5000,
-    epochs=60,
-    history=52,
-    horizon=20,
+    n_asins=n_asins,
+    seed=seed,
 )
+
+print(type(out))
+print(len(out))
