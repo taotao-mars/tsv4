@@ -1,8 +1,9 @@
+# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + ASIN 20w sum loss. Only consumes data_raw1/scot_df and outputs three hats for demand.
 # SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
 # to avoid namespace collision with demand model functions when using %run -i.
 # ============================================================
-# TCN Exposure Model V2 - PATCH LONG-HORIZON VERSION
-# Patch decoder + long-horizon weighted loss + compact diagnostics:
+# TCN Exposure Model V3 - SINGLE-HEAD PATCH + MAGNITUDE-AWARE DUAL GRAPH + ASIN-SUM LOSS
+# Patch decoder + long-horizon weighted loss + magnitude-aware positive/competitive graph + compact diagnostics:
 #   - remove two-head p_active^gamma * magnitude combination
 #   - predict log1p(total/buy_box/in_stock DPH) directly with one exposure head
 #   - keep a small auxiliary active head only for diagnostics / representation learning
@@ -439,8 +440,8 @@ def _build_graphsage_assets(
     df,
     graph_horizon=20,
     neighbor_k=10,
-    graph_zero_weight=0.2,
-    graph_level_peak_weight=1.5,
+    graph_zero_weight=0.05,
+    graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -622,6 +623,44 @@ def _build_graphsage_assets(
             feat["hbt_is_body"] = hbt_lower.str.contains("body").astype(float)
             feat["hbt_is_tail"] = hbt_lower.str.contains("tail").astype(float)
 
+    # ------------------------------------------------------------
+    # Magnitude-aware ASIN profile buckets for within-category graph.
+    # These buckets are computed from historical-only features, because
+    # g excludes the final forecast horizon above. They help distinguish
+    # high / medium / low exposure ASINs inside the same category.
+    # ------------------------------------------------------------
+    def _safe_group_qbucket(values, q=4):
+        s = pd.Series(values).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if len(s) <= 1 or s.nunique(dropna=False) <= 1:
+            return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+        q_eff = int(min(q, max(1, s.nunique())))
+        try:
+            return pd.qcut(s.rank(method="first"), q=q_eff, labels=False, duplicates="drop").astype(int)
+        except Exception:
+            return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+
+    # Strength proxy combines mean level, active-only tail, review/brand/head signals.
+    feat["graph_strength_score"] = (
+        0.90 * feat.get("log_instock_mean", 0.0).astype(float) +
+        0.90 * feat.get("log_active_only_q95", 0.0).astype(float) +
+        0.50 * feat.get("log_buybox_mean", 0.0).astype(float) +
+        0.35 * feat.get("log_review_last", 0.0).astype(float) +
+        0.25 * feat.get("ind_top10_brand", 0.0).astype(float) +
+        0.20 * feat.get("hbt_is_head", 0.0).astype(float)
+    )
+
+    feat["magnitude_bucket"] = 0
+    feat["active_bucket"] = 0
+    # Bucket within category so that high/low ASINs in the same category are separated.
+    cat_series = meta["category_code"].astype(str).fillna("MISSING")
+    for _, idxs in cat_series.groupby(cat_series).groups.items():
+        idxs = list(idxs)
+        feat.loc[idxs, "magnitude_bucket"] = _safe_group_qbucket(feat.loc[idxs, "graph_strength_score"], q=4).values
+        feat.loc[idxs, "active_bucket"] = _safe_group_qbucket(feat.loc[idxs, "instock_active_rate"], q=3).values
+
+    feat["magnitude_bucket_norm"] = feat["magnitude_bucket"].astype(float) / 3.0
+    feat["active_bucket_norm"] = feat["active_bucket"].astype(float) / 2.0
+
     zero_cols = [
         "instock_zero_rate", "buybox_zero_rate", "total_zero_rate",
         "oos_rate", "oos_rate_13", "oos_rate_26", "last_oos",
@@ -639,7 +678,11 @@ def _build_graphsage_assets(
                    "hbt_code", "hbt_freq", "hbt_is_unknown", "hbt_is_head", "hbt_is_body", "hbt_is_tail",
                    "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
     brand_cols = ["ind_top10_brand"]
-    node_feature_cols = list(dict.fromkeys(zero_cols + level_peak_cols + transition_cols + static_cols + brand_cols + ["instock_active_rate", "instock_active50_rate", "demand_active_rate"]))
+    node_feature_cols = list(dict.fromkeys(
+        zero_cols + level_peak_cols + transition_cols + static_cols + brand_cols +
+        ["instock_active_rate", "instock_active50_rate", "demand_active_rate",
+         "graph_strength_score", "magnitude_bucket_norm", "active_bucket_norm"]
+    ))
     for c in node_feature_cols:
         if c not in feat.columns:
             feat[c] = 0.0
@@ -665,80 +708,113 @@ def _build_graphsage_assets(
 
     N = X_knn.shape[0]
     K = max(1, min(int(neighbor_k), max(N - 1, 1)))
-    if N <= 1:
-        neigh_idx = np.zeros((N, K), dtype=np.int64)
-    else:
-        nn = NearestNeighbors(n_neighbors=min(K + 1, N), metric="cosine")
-        nn.fit(X_knn)
-        _, idx = nn.kneighbors(X_knn)
-        neigh = []
-        for i, row in enumerate(idx):
-            row = [j for j in row.tolist() if j != i]
-            if len(row) == 0:
-                row = [i]
-            while len(row) < K:
-                row.append(row[-1])
-            neigh.append(row[:K])
-        neigh_idx = np.asarray(neigh, dtype=np.int64)
 
-    # Competitive neighbors: same category/GL candidates that may compete for exposure/clicks.
-    # This is not a similarity average. It is a second relation type meant to capture
-    # attention competition, especially head/top-brand/high-review products vs body/tail products.
-    def _build_competitive_neighbors(meta_df, feat_df, K):
-        N = len(feat_df)
+    # ------------------------------------------------------------
+    # Magnitude-aware dual graph construction.
+    # Positive graph: same category/GL + close magnitude/active bucket + feature similarity.
+    # Competitive graph: same category/GL + far magnitude bucket or different HBT/top10 regime.
+    # This avoids over-smoothing high and low ASINs that happen to share a category.
+    # ------------------------------------------------------------
+    def _fallback_neighbors(i, K):
         if N <= 1:
-            return np.zeros((N, max(1, K)), dtype=np.int64)
-        cat_arr = meta_df["category_code"].astype(str).values
-        gl_arr = meta_df["gl_product_group"].astype(str).values
-        hbt_arr = meta_df["hbt"].astype(str).str.lower().values if "hbt" in meta_df.columns else np.array(["missing"] * N)
-        top_arr = meta_df["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta_df.columns else np.zeros(N)
-        # Strength proxy: category attention winner score.
-        strength_raw = (
-            0.90 * feat_df.get("log_review_last", pd.Series(np.zeros(N))).astype(float).values +
-            0.70 * feat_df.get("log_active_only_q95", pd.Series(np.zeros(N))).astype(float).values +
-            0.50 * feat_df.get("log_instock_q95", pd.Series(np.zeros(N))).astype(float).values +
-            0.50 * top_arr +
-            0.35 * feat_df.get("hbt_is_head", pd.Series(np.zeros(N))).astype(float).values
-        )
-        sr = strength_raw.copy()
-        sr = (sr - np.nanmean(sr)) / (np.nanstd(sr) + 1e-8)
-        out = []
-        all_idx = np.arange(N)
-        for i in range(N):
-            # Prefer same category; fall back to same GL; then global strongest alternatives.
-            cand = all_idx[(cat_arr == cat_arr[i]) & (all_idx != i)]
-            if len(cand) < K:
-                cand = np.unique(np.concatenate([cand, all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]]))
-            if len(cand) == 0:
-                cand = all_idx[all_idx != i]
-            if len(cand) == 0:
-                cand = np.array([i])
+            return [i] * K
+        # global nearest fallback, excluding self
+        sims = X_knn @ X_knn[i]
+        order = np.argsort(-sims)
+        out = [int(j) for j in order if int(j) != int(i)]
+        if not out:
+            out = [int(i)]
+        while len(out) < K:
+            out.append(out[-1])
+        return out[:K]
 
-            hbt_diff = (hbt_arr[cand] != hbt_arr[i]).astype(float)
-            brand_diff = (top_arr[cand] != top_arr[i]).astype(float)
-            cat_same = (cat_arr[cand] == cat_arr[i]).astype(float)
-            gl_same = (gl_arr[cand] == gl_arr[i]).astype(float)
-            # Stronger candidates matter more for possible attention stealing;
-            # hbt/top-brand/review gaps help distinguish competing rather than similar products.
+    cat_arr = meta["category_code"].astype(str).values
+    gl_arr = meta["gl_product_group"].astype(str).values
+    hbt_arr = meta["hbt"].astype(str).str.lower().values if "hbt" in meta.columns else np.array(["missing"] * N)
+    top_arr = meta["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta.columns else np.zeros(N)
+    mag_arr = feat["magnitude_bucket"].astype(int).values
+    act_arr = feat["active_bucket"].astype(int).values
+    strength_arr = feat["graph_strength_score"].astype(float).values
+    strength_z = (strength_arr - np.nanmean(strength_arr)) / (np.nanstd(strength_arr) + 1e-8)
+
+    neigh_rows = []
+    comp_rows = []
+    all_idx = np.arange(N)
+    for i in range(N):
+        # Candidate pool: same category first; if too small, same GL; if still small, global.
+        same_cat = all_idx[(cat_arr == cat_arr[i]) & (all_idx != i)]
+        same_gl = all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]
+        cand_pos = same_cat
+        if len(cand_pos) < K:
+            cand_pos = np.unique(np.concatenate([cand_pos, same_gl]))
+        if len(cand_pos) == 0:
+            cand_pos = all_idx[all_idx != i]
+
+        if len(cand_pos) == 0:
+            pos = [i] * K
+        else:
+            # Similarity: feature cosine-like dot, with penalties for bucket gaps.
+            sim = X_knn[cand_pos] @ X_knn[i]
+            bucket_gap = np.abs(mag_arr[cand_pos] - mag_arr[i])
+            active_gap = np.abs(act_arr[cand_pos] - act_arr[i])
+            hbt_same = (hbt_arr[cand_pos] == hbt_arr[i]).astype(float)
+            brand_same = (top_arr[cand_pos] == top_arr[i]).astype(float)
             score = (
-                2.00 * cat_same +
-                0.60 * gl_same +
-                0.80 * hbt_diff +
-                0.45 * brand_diff +
-                0.55 * np.maximum(sr[cand] - sr[i], 0.0) +
-                0.20 * np.abs(sr[cand] - sr[i]) +
-                0.25 * sr[cand]
+                sim
+                - 1.25 * bucket_gap
+                - 0.55 * active_gap
+                + 0.35 * hbt_same
+                + 0.25 * brand_same
+                + 0.40 * (cat_arr[cand_pos] == cat_arr[i]).astype(float)
+                + 0.15 * (gl_arr[cand_pos] == gl_arr[i]).astype(float)
             )
             order = np.argsort(-score)
-            chosen = cand[order].tolist()
-            if not chosen:
-                chosen = [i]
-            while len(chosen) < K:
-                chosen.append(chosen[-1])
-            out.append(chosen[:K])
-        return np.asarray(out, dtype=np.int64)
+            # Prefer close buckets; allow fallback if not enough.
+            close = [int(cand_pos[j]) for j in order if bucket_gap[j] <= 1 and active_gap[j] <= 1]
+            rest = [int(cand_pos[j]) for j in order if int(cand_pos[j]) not in set(close)]
+            pos = (close + rest)[:K]
+            if not pos:
+                pos = _fallback_neighbors(i, K)
+            while len(pos) < K:
+                pos.append(pos[-1])
+        neigh_rows.append(pos[:K])
 
-    comp_idx = _build_competitive_neighbors(meta, feat, K)
+        # Competitive/contrast relation: same category/GL but far magnitude bucket, different HBT/brand,
+        # or much stronger/weaker strength. This relation should help the model avoid category-only smoothing.
+        cand_comp = same_cat
+        if len(cand_comp) < K:
+            cand_comp = np.unique(np.concatenate([cand_comp, same_gl]))
+        if len(cand_comp) == 0:
+            cand_comp = all_idx[all_idx != i]
+        if len(cand_comp) == 0:
+            comp = [i] * K
+        else:
+            bucket_gap = np.abs(mag_arr[cand_comp] - mag_arr[i])
+            active_gap = np.abs(act_arr[cand_comp] - act_arr[i])
+            hbt_diff = (hbt_arr[cand_comp] != hbt_arr[i]).astype(float)
+            brand_diff = (top_arr[cand_comp] != top_arr[i]).astype(float)
+            strength_gap = np.abs(strength_z[cand_comp] - strength_z[i])
+            stronger = np.maximum(strength_z[cand_comp] - strength_z[i], 0.0)
+            score = (
+                1.60 * bucket_gap
+                + 0.60 * active_gap
+                + 0.65 * hbt_diff
+                + 0.40 * brand_diff
+                + 0.55 * strength_gap
+                + 0.20 * stronger
+                + 0.60 * (cat_arr[cand_comp] == cat_arr[i]).astype(float)
+                + 0.15 * (gl_arr[cand_comp] == gl_arr[i]).astype(float)
+            )
+            order = np.argsort(-score)
+            comp = [int(cand_comp[j]) for j in order[:K]]
+            if not comp:
+                comp = _fallback_neighbors(i, K)
+            while len(comp) < K:
+                comp.append(comp[-1])
+        comp_rows.append(comp[:K])
+
+    neigh_idx = np.asarray(neigh_rows, dtype=np.int64)
+    comp_idx = np.asarray(comp_rows, dtype=np.int64)
 
     asin_list = feat["asin"].astype(str).tolist()
     asin_to_idx = {a: i for i, a in enumerate(asin_list)}
@@ -749,7 +825,12 @@ def _build_graphsage_assets(
         print("=" * 100)
         print(f"Nodes: {N} | K={K} | node_feat_dim={len(node_feature_cols)}")
         print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
-        print("Key graph features: active_only_mean/q90/q95, q95_over_mean, top10/top20_share, hbt, top10_brand, review_count")
+        print("Key graph features: active_only_mean/q90/q95, strength_score, magnitude_bucket, active_bucket, hbt, top10_brand, review_count")
+        try:
+            print("Magnitude bucket counts:", feat["magnitude_bucket"].value_counts().sort_index().to_dict())
+            print("Active bucket counts:", feat["active_bucket"].value_counts().sort_index().to_dict())
+        except Exception:
+            pass
         try:
             nb = neigh_idx
             same_gl = []
@@ -807,7 +888,7 @@ def _build_graphsage_assets(
     }
 
 
-def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.2, graph_level_peak_weight=1.5, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
+def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.05, graph_level_peak_weight=2.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
@@ -1849,13 +1930,14 @@ def exposure_hurdle_loss(
     high_weight_alpha=0.35,
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
-    long_horizon_weight=2.5,
-    long_block_sum_weight=0.45,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.35,
     # ENN/path-regime terms
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     # Peak/path-high regime terms. These prevent zero losses from making the model too conservative.
     peak_weight=0.08,
     topk_peak_weight=0.05,
@@ -2016,6 +2098,14 @@ def exposure_hurdle_loss(
     pred_path_sum_log = torch.log1p(pred_path_sum.clamp_min(0.0))
     path_sum_loss = F.smooth_l1_loss(pred_path_sum_log, true_path_sum_log)
 
+    # ASIN/window 20-week sum loss across all three exposure channels.
+    # This is the main magnitude prior: it asks the single-head decoder to get
+    # each ASIN's total future exposure level right, instead of only matching
+    # pointwise weekly errors. This is NOT a two-head or active-gated term.
+    true_sum_all_log = torch.log1p(true.sum(dim=1).clamp_min(0.0))      # [B,3]
+    pred_sum_all_log = torch.log1p(pred_level.sum(dim=1).clamp_min(0.0)) # [B,3]
+    asin_sum_loss = (F.smooth_l1_loss(pred_sum_all_log, true_sum_all_log, reduction="none") * tw.view(1,3)).mean()
+
     # Long-block sum loss: explicitly protect h14-h20 total in_stock exposure.
     # This is more stable than only increasing pointwise weights, because the
     # key failure mode is long-block level underprediction.
@@ -2058,6 +2148,7 @@ def exposure_hurdle_loss(
         + zero_fp_weight * zero_fp_loss
         + active_count_weight * active_count_loss
         + path_sum_weight * path_sum_loss
+        + asin_sum_weight * asin_sum_loss
         + long_block_sum_weight * long_block_sum_loss
         + peak_weight * peak_loss
         + topk_peak_weight * topk_peak_loss
@@ -2072,8 +2163,8 @@ def train_exposure_model_v2(
     model, tr_ld, va_ld,
     epochs=60, lr=1e-3, patience=8,
     w_total=0.30, w_buy=0.60, w_instock=1.00,
-    bce_weight=0.15, mag_weight=1.00, mean_weight=0.35,
-    active_calib_weight=0.05,
+    bce_weight=0.00, mag_weight=1.00, mean_weight=0.40,
+    active_calib_weight=0.00,
     nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
@@ -2084,12 +2175,13 @@ def train_exposure_model_v2(
     horizon_weight_alpha=0.15, high_weight_alpha=0.35,
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
-    long_horizon_weight=2.5,
-    long_block_sum_weight=0.45,
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.35,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -2139,6 +2231,11 @@ def train_exposure_model_v2(
                 zero_fp_weight=zero_fp_weight,
                 active_count_weight=active_count_weight,
                 path_sum_weight=path_sum_weight,
+                asin_sum_weight=asin_sum_weight,
+                short_horizon_weight=short_horizon_weight,
+                mid_horizon_weight=mid_horizon_weight,
+                long_horizon_weight=long_horizon_weight,
+                long_block_sum_weight=long_block_sum_weight,
                 peak_weight=peak_weight,
                 topk_peak_weight=topk_peak_weight,
                 peak_under_weight=peak_under_weight,
@@ -3104,12 +3201,13 @@ def run_exposure_v2(
     high_weight_alpha=0.35,
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
-    long_horizon_weight=2.5,
-    long_block_sum_weight=0.45,
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.35,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3121,17 +3219,17 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.10,
-    graph_zero_weight=0.2,
-    graph_level_peak_weight=1.5,
+    graph_message_scale=0.06,
+    graph_zero_weight=0.05,
+    graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: PATCH DECODER + LONG-HORIZON LEVEL LOSS")
-    print("Preset: h1-5 / h6-13 / h14-20 patch heads; MU hats for demand; compact diagnostics")
+    print("EXPOSURE MODEL V3: SINGLE-HEAD PATCH + MAGNITUDE-AWARE GRAPH + ASIN-SUM LOSS")
+    print("Preset: no two-head/gate; magnitude-aware positive/competitive graph; ASIN 20w sum loss; MU hats for demand")
     print("=" * 100)
 
     df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -3195,6 +3293,7 @@ def run_exposure_v2(
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -3502,10 +3601,11 @@ def _train_one_exposure_window(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3517,7 +3617,7 @@ def _train_one_exposure_window(
     use_graphsage=False,
     graph_assets=None,
     graph_dim=16,
-    graph_message_scale=0.10,
+    graph_message_scale=0.06,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -3589,6 +3689,7 @@ def _train_one_exposure_window(
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -3808,10 +3909,11 @@ def run_exposure_v2(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3825,9 +3927,9 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.10,
-    graph_zero_weight=0.2,
-    graph_level_peak_weight=1.5,
+    graph_message_scale=0.06,
+    graph_zero_weight=0.05,
+    graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -3884,6 +3986,7 @@ def run_exposure_v2(
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -3959,10 +4062,11 @@ def run_exposure_v2_rolling(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
-    path_zero_weight=0.08,
-    zero_fp_weight=0.08,
-    active_count_weight=0.05,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
     path_sum_weight=0.05,
+    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3975,9 +4079,9 @@ def run_exposure_v2_rolling(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.10,
-    graph_zero_weight=0.2,
-    graph_level_peak_weight=1.5,
+    graph_message_scale=0.06,
+    graph_zero_weight=0.05,
+    graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -4040,6 +4144,11 @@ def run_exposure_v2_rolling(
                 zero_fp_weight=zero_fp_weight,
                 active_count_weight=active_count_weight,
                 path_sum_weight=path_sum_weight,
+                asin_sum_weight=asin_sum_weight,
+                short_horizon_weight=short_horizon_weight,
+                mid_horizon_weight=mid_horizon_weight,
+                long_horizon_weight=long_horizon_weight,
+                long_block_sum_weight=long_block_sum_weight,
                 peak_weight=peak_weight,
                 topk_peak_weight=topk_peak_weight,
                 peak_under_weight=peak_under_weight,
@@ -4333,9 +4442,9 @@ def run_exposure_v2_final_scot_5000(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.10,
-    graph_zero_weight=0.2,
-    graph_level_peak_weight=1.5,
+    graph_message_scale=0.06,
+    graph_zero_weight=0.05,
+    graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.5,
@@ -4400,10 +4509,10 @@ def run_exposure_v2_final_scot_5000(
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.10,
+#     graph_message_scale=0.06,
 #
-#     graph_zero_weight=0.2,
-#     graph_level_peak_weight=1.5,
+#     graph_zero_weight=0.05,
+#     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
 #     graph_brand_weight=0.5,
@@ -4451,9 +4560,9 @@ def run_exposure_v2_final_scot_5000(
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.10,
-#     graph_zero_weight=0.2,
-#     graph_level_peak_weight=1.5,
+#     graph_message_scale=0.06,
+#     graph_zero_weight=0.05,
+#     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
 #     graph_brand_weight=0.5,
@@ -4633,9 +4742,9 @@ def print_exposure_diagnostics(pred_df):
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.10,
-#     graph_zero_weight=0.2,
-#     graph_level_peak_weight=1.5,
+#     graph_message_scale=0.06,
+#     graph_zero_weight=0.05,
+#     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
 #     graph_brand_weight=0.5,
