@@ -1,9 +1,278 @@
-out = prepare_data_from_sample_scot_intersection(
+import numpy as np
+import pandas as pd
+
+def analyze_category_asin_magnitude_structure(
+    data_raw1,
+    scot_df,
+    asin_col="asin",
+    week_col="order_week",
+    horizon=20,
+    hist_weeks=13,
+    min_asins_per_category=10,
+):
+    """
+    Validate whether within-category ASIN magnitude differentiation exists.
+
+    Checks:
+    1. Overall / GL / category variance.
+    2. Within-category ASIN exposure dispersion.
+    3. Historical 13w exposure vs future 20w exposure correlation.
+    4. Magnitude bucket separation within category.
+    """
+
+    df = data_raw1.copy()
+    scot = scot_df.copy()
+
+    df[week_col] = pd.to_datetime(df[week_col])
+    scot[week_col] = pd.to_datetime(scot[week_col])
+
+    # Static columns from data_raw1
+    static_cols = [
+        asin_col,
+        week_col,
+        "gl_product_group",
+        "category_code",
+        "hbt",
+        "ind_top10_brand",
+        "customer_review_count",
+        "customer_active_review_count",
+        "fbi_demand",
+    ]
+    static_cols = [c for c in static_cols if c in df.columns]
+
+    d = df[static_cols].copy()
+
+    exposure_cols = [
+        asin_col,
+        week_col,
+        "total_dph",
+        "buy_box_dph",
+        "in_stock_dph",
+        "scot_oos",
+    ]
+    exposure_cols = [c for c in exposure_cols if c in scot.columns]
+
+    d = d.merge(scot[exposure_cols], on=[asin_col, week_col], how="left")
+
+    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph", "scot_oos"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    for c in ["gl_product_group", "category_code", "hbt"]:
+        if c in d.columns:
+            d[c] = d[c].fillna("unknown").astype(str)
+
+    # Use final horizon as future, previous hist_weeks as history
+    max_week = d[week_col].max()
+    future_start = max_week - pd.Timedelta(weeks=horizon - 1)
+    hist_end = future_start - pd.Timedelta(weeks=1)
+    hist_start = hist_end - pd.Timedelta(weeks=hist_weeks - 1)
+
+    hist = d[(d[week_col] >= hist_start) & (d[week_col] <= hist_end)].copy()
+    fut = d[(d[week_col] >= future_start) & (d[week_col] <= max_week)].copy()
+
+    print("=" * 90)
+    print("WINDOWS")
+    print("=" * 90)
+    print("history:", hist_start.date(), "to", hist_end.date(), "weeks:", hist[week_col].nunique())
+    print("future :", future_start.date(), "to", max_week.date(), "weeks:", fut[week_col].nunique())
+
+    # ASIN profile
+    hist_agg = hist.groupby(asin_col).agg(
+        hist_instock_sum=("in_stock_dph", "sum"),
+        hist_instock_mean=("in_stock_dph", "mean"),
+        hist_instock_p75=("in_stock_dph", lambda x: np.nanpercentile(x, 75)),
+        hist_buybox_sum=("buy_box_dph", "sum"),
+        hist_total_sum=("total_dph", "sum"),
+        hist_demand_sum=("fbi_demand", "sum") if "fbi_demand" in hist.columns else ("in_stock_dph", "sum"),
+        hist_active_rate=("in_stock_dph", lambda x: float((x > 0).mean())),
+        hist_oos_rate=("scot_oos", "mean") if "scot_oos" in hist.columns else ("in_stock_dph", "mean"),
+    ).reset_index()
+
+    fut_agg = fut.groupby(asin_col).agg(
+        fut_instock_sum=("in_stock_dph", "sum"),
+        fut_instock_mean=("in_stock_dph", "mean"),
+        fut_buybox_sum=("buy_box_dph", "sum"),
+        fut_total_sum=("total_dph", "sum"),
+        fut_active_rate=("in_stock_dph", lambda x: float((x > 0).mean())),
+    ).reset_index()
+
+    static = (
+        d.sort_values(week_col)
+        .groupby(asin_col)
+        .tail(1)[[c for c in [
+            asin_col,
+            "gl_product_group",
+            "category_code",
+            "hbt",
+            "ind_top10_brand",
+            "customer_review_count",
+            "customer_active_review_count",
+        ] if c in d.columns]]
+        .drop_duplicates(asin_col)
+    )
+
+    prof = static.merge(hist_agg, on=asin_col, how="left")
+    prof = prof.merge(fut_agg, on=asin_col, how="left")
+    prof = prof.fillna(0.0)
+
+    print("\n" + "=" * 90)
+    print("BASIC ASIN PROFILE")
+    print("=" * 90)
+    print("n_asins:", prof[asin_col].nunique())
+    print("n_categories:", prof["category_code"].nunique() if "category_code" in prof.columns else None)
+    print("n_gl:", prof["gl_product_group"].nunique() if "gl_product_group" in prof.columns else None)
+
+    # Overall hist -> future relation
+    print("\n" + "=" * 90)
+    print("HISTORICAL EXPOSURE VS FUTURE 20W EXPOSURE")
+    print("=" * 90)
+
+    for xcol in ["hist_instock_sum", "hist_buybox_sum", "hist_total_sum", "hist_demand_sum", "hist_active_rate"]:
+        if xcol in prof.columns:
+            pearson = prof[[xcol, "fut_instock_sum"]].corr(method="pearson").iloc[0, 1]
+            spearman = prof[[xcol, "fut_instock_sum"]].corr(method="spearman").iloc[0, 1]
+            print(f"{xcol:24s} -> fut_instock_sum | pearson={pearson:.4f} spearman={spearman:.4f}")
+
+    # Category-level and GL-level explanatory power using group means
+    def group_r2(group_col):
+        if group_col not in prof.columns:
+            return None
+        tmp = prof.copy()
+        group_mean = tmp.groupby(group_col)["fut_instock_sum"].transform("mean")
+        y = tmp["fut_instock_sum"].values
+        yhat = group_mean.values
+        sse = np.sum((y - yhat) ** 2)
+        sst = np.sum((y - y.mean()) ** 2) + 1e-8
+        return 1 - sse / sst
+
+    print("\n" + "=" * 90)
+    print("HOW MUCH FUTURE EXPOSURE VARIANCE IS EXPLAINED BY GROUP ONLY?")
+    print("=" * 90)
+    if "gl_product_group" in prof.columns:
+        print("GL group mean R2:", group_r2("gl_product_group"))
+    if "category_code" in prof.columns:
+        print("Category mean R2:", group_r2("category_code"))
+
+    # Within-category dispersion
+    print("\n" + "=" * 90)
+    print("WITHIN-CATEGORY ASIN MAGNITUDE DISPERSION")
+    print("=" * 90)
+
+    cat_stats = (
+        prof.groupby("category_code")
+        .agg(
+            n_asins=(asin_col, "nunique"),
+            true_mean=("fut_instock_sum", "mean"),
+            true_median=("fut_instock_sum", "median"),
+            true_p25=("fut_instock_sum", lambda x: np.nanpercentile(x, 25)),
+            true_p75=("fut_instock_sum", lambda x: np.nanpercentile(x, 75)),
+            true_p90=("fut_instock_sum", lambda x: np.nanpercentile(x, 90)),
+            hist_spearman=("hist_instock_sum", lambda x: np.nan),
+        )
+        .reset_index()
+    )
+
+    cat_stats["p75_p25_ratio"] = cat_stats["true_p75"] / cat_stats["true_p25"].clip(lower=1e-6)
+    cat_stats["p90_median_ratio"] = cat_stats["true_p90"] / cat_stats["true_median"].clip(lower=1e-6)
+
+    # Within-category hist->future Spearman
+    sp_rows = []
+    for cat, g in prof.groupby("category_code"):
+        if len(g) >= min_asins_per_category and g["fut_instock_sum"].nunique() > 1:
+            sp = g[["hist_instock_sum", "fut_instock_sum"]].corr(method="spearman").iloc[0, 1]
+            sp_rows.append((cat, len(g), sp))
+    sp_df = pd.DataFrame(sp_rows, columns=["category_code", "n_asins", "within_cat_hist_future_spearman"])
+
+    cat_stats = cat_stats.merge(sp_df, on=["category_code", "n_asins"], how="left")
+
+    print("Top categories by within-category dispersion:")
+    display_cols = [
+        "category_code",
+        "n_asins",
+        "true_mean",
+        "true_median",
+        "p75_p25_ratio",
+        "p90_median_ratio",
+        "within_cat_hist_future_spearman",
+    ]
+    print(
+        cat_stats[cat_stats["n_asins"] >= min_asins_per_category]
+        .sort_values("p90_median_ratio", ascending=False)
+        [display_cols]
+        .head(20)
+        .to_string(index=False)
+    )
+
+    print("\nWithin-category Spearman summary:")
+    print(sp_df["within_cat_hist_future_spearman"].describe())
+
+    # Magnitude bucket within category
+    prof["hist_mag_rank_in_cat"] = prof.groupby("category_code")["hist_instock_sum"].rank(method="first")
+
+    def make_bucket(s, q=4):
+        n = s.notna().sum()
+        if n < q:
+            return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+        return pd.qcut(s.rank(method="first"), q=q, labels=False, duplicates="drop")
+
+    prof["hist_magnitude_bucket"] = (
+        prof.groupby("category_code")["hist_instock_sum"]
+        .transform(lambda s: make_bucket(s, q=4))
+        .fillna(0)
+        .astype(int)
+    )
+
+    bucket_stats = prof.groupby("hist_magnitude_bucket").agg(
+        n_asins=(asin_col, "nunique"),
+        hist_sum_mean=("hist_instock_sum", "mean"),
+        future_sum_mean=("fut_instock_sum", "mean"),
+        future_sum_median=("fut_instock_sum", "median"),
+        future_active_rate=("fut_active_rate", "mean"),
+    ).reset_index()
+
+    print("\n" + "=" * 90)
+    print("DO HISTORICAL MAGNITUDE BUCKETS SEPARATE FUTURE EXPOSURE?")
+    print("=" * 90)
+    print(bucket_stats.to_string(index=False))
+
+    # Same category, far bucket examples
+    print("\n" + "=" * 90)
+    print("EXAMPLE: SAME CATEGORY BUT DIFFERENT MAGNITUDE BUCKET")
+    print("=" * 90)
+
+    example_cats = (
+        prof.groupby("category_code")
+        .agg(n_asins=(asin_col, "nunique"), bucket_n=("hist_magnitude_bucket", "nunique"))
+        .reset_index()
+        .query("n_asins >= @min_asins_per_category and bucket_n >= 4")
+        .head(3)["category_code"]
+        .tolist()
+    )
+
+    for cat in example_cats:
+        g = prof[prof["category_code"] == cat].copy()
+        show = g.sort_values("hist_instock_sum", ascending=False)[[
+            asin_col,
+            "category_code",
+            "gl_product_group",
+            "hbt" if "hbt" in prof.columns else asin_col,
+            "hist_magnitude_bucket",
+            "hist_instock_sum",
+            "fut_instock_sum",
+            "hist_active_rate",
+            "fut_active_rate",
+        ]].head(8)
+        print("\nCategory:", cat)
+        print(show.to_string(index=False))
+
+    return prof, cat_stats, bucket_stats, sp_df
+
+
+asin_profile_diag, category_diag, bucket_diag, within_cat_spearman_diag = analyze_category_asin_magnitude_structure(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    n_asins=n_asins,
-    seed=seed,
+    horizon=20,
+    hist_weeks=13,
+    min_asins_per_category=10,
 )
-
-print(type(out))
-print(len(out))
