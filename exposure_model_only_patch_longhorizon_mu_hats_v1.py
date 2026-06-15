@@ -1,4 +1,6 @@
-# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + graph-to-decoder fusion + ASIN 20w sum loss. Only consumes data_raw1/scot_df and outputs three hats for demand.
+# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + graph-to-decoder fusion + ASIN 20w sum loss.
+# V5: adds historical DEMAND profile features to graph strength / KNN node features / edge scoring.
+# Only consumes data_raw1/scot_df and outputs three exposure hats for downstream demand.
 # SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
 # to avoid namespace collision with demand model functions when using %run -i.
 # ============================================================
@@ -490,6 +492,17 @@ def _build_graphsage_assets(
         buy = _safe_numeric(g.get("buy_box_dph", 0.0)).clip(lower=0.0).values.astype(float)
         total = _safe_numeric(g.get("total_dph", 0.0)).clip(lower=0.0).values.astype(float)
         demand = _safe_numeric(g.get("fbi_demand", 0.0)).clip(lower=0.0).values.astype(float)
+        # Historical demand profile is safe here because g excludes the final forecast horizon.
+        # It is used only as an ASIN-strength/popularity prior for the exposure graph.
+        demand_mean = float(np.mean(demand)) if len(demand) else 0.0
+        demand_median = float(np.median(demand)) if len(demand) else 0.0
+        demand_q75 = float(np.quantile(demand, 0.75)) if len(demand) else 0.0
+        demand_q90 = float(np.quantile(demand, 0.90)) if len(demand) else 0.0
+        demand_q95 = float(np.quantile(demand, 0.95)) if len(demand) else 0.0
+        demand_max = float(np.max(demand)) if len(demand) else 0.0
+        demand_sum = float(np.sum(demand)) if len(demand) else 0.0
+        demand_std = float(np.std(demand)) if len(demand) else 0.0
+        demand_cv = demand_std / (demand_mean + 1e-8)
         oos = _safe_numeric(g.get("scot_oos", 0.0)).clip(0, 1).values.astype(float) if "scot_oos" in g.columns else np.zeros(len(g))
         # Historical-only OOS summaries. These are safe because g excludes the final forecast horizon.
         oos_bool = oos >= 0.5
@@ -556,6 +569,15 @@ def _build_graphsage_assets(
             "instock_active_rate": float(np.mean(instock > 0)) if len(instock) else 0.0,
             "instock_active50_rate": float(np.mean(active50)) if len(instock) else 0.0,
             "demand_active_rate": float(np.mean(demand > 0)) if len(demand) else 0.0,
+            # Historical demand magnitude / popularity features.
+            "log_demand_sum": np.log1p(demand_sum),
+            "log_demand_mean": np.log1p(demand_mean),
+            "log_demand_median": np.log1p(demand_median),
+            "log_demand_q75": np.log1p(demand_q75),
+            "log_demand_q90": np.log1p(demand_q90),
+            "log_demand_q95": np.log1p(demand_q95),
+            "log_demand_max": np.log1p(demand_max),
+            "demand_cv": float(np.clip(demand_cv, 0, 50)),
             "oos_rate": oos_rate_all,
             "oos_rate_13": oos_rate_13,
             "oos_rate_26": oos_rate_26,
@@ -639,15 +661,28 @@ def _build_graphsage_assets(
         except Exception:
             return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
 
-    # Strength proxy combines mean level, active-only tail, review/brand/head signals.
-    feat["graph_strength_score"] = (
-        0.90 * feat.get("log_instock_mean", 0.0).astype(float) +
-        0.90 * feat.get("log_active_only_q95", 0.0).astype(float) +
-        0.50 * feat.get("log_buybox_mean", 0.0).astype(float) +
-        0.35 * feat.get("log_review_last", 0.0).astype(float) +
-        0.25 * feat.get("ind_top10_brand", 0.0).astype(float) +
-        0.20 * feat.get("hbt_is_head", 0.0).astype(float)
+    # Strength proxy for within-category magnitude buckets.
+    # V5: demand is added as a historical popularity signal. HBT is intentionally NOT a main
+    # strength driver because diagnostics showed its within-category direction can be unstable.
+    exposure_strength = (
+        0.70 * feat.get("log_instock_mean", 0.0).astype(float) +
+        0.70 * feat.get("log_active_only_q95", 0.0).astype(float) +
+        0.35 * feat.get("log_buybox_mean", 0.0).astype(float) +
+        0.25 * feat.get("log_total_mean", 0.0).astype(float)
     )
+    demand_strength = (
+        0.35 * feat.get("log_demand_mean", 0.0).astype(float) +
+        0.35 * feat.get("log_demand_q90", 0.0).astype(float) +
+        0.20 * feat.get("log_demand_sum", 0.0).astype(float) +
+        0.10 * feat.get("demand_active_rate", 0.0).astype(float)
+    )
+    weak_static_strength = (
+        0.08 * feat.get("log_review_last", 0.0).astype(float) +
+        0.05 * feat.get("ind_top10_brand", 0.0).astype(float)
+    )
+    feat["graph_exposure_strength"] = exposure_strength
+    feat["graph_demand_strength"] = demand_strength
+    feat["graph_strength_score"] = 0.60 * exposure_strength + 0.35 * demand_strength + 0.05 * weak_static_strength
 
     feat["magnitude_bucket"] = 0
     feat["active_bucket"] = 0
@@ -673,15 +708,20 @@ def _build_graphsage_assets(
         "log_active_only_mean", "log_active_only_q75", "log_active_only_q90", "log_active_only_q95",
         "active_q95_over_mean", "log_buybox_mean", "log_total_mean",
     ]
+    demand_cols = [
+        "log_demand_sum", "log_demand_mean", "log_demand_median", "log_demand_q75",
+        "log_demand_q90", "log_demand_q95", "log_demand_max", "demand_cv",
+        "demand_active_rate", "graph_demand_strength"
+    ]
     transition_cols = ["active_to_zero_rate", "zero_to_active_rate", "log_avg_active_spell", "log_avg_zero_spell", "last_active_streak", "last_zero_streak", "weeks_since_last_positive"]
     static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown",
                    "hbt_code", "hbt_freq", "hbt_is_unknown", "hbt_is_head", "hbt_is_body", "hbt_is_tail",
                    "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
     brand_cols = ["ind_top10_brand"]
     node_feature_cols = list(dict.fromkeys(
-        zero_cols + level_peak_cols + transition_cols + static_cols + brand_cols +
-        ["instock_active_rate", "instock_active50_rate", "demand_active_rate",
-         "graph_strength_score", "magnitude_bucket_norm", "active_bucket_norm"]
+        zero_cols + level_peak_cols + demand_cols + transition_cols + static_cols + brand_cols +
+        ["instock_active_rate", "instock_active50_rate",
+         "graph_exposure_strength", "graph_strength_score", "magnitude_bucket_norm", "active_bucket_norm"]
     ))
     for c in node_feature_cols:
         if c not in feat.columns:
@@ -697,6 +737,9 @@ def _build_graphsage_assets(
         weight_map[c] = float(graph_zero_weight)
     for c in level_peak_cols:
         weight_map[c] = float(graph_level_peak_weight)
+    # Demand is useful as an ASIN popularity prior, but should not dominate exposure-specific features.
+    for c in demand_cols:
+        weight_map[c] = min(float(graph_level_peak_weight), 1.25)
     for c in transition_cols:
         weight_map[c] = float(graph_transition_weight)
     for c in static_cols:
@@ -736,6 +779,8 @@ def _build_graphsage_assets(
     act_arr = feat["active_bucket"].astype(int).values
     strength_arr = feat["graph_strength_score"].astype(float).values
     strength_z = (strength_arr - np.nanmean(strength_arr)) / (np.nanstd(strength_arr) + 1e-8)
+    demand_strength_arr = feat.get("graph_demand_strength", pd.Series(np.zeros(N))).astype(float).values
+    demand_strength_z = (demand_strength_arr - np.nanmean(demand_strength_arr)) / (np.nanstd(demand_strength_arr) + 1e-8)
 
     neigh_rows = []
     comp_rows = []
@@ -759,12 +804,14 @@ def _build_graphsage_assets(
             active_gap = np.abs(act_arr[cand_pos] - act_arr[i])
             hbt_same = (hbt_arr[cand_pos] == hbt_arr[i]).astype(float)
             brand_same = (top_arr[cand_pos] == top_arr[i]).astype(float)
+            demand_gap = np.abs(demand_strength_z[cand_pos] - demand_strength_z[i])
             score = (
                 sim
                 - 1.25 * bucket_gap
                 - 0.55 * active_gap
-                + 0.35 * hbt_same
-                + 0.25 * brand_same
+                - 0.25 * demand_gap
+                + 0.08 * hbt_same       # HBT is unstable in diagnostics, so only a weak tie-breaker.
+                + 0.10 * brand_same
                 + 0.40 * (cat_arr[cand_pos] == cat_arr[i]).astype(float)
                 + 0.15 * (gl_arr[cand_pos] == gl_arr[i]).astype(float)
             )
@@ -794,13 +841,15 @@ def _build_graphsage_assets(
             hbt_diff = (hbt_arr[cand_comp] != hbt_arr[i]).astype(float)
             brand_diff = (top_arr[cand_comp] != top_arr[i]).astype(float)
             strength_gap = np.abs(strength_z[cand_comp] - strength_z[i])
+            demand_gap = np.abs(demand_strength_z[cand_comp] - demand_strength_z[i])
             stronger = np.maximum(strength_z[cand_comp] - strength_z[i], 0.0)
             score = (
                 1.60 * bucket_gap
                 + 0.60 * active_gap
-                + 0.65 * hbt_diff
-                + 0.40 * brand_diff
-                + 0.55 * strength_gap
+                + 0.35 * hbt_diff       # downweighted after diagnostics
+                + 0.25 * brand_diff
+                + 0.50 * strength_gap
+                + 0.35 * demand_gap
                 + 0.20 * stronger
                 + 0.60 * (cat_arr[cand_comp] == cat_arr[i]).astype(float)
                 + 0.15 * (gl_arr[cand_comp] == gl_arr[i]).astype(float)
@@ -824,8 +873,8 @@ def _build_graphsage_assets(
         print("DUAL-RELATION GRAPHSAGE ASSET BUILD")
         print("=" * 100)
         print(f"Nodes: {N} | K={K} | node_feat_dim={len(node_feature_cols)}")
-        print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
-        print("Key graph features: active_only_mean/q90/q95, strength_score, magnitude_bucket, active_bucket, hbt, top10_brand, review_count")
+        print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, demand<=1.25, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
+        print("Key graph features V5: exposure_strength + historical demand_strength + magnitude_bucket(q4) + active_bucket; HBT downweighted")
         try:
             print("Magnitude bucket counts:", feat["magnitude_bucket"].value_counts().sort_index().to_dict())
             print("Active bucket counts:", feat["active_bucket"].value_counts().sort_index().to_dict())
@@ -874,6 +923,7 @@ def _build_graphsage_assets(
         "feature_groups": {
             "zero": zero_cols,
             "level_peak": level_peak_cols,
+            "demand": demand_cols,
             "transition": transition_cols,
             "static": static_cols,
             "brand": brand_cols,
