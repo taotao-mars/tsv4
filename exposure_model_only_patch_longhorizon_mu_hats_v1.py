@@ -442,11 +442,11 @@ def _build_graphsage_assets(
     df,
     graph_horizon=20,
     neighbor_k=10,
-    graph_zero_weight=0.05,
+    graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
-    graph_brand_weight=0.5,
+    graph_brand_weight=0.3,
     verbose=True,
 ):
     """
@@ -753,10 +753,12 @@ def _build_graphsage_assets(
     K = max(1, min(int(neighbor_k), max(N - 1, 1)))
 
     # ------------------------------------------------------------
-    # Magnitude-aware dual graph construction.
-    # Positive graph: same category/GL + close magnitude/active bucket + feature similarity.
-    # Competitive graph: same category/GL + far magnitude bucket or different HBT/top10 regime.
-    # This avoids over-smoothing high and low ASINs that happen to share a category.
+    # CATEGORY-ONLY magnitude-aware dual graph construction (v6).
+    # GL is intentionally NOT used to select graph neighbors; GL remains a static/model feature.
+    # Positive graph: same category + close exposure/demand/active buckets.
+    # Competitive graph: same category + far exposure/demand/active buckets.
+    # For very small categories, we keep weak self-neighbors instead of falling back to GL,
+    # because GL is too coarse and can over-smooth different categories.
     # ------------------------------------------------------------
     def _fallback_neighbors(i, K):
         if N <= 1:
@@ -785,17 +787,16 @@ def _build_graphsage_assets(
     neigh_rows = []
     comp_rows = []
     all_idx = np.arange(N)
+    min_category_graph_size = max(4, min(K + 1, 10))
     for i in range(N):
-        # Candidate pool: same category first; if too small, same GL; if still small, global.
+        # Candidate pool: STRICT same-category only.
+        # Do NOT fall back to same GL here; GL is kept as a static feature only.
         same_cat = all_idx[(cat_arr == cat_arr[i]) & (all_idx != i)]
-        same_gl = all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]
+        same_gl = all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]  # diagnostics only
         cand_pos = same_cat
-        if len(cand_pos) < K:
-            cand_pos = np.unique(np.concatenate([cand_pos, same_gl]))
-        if len(cand_pos) == 0:
-            cand_pos = all_idx[all_idx != i]
 
-        if len(cand_pos) == 0:
+        # If category is too small, avoid noisy GL/global smoothing.
+        if len(cand_pos) < 1:
             pos = [i] * K
         else:
             # Similarity: feature cosine-like dot, with penalties for bucket gaps.
@@ -812,8 +813,8 @@ def _build_graphsage_assets(
                 - 0.25 * demand_gap
                 + 0.08 * hbt_same       # HBT is unstable in diagnostics, so only a weak tie-breaker.
                 + 0.10 * brand_same
-                + 0.40 * (cat_arr[cand_pos] == cat_arr[i]).astype(float)
-                + 0.15 * (gl_arr[cand_pos] == gl_arr[i]).astype(float)
+                + 0.50 * (cat_arr[cand_pos] == cat_arr[i]).astype(float)
+                # no GL bonus: GL is static only, not a graph-neighbor rule
             )
             order = np.argsort(-score)
             # Prefer close buckets; allow fallback if not enough.
@@ -826,14 +827,10 @@ def _build_graphsage_assets(
                 pos.append(pos[-1])
         neigh_rows.append(pos[:K])
 
-        # Competitive/contrast relation: same category/GL but far magnitude bucket, different HBT/brand,
-        # or much stronger/weaker strength. This relation should help the model avoid category-only smoothing.
+        # Competitive/contrast relation: STRICT same-category but far magnitude/demand/active buckets
+        # or much stronger/weaker strength. No GL fallback, to avoid cross-category smoothing.
         cand_comp = same_cat
-        if len(cand_comp) < K:
-            cand_comp = np.unique(np.concatenate([cand_comp, same_gl]))
-        if len(cand_comp) == 0:
-            cand_comp = all_idx[all_idx != i]
-        if len(cand_comp) == 0:
+        if len(cand_comp) < 1:
             comp = [i] * K
         else:
             bucket_gap = np.abs(mag_arr[cand_comp] - mag_arr[i])
@@ -851,8 +848,8 @@ def _build_graphsage_assets(
                 + 0.50 * strength_gap
                 + 0.35 * demand_gap
                 + 0.20 * stronger
-                + 0.60 * (cat_arr[cand_comp] == cat_arr[i]).astype(float)
-                + 0.15 * (gl_arr[cand_comp] == gl_arr[i]).astype(float)
+                + 0.70 * (cat_arr[cand_comp] == cat_arr[i]).astype(float)
+                # no GL bonus: GL is static only, not a graph-neighbor rule
             )
             order = np.argsort(-score)
             comp = [int(cand_comp[j]) for j in order[:K]]
@@ -892,7 +889,7 @@ def _build_graphsage_assets(
                 same_gl.append(np.mean(gl_arr[nb[i]] == gl_arr[i]))
                 same_cat.append(np.mean(cat_arr[nb[i]] == cat_arr[i]))
                 same_brand.append(np.mean(br_arr[nb[i]] == br_arr[i]))
-            print(f"Positive-neighbor homophily: same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
+            print(f"Positive-neighbor homophily (category-only; GL static): same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
             try:
                 cb = comp_idx
                 comp_same_cat = []
@@ -938,7 +935,7 @@ def _build_graphsage_assets(
     }
 
 
-def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.05, graph_level_peak_weight=2.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.5):
+def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.03, graph_level_peak_weight=2.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.3):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
@@ -1799,9 +1796,11 @@ class ExposureForecastModelV2(nn.Module):
 
     MAG_FEAT_COLS = [
         "stock_static__glance_view_band__norm",
+        # HBT is kept as static context but should not dominate graph edges.
         "stock_static__hbt__is_head",
         "our_price_log_norm",
         "log_review_count",
+        # GL is a static/group prior, NOT a graph-neighbor rule.
         "stock_static__gl_product_group__code",
         "stock_static__gl_product_group__freq",
         "stock_static__category_code__code",
@@ -1810,8 +1809,20 @@ class ExposureForecastModelV2(nn.Module):
         "stock_static__ind_amxl_hb",
         "stock_static__sort_type__norm",
         "stock_static__ind_top10_brand__code",
-        "hist_demand_mean13_log",
+        # Direct ASIN magnitude priors. These are the main signal supported by diagnostics.
+        "hist_total_dph_last_log",
+        "hist_total_dph_mean4_log",
+        "hist_total_dph_mean13_log",
+        "hist_buy_box_dph_last_log",
+        "hist_buy_box_dph_mean4_log",
+        "hist_buy_box_dph_mean13_log",
+        "hist_instock_dph_last_log",
+        "hist_instock_dph_mean4_log",
         "hist_instock_dph_mean13_log",
+        "hist_demand_last_log",
+        "hist_demand_mean4_log",
+        "hist_demand_mean13_log",
+        "hist_demand_active_rate",
     ]
 
     def __init__(self, input_dim, context_dim,
@@ -1847,7 +1858,7 @@ class ExposureForecastModelV2(nn.Module):
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
             print(f"DualGraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
-            print(f"Graph fusion v4: graph_emb is concatenated to future_context AND direct magnitude patch head ({self.graph_dim} dims).")
+            print(f"Category-only graph v6: GL is static only; graph_emb is light context/residual, NOT direct-to-head ({self.graph_dim} dims).")
         else:
             self.graph_encoder = None
             print("DualGraphSAGE disabled")
@@ -1895,21 +1906,15 @@ class ExposureForecastModelV2(nn.Module):
             if c in col_idx:
                 mag_feat_indices.append(col_idx[c])
 
-        # v4 graph-fusion: feed raw graph embedding directly to the magnitude heads.
-        # This targets the previous failure mode where graph was only a weak residual/context signal
-        # and graph_emb_to_log_true_sum_R2 stayed near 0.
+        # v6: graph_emb_* columns are appended to future_context so the decoder TCN/cross-attn
+        # can use them as light context, but they are NOT added to mag_feat_indices.
+        # This avoids the previous graph-fusion failure mode where direct-to-head graph features
+        # improved global ratio but worsened WAPE / ASIN-tail error.
         graph_direct_indices = []
-        for c in getattr(self, "graph_context_cols", []):
-            if c in col_idx:
-                graph_direct_indices.append(col_idx[c])
-        for i in graph_direct_indices:
-            if i not in mag_feat_indices:
-                mag_feat_indices.append(i)
 
         print(f"Active head feat dim: {len(active_feat_indices)}")
         print(f"Mag head feat dim:    {len(mag_feat_indices)}")
-        if graph_direct_indices:
-            print(f"Graph direct-to-mag-head feat dim: {len(graph_direct_indices)}")
+        print("Graph direct-to-mag-head feat dim: 0 (v6 light residual/context only)")
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
@@ -2002,7 +2007,7 @@ def exposure_hurdle_loss(
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
     long_horizon_weight=2.0,
-    long_block_sum_weight=0.35,
+    long_block_sum_weight=0.30,
     # ENN/path-regime terms
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
@@ -2247,7 +2252,7 @@ def train_exposure_model_v2(
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
     long_horizon_weight=2.0,
-    long_block_sum_weight=0.35,
+    long_block_sum_weight=0.30,
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
     active_count_weight=0.00,
@@ -3273,7 +3278,7 @@ def run_exposure_v2(
     short_horizon_weight=0.8,
     mid_horizon_weight=1.2,
     long_horizon_weight=2.0,
-    long_block_sum_weight=0.35,
+    long_block_sum_weight=0.30,
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
     active_count_weight=0.00,
@@ -3290,12 +3295,12 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.06,
-    graph_zero_weight=0.05,
+    graph_message_scale=0.04,
+    graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
-    graph_brand_weight=0.5,
+    graph_brand_weight=0.3,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -3688,7 +3693,7 @@ def _train_one_exposure_window(
     use_graphsage=False,
     graph_assets=None,
     graph_dim=16,
-    graph_message_scale=0.06,
+    graph_message_scale=0.04,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -3998,12 +4003,12 @@ def run_exposure_v2(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.06,
-    graph_zero_weight=0.05,
+    graph_message_scale=0.04,
+    graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
-    graph_brand_weight=0.5,
+    graph_brand_weight=0.3,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -4150,12 +4155,12 @@ def run_exposure_v2_rolling(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.06,
-    graph_zero_weight=0.05,
+    graph_message_scale=0.04,
+    graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
-    graph_brand_weight=0.5,
+    graph_brand_weight=0.3,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
@@ -4513,12 +4518,12 @@ def run_exposure_v2_final_scot_5000(
     use_graphsage=False,
     neighbor_k=10,
     graph_dim=16,
-    graph_message_scale=0.06,
-    graph_zero_weight=0.05,
+    graph_message_scale=0.04,
+    graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
-    graph_brand_weight=0.5,
+    graph_brand_weight=0.3,
     use_encoder_self_attn=True,
 ):
     """
@@ -4580,13 +4585,13 @@ def run_exposure_v2_final_scot_5000(
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.06,
+#     graph_message_scale=0.04,
 #
-#     graph_zero_weight=0.05,
+#     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
-#     graph_brand_weight=0.5,
+#     graph_brand_weight=0.3,
 # )
 #
 # pred_df = result["forecast_df"]
@@ -4631,12 +4636,12 @@ def run_exposure_v2_final_scot_5000(
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.06,
-#     graph_zero_weight=0.05,
+#     graph_message_scale=0.04,
+#     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
-#     graph_brand_weight=0.5,
+#     graph_brand_weight=0.3,
 # )
 
 # ============================================================
@@ -4813,12 +4818,12 @@ def print_exposure_diagnostics(pred_df):
 #     use_graphsage=True,
 #     neighbor_k=10,
 #     graph_dim=16,
-#     graph_message_scale=0.06,
-#     graph_zero_weight=0.05,
+#     graph_message_scale=0.04,
+#     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
-#     graph_brand_weight=0.5,
+#     graph_brand_weight=0.3,
 #     use_encoder_self_attn=True,
 # )
 #
