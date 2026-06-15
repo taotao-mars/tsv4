@@ -1,4 +1,4 @@
-# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + graph-to-decoder fusion + ASIN 20w sum loss.
+# VERSION V7: category-only graph + GL static + optional small graph-delta head + ASIN 20w sum loss.
 # V5: adds historical DEMAND profile features to graph strength / KNN node features / edge scoring.
 # Only consumes data_raw1/scot_df and outputs three exposure hats for downstream demand.
 # SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
@@ -1829,7 +1829,8 @@ class ExposureForecastModelV2(nn.Module):
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
-                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10):
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
+                 use_graph_head=False, graph_head_scale=0.05):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1839,6 +1840,12 @@ class ExposureForecastModelV2(nn.Module):
         self.graph_dim = int(graph_dim) if self.use_graphsage else 0
         self.graph_context_cols = []
         self.graph_message_scale = float(graph_message_scale)
+        # V7: optional graph-delta head. This is NOT a standalone exposure head.
+        # It applies a small multiplicative correction on the decoder MU path:
+        #     mu_final = mu_base * exp(graph_head_scale * tanh(delta_g))
+        # Default is off for maximum stability; turn on only for ablation.
+        self.use_graph_head = bool(use_graph_head and self.use_graphsage)
+        self.graph_head_scale = float(graph_head_scale)
         if self.use_graphsage:
             node_np = graph_assets["node_features"].astype(np.float32)
             neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
@@ -1858,10 +1865,21 @@ class ExposureForecastModelV2(nn.Module):
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
             print(f"DualGraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
-            print(f"Category-only graph v6: GL is static only; graph_emb is light context/residual, NOT direct-to-head ({self.graph_dim} dims).")
+            print(f"Category-only graph v7: GL is static only; graph_emb is light context/residual. Optional graph-delta head={self.use_graph_head}, scale={self.graph_head_scale}.")
         else:
             self.graph_encoder = None
             print("DualGraphSAGE disabled")
+
+        if self.use_graph_head:
+            self.graph_delta_head = nn.Sequential(
+                nn.Linear(self.graph_dim, max(32, self.graph_dim * 2)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, self.graph_dim * 2), 3),
+                nn.Tanh(),
+            )
+        else:
+            self.graph_delta_head = None
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -1914,7 +1932,8 @@ class ExposureForecastModelV2(nn.Module):
 
         print(f"Active head feat dim: {len(active_feat_indices)}")
         print(f"Mag head feat dim:    {len(mag_feat_indices)}")
-        print("Graph direct-to-mag-head feat dim: 0 (v6 light residual/context only)")
+        print("Graph direct-to-mag-head feat dim: 0 (v7 keeps graph out of mag features)")
+        print(f"Graph delta head: {self.use_graph_head} | graph_head_scale={self.graph_head_scale}")
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
@@ -1934,8 +1953,45 @@ class ExposureForecastModelV2(nn.Module):
             gate_temperature=gate_temperature,
         )
 
+    def _apply_graph_delta_head(self, dec_out, g):
+        """
+        V7 optional graph head.
+        This is a small multiplicative correction, not an additive standalone head:
+            level_final = level_base * exp(scale * tanh(delta_g))
+        It lets category graph adjust ASIN-level magnitude without taking over the forecast.
+        """
+        if (not self.use_graph_head) or (self.graph_delta_head is None) or (g is None):
+            return dec_out
+
+        delta = self.graph_delta_head(g)  # [B,3], already tanh-bounded
+        log_mult = self.graph_head_scale * delta[:, None, :]  # [B,1,3]
+
+        def _adjust_log_hat(base_log_hat):
+            base_level = torch.expm1(base_log_hat).clamp(min=0.0)
+            final_level = base_level * torch.exp(log_mult)
+            return torch.log1p(final_level.clamp(min=0.0))
+
+        if isinstance(dec_out, dict):
+            base_log_hat = dec_out["log_hat"]
+            final_log_hat = _adjust_log_hat(base_log_hat)
+            final_level = torch.expm1(final_log_hat).clamp(min=0.0)
+            dec_out = dict(dec_out)
+            dec_out["base_log_hat_before_graph_head"] = base_log_hat
+            dec_out["graph_delta"] = delta
+            dec_out["graph_log_multiplier"] = log_mult.expand_as(base_log_hat)
+            dec_out["graph_head_scale"] = torch.tensor(self.graph_head_scale, dtype=base_log_hat.dtype, device=base_log_hat.device)
+            dec_out["log_hat"] = final_log_hat
+            dec_out["log_mag"] = final_log_hat
+            dec_out["mag_level"] = final_level
+            dec_out["pred_level"] = final_level
+            dec_out["mu_level"] = final_level
+            return dec_out
+
+        return _adjust_log_hat(dec_out)
+
     def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
         enc_out = self.encoder(x)
+        g = None
 
         if self.use_graphsage:
             if asin_idx is None:
@@ -1946,7 +2002,8 @@ class ExposureForecastModelV2(nn.Module):
             g_rep = g[:, None, :].expand(B, H, -1)
             future_context = torch.cat([future_context, g_rep], dim=-1)
 
-        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
+        dec_out = self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
+        return self._apply_graph_delta_head(dec_out, g)
 
 
 # ============================================================
@@ -3296,6 +3353,8 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -3345,6 +3404,8 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -3738,6 +3799,8 @@ def _train_one_exposure_window(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -4004,6 +4067,8 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4156,6 +4221,8 @@ def run_exposure_v2_rolling(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4519,6 +4586,8 @@ def run_exposure_v2_final_scot_5000(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4550,6 +4619,8 @@ def run_exposure_v2_final_scot_5000(
         neighbor_k=neighbor_k,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
         graph_zero_weight=graph_zero_weight,
         graph_level_peak_weight=graph_level_peak_weight,
         graph_transition_weight=graph_transition_weight,
@@ -4586,6 +4657,8 @@ def run_exposure_v2_final_scot_5000(
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
+#     use_graph_head=True,
+#     graph_head_scale=0.05,
 #
 #     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
@@ -4637,6 +4710,8 @@ def run_exposure_v2_final_scot_5000(
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
+#     use_graph_head=True,
+#     graph_head_scale=0.05,
 #     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
@@ -4819,6 +4894,8 @@ def print_exposure_diagnostics(pred_df):
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
+#     use_graph_head=True,
+#     graph_head_scale=0.05,
 #     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
