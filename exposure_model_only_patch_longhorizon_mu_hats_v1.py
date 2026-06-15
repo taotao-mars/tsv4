@@ -1,4 +1,4 @@
-# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + ASIN 20w sum loss. Only consumes data_raw1/scot_df and outputs three hats for demand.
+# VERSION: exposure-only SINGLE-HEAD patch long horizon + magnitude-aware dual graph + graph-to-decoder fusion + ASIN 20w sum loss. Only consumes data_raw1/scot_df and outputs three hats for demand.
 # SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
 # to avoid namespace collision with demand model functions when using %run -i.
 # ============================================================
@@ -1776,6 +1776,8 @@ class ExposureForecastModelV2(nn.Module):
 
         self.use_graphsage = bool(use_graphsage and graph_assets is not None)
         self.graph_dim = int(graph_dim) if self.use_graphsage else 0
+        self.graph_context_cols = []
+        self.graph_message_scale = float(graph_message_scale)
         if self.use_graphsage:
             node_np = graph_assets["node_features"].astype(np.float32)
             neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
@@ -1789,7 +1791,13 @@ class ExposureForecastModelV2(nn.Module):
                 dropout=dropout,
                 neighbor_message_scale=graph_message_scale,
             )
+            # IMPORTANT v4: expose graph embedding as named future-context columns so the
+            # magnitude patch heads can directly consume it, not only through the TCN/cross-attn path.
+            self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
+            if context_cols is not None:
+                context_cols = list(context_cols) + self.graph_context_cols
             print(f"DualGraphSAGE enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
+            print(f"Graph fusion v4: graph_emb is concatenated to future_context AND direct magnitude patch head ({self.graph_dim} dims).")
         else:
             self.graph_encoder = None
             print("DualGraphSAGE disabled")
@@ -1837,8 +1845,21 @@ class ExposureForecastModelV2(nn.Module):
             if c in col_idx:
                 mag_feat_indices.append(col_idx[c])
 
+        # v4 graph-fusion: feed raw graph embedding directly to the magnitude heads.
+        # This targets the previous failure mode where graph was only a weak residual/context signal
+        # and graph_emb_to_log_true_sum_R2 stayed near 0.
+        graph_direct_indices = []
+        for c in getattr(self, "graph_context_cols", []):
+            if c in col_idx:
+                graph_direct_indices.append(col_idx[c])
+        for i in graph_direct_indices:
+            if i not in mag_feat_indices:
+                mag_feat_indices.append(i)
+
         print(f"Active head feat dim: {len(active_feat_indices)}")
         print(f"Mag head feat dim:    {len(mag_feat_indices)}")
+        if graph_direct_indices:
+            print(f"Graph direct-to-mag-head feat dim: {len(graph_direct_indices)}")
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
@@ -4755,3 +4776,13 @@ def print_exposure_diagnostics(pred_df):
 # summarize_exposure_hat_for_demand(exposure_hat_for_demand, title="MU HAT TO PASS INTO DEMAND")
 #
 # Then run the demand model in a separate cell/file and pass only exposure_hat_for_demand.
+
+
+# ============================================================
+# v4 note
+# This file is a minimal patch over exposure_model_only_patch_v1_minimal_maggraph_asinsum.py.
+# Main change: graph embeddings are not only concatenated into future_context for decoder TCN,
+# but are also registered as graph_emb_* context columns and fed directly into the magnitude
+# patch heads through mag_feat_indices. This makes graph signal enter the final MU head more
+# strongly while keeping single-head / no-gate / no-zero-calibration behavior.
+# ============================================================
