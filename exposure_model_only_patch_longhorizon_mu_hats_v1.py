@@ -3755,6 +3755,8 @@ def _train_one_exposure_window(
     graph_assets=None,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
