@@ -1,77 +1,58 @@
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.preprocessing import StandardScaler
 
 
-def standardize_raw_dph_columns(df):
-    df = df.copy()
-
-    rename_map = {}
-
-    if "buy_box_dph" not in df.columns:
-        for c in ["buybox_dph", "buy_box_dph_mean", "buybox_dph_mean"]:
-            if c in df.columns:
-                rename_map[c] = "buy_box_dph"
-                break
-
-    if "in_stock_dph" not in df.columns:
-        for c in ["instock_dph", "in_stock_dph_mean", "instock_dph_mean"]:
-            if c in df.columns:
-                rename_map[c] = "in_stock_dph"
-                break
-
-    if "total_dph" not in df.columns:
-        for c in ["total_dph_mean", "total_dph_sum"]:
-            if c in df.columns:
-                rename_map[c] = "total_dph"
-                break
-
-    return df.rename(columns=rename_map)
-
-
-def analyze_category_asin_magnitude_structure_raw_only(
+def graph_feature_quality_diagnostic(
     data_raw1,
     asin_col="asin",
     week_col="order_week",
     horizon=20,
     hist_weeks=13,
     min_asins_per_category=10,
+    n_buckets=4,
 ):
     """
-    Raw-only diagnostic.
-
-    Purpose:
-    Check whether within-category ASIN historical exposure magnitude
-    can predict future exposure magnitude.
+    Diagnose which graph/profile features help predict future exposure magnitude
+    and which may be noisy/misleading.
 
     Uses only data_raw1.
+
+    Main target:
+        future 20-week in_stock_dph sum by ASIN.
+
+    Outputs:
+        feature_diag
+        bucket_diag
+        within_category_diag
     """
 
-    df = standardize_raw_dph_columns(data_raw1)
+    df = data_raw1.copy()
+    df[week_col] = pd.to_datetime(df[week_col])
 
-    print("=" * 90)
-    print("RAW DATA COLUMNS CHECK")
-    print("=" * 90)
-
-    dph_cols = [c for c in df.columns if "dph" in c.lower()]
-    print("DPH columns:", dph_cols)
+    # Standardize DPH names
+    rename_map = {}
+    if "buy_box_dph" not in df.columns and "buybox_dph" in df.columns:
+        rename_map["buybox_dph"] = "buy_box_dph"
+    if "in_stock_dph" not in df.columns and "instock_dph" in df.columns:
+        rename_map["instock_dph"] = "in_stock_dph"
+    df = df.rename(columns=rename_map)
 
     required = [asin_col, week_col, "in_stock_dph", "buy_box_dph", "total_dph"]
     missing = [c for c in required if c not in df.columns]
-
     if missing:
-        raise ValueError(f"Missing required columns in data_raw1: {missing}")
+        raise ValueError(f"Missing columns: {missing}")
 
-    df[week_col] = pd.to_datetime(df[week_col])
-
-    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph", "scot_oos"]:
+    for c in ["in_stock_dph", "buy_box_dph", "total_dph", "fbi_demand", "scot_oos"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0.0)
 
-    for c in ["gl_product_group", "category_code", "hbt"]:
+    for c in ["category_code", "gl_product_group", "hbt"]:
         if c in df.columns:
             df[c] = df[c].fillna("unknown").astype(str)
 
-    # Final 20 weeks as future, previous hist_weeks as history
     max_week = df[week_col].max()
     future_start = max_week - pd.Timedelta(weeks=horizon - 1)
     hist_end = future_start - pd.Timedelta(weeks=1)
@@ -80,17 +61,16 @@ def analyze_category_asin_magnitude_structure_raw_only(
     hist = df[(df[week_col] >= hist_start) & (df[week_col] <= hist_end)].copy()
     fut = df[(df[week_col] >= future_start) & (df[week_col] <= max_week)].copy()
 
-    print("\n" + "=" * 90)
+    print("=" * 90)
     print("WINDOWS")
     print("=" * 90)
     print("history:", hist_start.date(), "to", hist_end.date(), "weeks:", hist[week_col].nunique())
     print("future :", future_start.date(), "to", max_week.date(), "weeks:", fut[week_col].nunique())
 
-    # Static info
     static_cols = [
         asin_col,
-        "gl_product_group",
         "category_code",
+        "gl_product_group",
         "hbt",
         "ind_top10_brand",
         "customer_review_count",
@@ -105,35 +85,34 @@ def analyze_category_asin_magnitude_structure_raw_only(
         .drop_duplicates(asin_col)
     )
 
-    # Historical ASIN profile
-    agg_hist = {
+    hist_agg_dict = {
         "hist_instock_sum": ("in_stock_dph", "sum"),
         "hist_instock_mean": ("in_stock_dph", "mean"),
         "hist_instock_p75": ("in_stock_dph", lambda x: np.nanpercentile(x, 75)),
+        "hist_instock_p90": ("in_stock_dph", lambda x: np.nanpercentile(x, 90)),
         "hist_instock_max": ("in_stock_dph", "max"),
         "hist_buybox_sum": ("buy_box_dph", "sum"),
+        "hist_buybox_mean": ("buy_box_dph", "mean"),
         "hist_total_sum": ("total_dph", "sum"),
+        "hist_total_mean": ("total_dph", "mean"),
         "hist_active_rate": ("in_stock_dph", lambda x: float((x > 0).mean())),
     }
 
     if "fbi_demand" in hist.columns:
-        agg_hist.update({
+        hist_agg_dict.update({
             "hist_demand_sum": ("fbi_demand", "sum"),
+            "hist_demand_mean": ("fbi_demand", "mean"),
             "hist_demand_active_rate": ("fbi_demand", lambda x: float((x > 0).mean())),
         })
 
     if "scot_oos" in hist.columns:
-        agg_hist.update({
-            "hist_oos_rate": ("scot_oos", "mean"),
-        })
+        hist_agg_dict["hist_oos_rate"] = ("scot_oos", "mean")
 
-    hist_agg = hist.groupby(asin_col).agg(**agg_hist).reset_index()
+    hist_agg = hist.groupby(asin_col).agg(**hist_agg_dict).reset_index()
 
     fut_agg = fut.groupby(asin_col).agg(
         fut_instock_sum=("in_stock_dph", "sum"),
         fut_instock_mean=("in_stock_dph", "mean"),
-        fut_buybox_sum=("buy_box_dph", "sum"),
-        fut_total_sum=("total_dph", "sum"),
         fut_active_rate=("in_stock_dph", lambda x: float((x > 0).mean())),
     ).reset_index()
 
@@ -141,154 +120,220 @@ def analyze_category_asin_magnitude_structure_raw_only(
     prof = prof.merge(fut_agg, on=asin_col, how="left")
     prof = prof.fillna(0.0)
 
-    print("\n" + "=" * 90)
-    print("BASIC PROFILE")
-    print("=" * 90)
-    print("n_asins:", prof[asin_col].nunique())
-    if "category_code" in prof.columns:
-        print("n_categories:", prof["category_code"].nunique())
-    if "gl_product_group" in prof.columns:
-        print("n_gl:", prof["gl_product_group"].nunique())
+    # Derived static numeric features
+    if "customer_review_count" in prof.columns:
+        prof["log_review_count"] = np.log1p(pd.to_numeric(prof["customer_review_count"], errors="coerce").fillna(0))
+    if "customer_active_review_count" in prof.columns:
+        prof["log_active_review_count"] = np.log1p(pd.to_numeric(prof["customer_active_review_count"], errors="coerce").fillna(0))
+    if "ind_top10_brand" in prof.columns:
+        prof["ind_top10_brand"] = pd.to_numeric(prof["ind_top10_brand"], errors="coerce").fillna(0).astype(float)
+    if "hbt" in prof.columns:
+        prof["hbt_is_head"] = (prof["hbt"].astype(str).str.lower() == "head").astype(float)
+        prof["hbt_is_body"] = (prof["hbt"].astype(str).str.lower() == "body").astype(float)
 
-    # Historical magnitude -> future magnitude
-    print("\n" + "=" * 90)
-    print("HISTORICAL MAGNITUDE -> FUTURE 20W IN_STOCK_DPH")
-    print("=" * 90)
+    # Log magnitude features
+    for c in [
+        "hist_instock_sum", "hist_instock_mean", "hist_instock_p75", "hist_instock_p90", "hist_instock_max",
+        "hist_buybox_sum", "hist_buybox_mean", "hist_total_sum", "hist_total_mean",
+        "hist_demand_sum", "hist_demand_mean"
+    ]:
+        if c in prof.columns:
+            prof["log1p_" + c] = np.log1p(prof[c].clip(lower=0.0))
 
-    candidate_x = [
-        "hist_instock_sum",
-        "hist_instock_mean",
-        "hist_instock_p75",
-        "hist_instock_max",
-        "hist_buybox_sum",
-        "hist_total_sum",
-        "hist_active_rate",
-        "hist_demand_sum",
-        "hist_demand_active_rate",
-        "hist_oos_rate",
+    target = "fut_instock_sum"
+    active_target = (prof[target] > 0).astype(int)
+
+    candidate_features = [
+        c for c in prof.columns
+        if (
+            c.startswith("hist_")
+            or c.startswith("log1p_hist_")
+            or c.startswith("log_review")
+            or c.startswith("log_active_review")
+            or c in ["ind_top10_brand", "hbt_is_head", "hbt_is_body"]
+        )
+        and c not in [target, "fut_instock_mean", "fut_active_rate"]
     ]
 
-    for xcol in candidate_x:
-        if xcol in prof.columns:
-            pearson = prof[[xcol, "fut_instock_sum"]].corr(method="pearson").iloc[0, 1]
-            spearman = prof[[xcol, "fut_instock_sum"]].corr(method="spearman").iloc[0, 1]
-            print(f"{xcol:26s} pearson={pearson:.4f} | spearman={spearman:.4f}")
+    rows = []
+    for c in candidate_features:
+        x = pd.to_numeric(prof[c], errors="coerce").fillna(0.0)
+        y = prof[target]
 
-    # Group-only explanatory power
-    def group_r2(group_col):
-        if group_col not in prof.columns:
-            return np.nan
-        y = prof["fut_instock_sum"].values
-        yhat = prof.groupby(group_col)["fut_instock_sum"].transform("mean").values
-        sse = np.sum((y - yhat) ** 2)
-        sst = np.sum((y - y.mean()) ** 2) + 1e-8
-        return 1 - sse / sst
+        if x.nunique() <= 1:
+            continue
+
+        pearson = x.corr(y, method="pearson")
+        spearman = x.corr(y, method="spearman")
+
+        try:
+            auc = roc_auc_score(active_target, x)
+            auc = max(auc, 1 - auc)  # direction-free AUC
+        except Exception:
+            auc = np.nan
+
+        # Within-category average Spearman
+        within_sps = []
+        if "category_code" in prof.columns:
+            for cat, g in prof.groupby("category_code"):
+                if len(g) >= min_asins_per_category and g[target].nunique() > 1 and g[c].nunique() > 1:
+                    sp = g[[c, target]].corr(method="spearman").iloc[0, 1]
+                    if pd.notna(sp):
+                        within_sps.append(sp)
+
+        within_mean = np.nanmean(within_sps) if len(within_sps) > 0 else np.nan
+        within_median = np.nanmedian(within_sps) if len(within_sps) > 0 else np.nan
+        within_neg_share = np.mean(np.array(within_sps) < 0) if len(within_sps) > 0 else np.nan
+
+        rows.append({
+            "feature": c,
+            "pearson_to_future_sum": pearson,
+            "spearman_to_future_sum": spearman,
+            "direction_free_active_auc": auc,
+            "within_cat_spearman_mean": within_mean,
+            "within_cat_spearman_median": within_median,
+            "within_cat_negative_share": within_neg_share,
+            "n_unique": x.nunique(),
+        })
+
+    feature_diag = pd.DataFrame(rows)
+    feature_diag["abs_within_cat_spearman"] = feature_diag["within_cat_spearman_mean"].abs()
+    feature_diag = feature_diag.sort_values(
+        ["within_cat_spearman_mean", "spearman_to_future_sum"],
+        ascending=False
+    )
 
     print("\n" + "=" * 90)
-    print("GROUP-ONLY R2 FOR FUTURE 20W IN_STOCK_DPH")
+    print("TOP GOOD GRAPH FEATURES")
     print("=" * 90)
-    if "gl_product_group" in prof.columns:
-        print("GL mean R2:", group_r2("gl_product_group"))
-    if "category_code" in prof.columns:
-        print("Category mean R2:", group_r2("category_code"))
+    print(
+        feature_diag.head(20)[[
+            "feature",
+            "spearman_to_future_sum",
+            "within_cat_spearman_mean",
+            "within_cat_negative_share",
+            "direction_free_active_auc",
+        ]].to_string(index=False)
+    )
 
-    # Within-category dispersion
-    if "category_code" in prof.columns:
-        print("\n" + "=" * 90)
-        print("WITHIN-CATEGORY DISPERSION")
-        print("=" * 90)
+    print("\n" + "=" * 90)
+    print("POTENTIALLY BAD / MISLEADING FEATURES")
+    print("=" * 90)
+    bad = feature_diag[
+        (feature_diag["within_cat_spearman_mean"] < -0.02)
+        | (feature_diag["within_cat_negative_share"] > 0.45)
+    ].copy()
+    print(
+        bad[[
+            "feature",
+            "spearman_to_future_sum",
+            "within_cat_spearman_mean",
+            "within_cat_negative_share",
+            "direction_free_active_auc",
+        ]].head(20).to_string(index=False)
+    )
 
-        cat_stats = prof.groupby("category_code").agg(
+    # Bucket test: 2, 4, 5 buckets
+    bucket_rows = []
+    for q in [2, 4, 5]:
+        if "category_code" in prof.columns:
+            bucket_col = f"mag_bucket_q{q}"
+            prof[bucket_col] = (
+                prof.groupby("category_code")["hist_instock_sum"]
+                .transform(lambda s: pd.qcut(
+                    s.rank(method="first"),
+                    q=min(q, max(1, s.notna().sum())),
+                    labels=False,
+                    duplicates="drop",
+                ))
+                .fillna(0)
+                .astype(int)
+            )
+        else:
+            bucket_col = f"mag_bucket_q{q}"
+            prof[bucket_col] = pd.qcut(
+                prof["hist_instock_sum"].rank(method="first"),
+                q=q,
+                labels=False,
+                duplicates="drop"
+            ).fillna(0).astype(int)
+
+        tmp = prof.groupby(bucket_col).agg(
             n_asins=(asin_col, "nunique"),
-            fut_mean=("fut_instock_sum", "mean"),
-            fut_median=("fut_instock_sum", "median"),
-            fut_p25=("fut_instock_sum", lambda x: np.nanpercentile(x, 25)),
-            fut_p75=("fut_instock_sum", lambda x: np.nanpercentile(x, 75)),
-            fut_p90=("fut_instock_sum", lambda x: np.nanpercentile(x, 90)),
+            future_sum_mean=(target, "mean"),
+            future_sum_median=(target, "median"),
+            future_active_rate=("fut_active_rate", "mean"),
         ).reset_index()
 
-        cat_stats["p75_p25_ratio"] = cat_stats["fut_p75"] / cat_stats["fut_p25"].clip(lower=1e-6)
-        cat_stats["p90_median_ratio"] = cat_stats["fut_p90"] / cat_stats["fut_median"].clip(lower=1e-6)
+        tmp["q"] = q
+        bucket_rows.append(tmp.rename(columns={bucket_col: "bucket"}))
 
-        # within-category Spearman
-        rows = []
+    bucket_diag = pd.concat(bucket_rows, ignore_index=True)
+
+    print("\n" + "=" * 90)
+    print("BUCKET SEPARATION TEST")
+    print("=" * 90)
+    for q in [2, 4, 5]:
+        print(f"\nq={q}")
+        print(bucket_diag[bucket_diag["q"] == q].to_string(index=False))
+
+    # Within-category high-low separation
+    sep_rows = []
+    if "category_code" in prof.columns:
         for cat, g in prof.groupby("category_code"):
-            if len(g) >= min_asins_per_category and g["fut_instock_sum"].nunique() > 1:
-                sp = g[["hist_instock_sum", "fut_instock_sum"]].corr(method="spearman").iloc[0, 1]
-                rows.append((cat, len(g), sp))
+            if len(g) < min_asins_per_category:
+                continue
+            g = g.copy()
+            g["bucket4"] = pd.qcut(
+                g["hist_instock_sum"].rank(method="first"),
+                q=min(4, len(g)),
+                labels=False,
+                duplicates="drop"
+            ).astype(int)
 
-        sp_df = pd.DataFrame(
-            rows,
-            columns=["category_code", "n_asins", "within_cat_hist_future_spearman"]
-        )
+            low = g[g["bucket4"] == g["bucket4"].min()]
+            high = g[g["bucket4"] == g["bucket4"].max()]
 
-        cat_stats = cat_stats.merge(sp_df, on=["category_code", "n_asins"], how="left")
+            if len(low) == 0 or len(high) == 0:
+                continue
 
-        print("Top categories by p90/median dispersion:")
+            low_mean = low[target].mean()
+            high_mean = high[target].mean()
+            sep_ratio = high_mean / max(low_mean, 1e-6)
+
+            sp = g[["hist_instock_sum", target]].corr(method="spearman").iloc[0, 1]
+
+            sep_rows.append({
+                "category_code": cat,
+                "n_asins": len(g),
+                "low_future_mean": low_mean,
+                "high_future_mean": high_mean,
+                "high_low_future_ratio": sep_ratio,
+                "within_cat_spearman": sp,
+            })
+
+    within_category_diag = pd.DataFrame(sep_rows)
+
+    print("\n" + "=" * 90)
+    print("WITHIN-CATEGORY HIGH VS LOW SEPARATION")
+    print("=" * 90)
+    if len(within_category_diag) > 0:
+        print("Summary:")
+        print(within_category_diag["high_low_future_ratio"].describe())
+        print("\nTop strong separation categories:")
         print(
-            cat_stats[cat_stats["n_asins"] >= min_asins_per_category]
-            .sort_values("p90_median_ratio", ascending=False)
+            within_category_diag.sort_values("high_low_future_ratio", ascending=False)
             .head(20)
             .to_string(index=False)
         )
 
-        print("\nWithin-category Spearman summary:")
-        print(sp_df["within_cat_hist_future_spearman"].describe())
-    else:
-        cat_stats = None
-        sp_df = None
-
-    # Magnitude bucket within category
-    print("\n" + "=" * 90)
-    print("MAGNITUDE BUCKET TEST")
-    print("=" * 90)
-
-    if "category_code" in prof.columns:
-        def make_bucket(s, q=4):
-            if s.notna().sum() < q:
-                return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
-            return pd.qcut(
-                s.rank(method="first"),
-                q=q,
-                labels=False,
-                duplicates="drop"
-            )
-
-        prof["hist_magnitude_bucket"] = (
-            prof.groupby("category_code")["hist_instock_sum"]
-            .transform(lambda s: make_bucket(s, q=4))
-            .fillna(0)
-            .astype(int)
-        )
-    else:
-        prof["hist_magnitude_bucket"] = pd.qcut(
-            prof["hist_instock_sum"].rank(method="first"),
-            q=4,
-            labels=False,
-            duplicates="drop"
-        ).fillna(0).astype(int)
-
-    bucket_stats = prof.groupby("hist_magnitude_bucket").agg(
-        n_asins=(asin_col, "nunique"),
-        hist_sum_mean=("hist_instock_sum", "mean"),
-        future_sum_mean=("fut_instock_sum", "mean"),
-        future_sum_median=("fut_instock_sum", "median"),
-        future_active_rate=("fut_active_rate", "mean"),
-    ).reset_index()
-
-    print(bucket_stats.to_string(index=False))
-
-    print("\nInterpretation:")
-    print("- If future_sum_mean increases from bucket 0 -> 3, magnitude-aware graph is justified.")
-    print("- If within-category Spearman is positive, same-category ASIN ranking is learnable.")
-    print("- If Category R2 is low but bucket separation is strong, category alone is insufficient.")
-
-    return prof, cat_stats, bucket_stats
+    return prof, feature_diag, bucket_diag, within_category_diag
 
 
-asin_profile_diag, category_diag, bucket_diag = analyze_category_asin_magnitude_structure_raw_only(
+graph_profile_diag, graph_feature_diag, graph_bucket_diag, within_cat_highlow_diag = graph_feature_quality_diagnostic(
     data_raw1=data_raw1,
     horizon=20,
     hist_weeks=13,
     min_asins_per_category=10,
+    n_buckets=4,
 )
