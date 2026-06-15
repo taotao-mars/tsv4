@@ -4138,6 +4138,8 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
