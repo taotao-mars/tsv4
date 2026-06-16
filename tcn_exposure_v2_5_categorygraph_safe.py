@@ -1,7 +1,7 @@
 # VERSION V2.5: previous strongest single-head ENN baseline + SAFE category-only graph + ASIN 20w sum loss.
 # Built from the V7 category-only graph experiment, patched for rolling graph-horizon leakage safety and run-compatibility.
-# VERSION V7: category-only graph + GL static + optional small graph-delta head + ASIN 20w sum loss.
-# V5: adds historical DEMAND profile features to graph strength / KNN node features / edge scoring.
+# VERSION V2.5-DIRECT20: category-only graph + GL static + optional small graph-delta head, but NO horizon-block/ASIN-sum loss.
+# Direct-20 setup: keeps previous-best direct 20-week prediction behavior; graph is optional and lightweight.
 # Only consumes data_raw1/scot_df and outputs three exposure hats for downstream demand.
 # SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
 # to avoid namespace collision with demand model functions when using %run -i.
@@ -2045,8 +2045,6 @@ def exposure_hurdle_loss(
     true_instock,   # [B,H]
     active_logit,   # [B,H,3] auxiliary occurrence logits only
     log_mag=None,   # unused; kept for interface compatibility
-    alpha=None,      # [B,H,3] NB over-dispersion for distributional exposure head
-    nb_weight=0.25,
     w_total=0.30,
     w_buy=0.60,
     w_instock=1.00,
@@ -2061,18 +2059,13 @@ def exposure_hurdle_loss(
     instock_zero_weight=0.08,
     total_zero_consistency_weight=0.01,
     buy_zero_consistency_weight=0.05,
-    horizon_weight_alpha=0.15,
+    horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
-    short_horizon_weight=0.8,
-    mid_horizon_weight=1.2,
-    long_horizon_weight=2.0,
-    long_block_sum_weight=0.30,
     # ENN/path-regime terms
-    path_zero_weight=0.00,
-    zero_fp_weight=0.00,
-    active_count_weight=0.00,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     # Peak/path-high regime terms. These prevent zero losses from making the model too conservative.
     peak_weight=0.08,
     topk_peak_weight=0.05,
@@ -2115,40 +2108,12 @@ def exposure_hurdle_loss(
 
     H = true.shape[1]
     h = torch.arange(1, H + 1, device=true.device, dtype=true.dtype).view(1, H, 1)
-    # Horizon block weighting. Short horizons already perform well; we upweight
-    # h14-h20 to fight long-horizon magnitude collapse.
-    base_h_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
-    block_h_w = torch.where(
-        h <= 5,
-        torch.full_like(h, float(short_horizon_weight)),
-        torch.where(
-            h <= 13,
-            torch.full_like(h, float(mid_horizon_weight)),
-            torch.full_like(h, float(long_horizon_weight)),
-        ),
-    )
-    horizon_w = base_h_w * block_h_w
+    horizon_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
     sample_w = high_w * horizon_w
 
     # 1) Main direct log loss.
     log_err = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
     direct_loss = (log_err * sample_w * tw).mean()
-
-    # Distributional NB quasi-likelihood. This teaches over-dispersion so that
-    # sparse exposure paths can produce exact-zero sample quantiles, similar to
-    # the demand model's NB sampling mechanism. The mean path is still controlled
-    # by log_hat / pred_level, so we do not hard-threshold or gate predictions.
-    if alpha is not None and nb_weight > 0:
-        mu_for_nb = torch.expm1(log_hat).clamp(min=1e-6)
-        nb_loss = exposure_tail_weighted_nb_nll(
-            true=true,
-            mu=mu_for_nb,
-            alpha=alpha,
-            channel_weights=tw.view(3),
-            high_weight_alpha=high_weight_alpha,
-        )
-    else:
-        nb_loss = torch.zeros((), dtype=log_hat.dtype, device=log_hat.device)
 
     # Shared zero error: target log is zero when target exposure is zero.
     zero_err = F.huber_loss(log_hat, torch.zeros_like(log_hat), delta=0.5, reduction="none")
@@ -2233,22 +2198,6 @@ def exposure_hurdle_loss(
     pred_path_sum_log = torch.log1p(pred_path_sum.clamp_min(0.0))
     path_sum_loss = F.smooth_l1_loss(pred_path_sum_log, true_path_sum_log)
 
-    # ASIN/window 20-week sum loss across all three exposure channels.
-    # This is the main magnitude prior: it asks the single-head decoder to get
-    # each ASIN's total future exposure level right, instead of only matching
-    # pointwise weekly errors. This is NOT a two-head or active-gated term.
-    true_sum_all_log = torch.log1p(true.sum(dim=1).clamp_min(0.0))      # [B,3]
-    pred_sum_all_log = torch.log1p(pred_level.sum(dim=1).clamp_min(0.0)) # [B,3]
-    asin_sum_loss = (F.smooth_l1_loss(pred_sum_all_log, true_sum_all_log, reduction="none") * tw.view(1,3)).mean()
-
-    # Long-block sum loss: explicitly protect h14-h20 total in_stock exposure.
-    # This is more stable than only increasing pointwise weights, because the
-    # key failure mode is long-block level underprediction.
-    long_start = 13 if H > 13 else max(H - 1, 0)  # zero-based index: h14
-    true_long_sum_log = torch.log1p(true_instock_y[:, long_start:].sum(dim=1).clamp_min(0.0))
-    pred_long_sum_log = torch.log1p(pred_instock[:, long_start:].sum(dim=1).clamp_min(0.0))
-    long_block_sum_loss = F.smooth_l1_loss(pred_long_sum_log, true_long_sum_log)
-
     # 7) Peak/path-high losses for ENN.
     # These target the opposite failure mode of zero losses: peak compression.
     # Use in_stock as the main business-critical exposure channel.
@@ -2273,8 +2222,7 @@ def exposure_hurdle_loss(
     peak_under_loss = (peak_under * high_mask).sum() / high_mask.sum().clamp_min(1.0)
 
     return (
-        nb_weight * nb_loss
-        + mag_weight * direct_loss
+        mag_weight * direct_loss
         + mean_weight * mean_loss
         + bce_weight * bce_loss
         + active_calib_weight * active_calib_loss
@@ -2283,8 +2231,6 @@ def exposure_hurdle_loss(
         + zero_fp_weight * zero_fp_loss
         + active_count_weight * active_count_loss
         + path_sum_weight * path_sum_loss
-        + asin_sum_weight * asin_sum_loss
-        + long_block_sum_weight * long_block_sum_loss
         + peak_weight * peak_loss
         + topk_peak_weight * topk_peak_loss
         + peak_under_weight * peak_under_loss
@@ -2300,7 +2246,6 @@ def train_exposure_model_v2(
     w_total=0.30, w_buy=0.60, w_instock=1.00,
     bce_weight=0.00, mag_weight=1.00, mean_weight=0.40,
     active_calib_weight=0.00,
-    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -2308,15 +2253,10 @@ def train_exposure_model_v2(
     total_zero_consistency_weight=0.01,
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.15, high_weight_alpha=0.35,
-    short_horizon_weight=0.8,
-    mid_horizon_weight=1.2,
-    long_horizon_weight=2.0,
-    long_block_sum_weight=0.30,
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
     active_count_weight=0.00,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -2348,8 +2288,6 @@ def train_exposure_model_v2(
                 true_instock=b["future_instock_dph"],
                 active_logit=aux["active_logit"],
                 log_mag=aux["log_mag"],
-                alpha=aux.get("alpha", None),
-                nb_weight=nb_weight,
                 w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                 bce_weight=bce_weight, mag_weight=mag_weight,
                 mean_weight=mean_weight,
@@ -2366,11 +2304,6 @@ def train_exposure_model_v2(
                 zero_fp_weight=zero_fp_weight,
                 active_count_weight=active_count_weight,
                 path_sum_weight=path_sum_weight,
-                asin_sum_weight=asin_sum_weight,
-                short_horizon_weight=short_horizon_weight,
-                mid_horizon_weight=mid_horizon_weight,
-                long_horizon_weight=long_horizon_weight,
-                long_block_sum_weight=long_block_sum_weight,
                 peak_weight=peak_weight,
                 topk_peak_weight=topk_peak_weight,
                 peak_under_weight=peak_under_weight,
@@ -2401,8 +2334,6 @@ def train_exposure_model_v2(
                     true_instock=b["future_instock_dph"],
                     active_logit=aux["active_logit"],
                     log_mag=aux["log_mag"],
-                    alpha=aux.get("alpha", None),
-                    nb_weight=nb_weight,
                     w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                     bce_weight=bce_weight, mag_weight=mag_weight,
                     mean_weight=mean_weight,
@@ -2419,11 +2350,6 @@ def train_exposure_model_v2(
                     zero_fp_weight=zero_fp_weight,
                     active_count_weight=active_count_weight,
                     path_sum_weight=path_sum_weight,
-                    asin_sum_weight=asin_sum_weight,
-                    short_horizon_weight=short_horizon_weight,
-                    mid_horizon_weight=mid_horizon_weight,
-                    long_horizon_weight=long_horizon_weight,
-                    long_block_sum_weight=long_block_sum_weight,
                     peak_weight=peak_weight,
                     topk_peak_weight=topk_peak_weight,
                     peak_under_weight=peak_under_weight,
@@ -3330,7 +3256,6 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -3339,15 +3264,10 @@ def run_exposure_v2(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.15,
     high_weight_alpha=0.35,
-    short_horizon_weight=0.8,
-    mid_horizon_weight=1.2,
-    long_horizon_weight=2.0,
-    long_block_sum_weight=0.30,
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
     active_count_weight=0.00,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3429,15 +3349,10 @@ def run_exposure_v2(
         total_zero_consistency_weight=total_zero_consistency_weight,
         buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
-        short_horizon_weight=short_horizon_weight,
-        mid_horizon_weight=mid_horizon_weight,
-        long_horizon_weight=long_horizon_weight,
-        long_block_sum_weight=long_block_sum_weight,
         path_zero_weight=path_zero_weight,
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
-        asin_sum_weight=asin_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -3736,7 +3651,6 @@ def _train_one_exposure_window(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -3745,15 +3659,10 @@ def _train_one_exposure_window(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
-    short_horizon_weight=0.8,
-    mid_horizon_weight=1.2,
-    long_horizon_weight=2.0,
-    long_block_sum_weight=0.30,
     path_zero_weight=0.00,
     zero_fp_weight=0.00,
     active_count_weight=0.00,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -3829,7 +3738,6 @@ def _train_one_exposure_window(
         mag_weight=mag_weight,
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
-        nb_weight=nb_weight,
         zero_weight=zero_weight,
         total_zero_weight=total_zero_weight,
         buy_zero_weight=buy_zero_weight,
@@ -3842,11 +3750,6 @@ def _train_one_exposure_window(
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
-        asin_sum_weight=asin_sum_weight,
-        short_horizon_weight=short_horizon_weight,
-        mid_horizon_weight=mid_horizon_weight,
-        long_horizon_weight=long_horizon_weight,
-        long_block_sum_weight=long_block_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -4057,7 +3960,6 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -4070,7 +3972,6 @@ def run_exposure_v2(
     zero_fp_weight=0.00,
     active_count_weight=0.00,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -4114,6 +4015,9 @@ def run_exposure_v2(
         graph_brand_weight=graph_brand_weight,
     )
 
+    # Direct-20 setup: no horizon-block reweighting and no ASIN/long-block sum loss.
+    # This keeps the old best-version behavior: the decoder directly predicts all 20 weeks.
+
     out = _train_one_exposure_window(
         data=data,
         context_dim=context_dim,
@@ -4133,7 +4037,6 @@ def run_exposure_v2(
         mag_weight=mag_weight,
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
-        nb_weight=nb_weight,
         zero_weight=zero_weight,
         total_zero_weight=total_zero_weight,
         buy_zero_weight=buy_zero_weight,
@@ -4146,11 +4049,6 @@ def run_exposure_v2(
         zero_fp_weight=zero_fp_weight,
         active_count_weight=active_count_weight,
         path_sum_weight=path_sum_weight,
-        asin_sum_weight=asin_sum_weight,
-        short_horizon_weight=short_horizon_weight,
-        mid_horizon_weight=mid_horizon_weight,
-        long_horizon_weight=long_horizon_weight,
-        long_block_sum_weight=long_block_sum_weight,
         peak_weight=peak_weight,
         topk_peak_weight=topk_peak_weight,
         peak_under_weight=peak_under_weight,
@@ -4219,7 +4117,6 @@ def run_exposure_v2_rolling(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    nb_weight=0.25,
     zero_weight=0.00,
     total_zero_weight=0.01,
     buy_zero_weight=0.05,
@@ -4232,7 +4129,6 @@ def run_exposure_v2_rolling(
     zero_fp_weight=0.00,
     active_count_weight=0.00,
     path_sum_weight=0.05,
-    asin_sum_weight=0.40,
     peak_weight=0.08,
     topk_peak_weight=0.05,
     peak_under_weight=0.08,
@@ -4283,6 +4179,8 @@ def run_exposure_v2_rolling(
 
     results_by_offset = {}
     pred_list = []
+
+    # Direct-20 setup for rolling too: neutral horizon-block weights, no long-block loss.
 
     for offset in rolling_offsets:
         window_graph_assets = None
@@ -4338,11 +4236,6 @@ def run_exposure_v2_rolling(
                 zero_fp_weight=zero_fp_weight,
                 active_count_weight=active_count_weight,
                 path_sum_weight=path_sum_weight,
-                asin_sum_weight=asin_sum_weight,
-                short_horizon_weight=short_horizon_weight,
-                mid_horizon_weight=mid_horizon_weight,
-                long_horizon_weight=long_horizon_weight,
-                long_block_sum_weight=long_block_sum_weight,
                 peak_weight=peak_weight,
                 topk_peak_weight=topk_peak_weight,
                 peak_under_weight=peak_under_weight,
