@@ -3532,34 +3532,6 @@ def run_exposure_v2(
 
 
 # ============================================================
-# 使用
-# ============================================================
-#
-# result = run_exposure_v2(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=13,
-#     horizon=20,
-#     d_model=64,
-#     n_heads=4,
-#     batch_size=64,
-#     epochs=60,
-#     lr=1e-3,
-#     patience=8,
-#     anchor_decay=0.08,     # anchor衰减速度，越大远期越快收缩到mean13
-#     bce_weight=1.00,       # occurrence BCE loss权重
-#     mag_weight=1.00,       # magnitude Huber loss权重
-#     mean_weight=0.50,      # mean scale penalty权重
-# )
-#
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# pred_df = result["forecast_df"]
-#
-# # 诊断occurrence预测质量
-# print(pred_df.groupby("horizon")["p_active_instock"].mean())
-
 # ============================================================
 # Rolling Backtest + SCOT Intersection Add-on
 # Added after original definitions; these functions override/use the fixed ABC model above.
@@ -3818,6 +3790,8 @@ def _train_one_exposure_window(
     graph_assets=None,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -4201,6 +4175,8 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
@@ -4693,96 +4669,6 @@ def run_exposure_v2_final_scot_5000(
     )
 
 # ============================================================
-# Usage: dual-relation GraphSAGE exposure model + historical-only OOS
-# ============================================================
-# This is the recommended run command for the current version.
-# It uses:
-#   - no extra zero/occurrence loss
-#   - NaN DPH -> 0 handling
-#   - category_code
-#   - dual-relation GraphSAGE using positive + competitive neighbors
-#   - hbt, customer_active_review_count / customer_review_count, ind_top10_brand
-#   - graph diagnostics only; heavy encoder/decoder diagnostics are disabled
-#
-# %run -i tcn_exposure_v2_enn_nogate_peakloss_category_dualgraph_hbt_review_gpu_CLEAN.py
-#
-# result = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=True,
-#
-#     use_graphsage=True,
-#     neighbor_k=10,
-#     graph_dim=16,
-#     graph_message_scale=0.04,
-#     use_graph_head=True,
-#     graph_head_scale=0.05,
-#
-#     graph_zero_weight=0.03,
-#     graph_level_peak_weight=2.2,
-#     graph_transition_weight=1.0,
-#     graph_static_weight=1.0,
-#     graph_brand_weight=0.3,
-# )
-#
-# pred_df = result["forecast_df"]
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# diagnostics = result["diagnostics"]
-# graph_diag = diagnostics.get("graph", {})
-# gl_diag = result["gl_diagnostics"]
-# gl_block_diag = result["gl_horizon_block_diagnostics"]
-# gl_summary = result["gl_summary"]
-#
-# Quick ablations:
-#   1) If GraphSAGE underpredicts, reduce graph_message_scale to 0.05.
-#   2) If graph signal is too weak, increase graph_dim to 32.
-#   3) If zero smoothing is still too strong, set graph_zero_weight=0.0 or 0.1.
-#
-# No-graph baseline:
-# result_no_graph = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=True,
-#     use_graphsage=False,
-# )
-#
-# Rolling backtest is available but slower:
-# result_roll = run_exposure_v2_rolling(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     history=13,
-#     horizon=20,
-#     rolling_offsets=(60, 40, 20, 0),
-#     epochs=20,
-#     patience=5,
-#     batch_size=128,
-#     use_scot_intersection=True,
-#     use_encoder_self_attn=True,
-#     use_graphsage=True,
-#     neighbor_k=10,
-#     graph_dim=16,
-#     graph_message_scale=0.04,
-#     use_graph_head=True,
-#     graph_head_scale=0.05,
-#     graph_zero_weight=0.03,
-#     graph_level_peak_weight=2.2,
-#     graph_transition_weight=1.0,
-#     graph_static_weight=1.0,
-#     graph_brand_weight=0.3,
-# )
-
-# ============================================================
 # CLEAN DIAGNOSTICS OVERRIDE
 # Keep only useful checks for the current direction:
 #   1) overall exposure quality
@@ -4939,11 +4825,11 @@ def print_exposure_diagnostics(pred_df):
         "final_summary": final_summary,
     }
 
-
 # ============================================================
-# USAGE: exposure only; pass only the final hat dataframe to demand
+# USAGE: DualGAT exposure only; pass final MU exposure hats to demand
 # ============================================================
-# %run -i exposure_model_only_nb_mu_hats_v2.py
+# Run this file in Jupyter:
+# %run -i exposure_model_only_categorygraph_glstatic_dualGAT_v8.py
 #
 # exposure_result = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
@@ -4953,31 +4839,32 @@ def print_exposure_diagnostics(pred_df):
 #     epochs=30,
 #     patience=6,
 #     batch_size=128,
-#     use_graphsage=True,
+#
+#     # Encoder / graph
+#     use_encoder_self_attn=True,
+#     use_graphsage=True,       # In this file this enables DualRelationalGAT, not mean GraphSAGE.
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
-#     use_graph_head=True,
-#     graph_head_scale=0.05,
+#
+#     # First recommended run: keep graph as embedding only.
+#     # Turn this on only after the embedding-only ablation improves validation/demand.
+#     use_graph_head=False,
+#     graph_head_scale=0.03,
+#
+#     # Graph feature weights used to build ASIN profiles / edges
 #     graph_zero_weight=0.03,
 #     graph_level_peak_weight=2.2,
 #     graph_transition_weight=1.0,
 #     graph_static_weight=1.0,
 #     graph_brand_weight=0.3,
-#     use_encoder_self_attn=True,
 # )
 #
+# forecast_df = exposure_result["forecast_df"]
 # exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
-# summarize_exposure_hat_for_demand(exposure_hat_for_demand, title="MU HAT TO PASS INTO DEMAND")
+# summarize_exposure_hat_for_demand(
+#     exposure_hat_for_demand,
+#     title="DUALGAT MU HAT TO PASS INTO DEMAND",
+# )
 #
 # Then run the demand model in a separate cell/file and pass only exposure_hat_for_demand.
-
-
-# ============================================================
-# v4 note
-# This file is a minimal patch over exposure_model_only_patch_v1_minimal_maggraph_asinsum.py.
-# Main change: graph embeddings are not only concatenated into future_context for decoder TCN,
-# but are also registered as graph_emb_* context columns and fed directly into the magnitude
-# patch heads through mag_feat_indices. This makes graph signal enter the final MU head more
-# strongly while keeping single-head / no-gate / no-zero-calibration behavior.
-# ============================================================
