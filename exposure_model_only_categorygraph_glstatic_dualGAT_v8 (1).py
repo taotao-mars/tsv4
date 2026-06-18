@@ -1473,17 +1473,12 @@ class DualRelationalGATEncoder(nn.Module):
     """
     Lightweight dual-relation GAT encoder for ASIN graphs.
 
-    It keeps the graph construction unchanged:
-      1. positive/co-movement KNN neighbors
-      2. competitive/attention-stealing same-category neighbors
-
-    Difference vs DualGraphSAGE:
-      - DualGraphSAGE uses a simple mean over neighbors.
-      - This GAT version learns attention weights over neighbors.
-
-    Important design choice:
-      KNN/category rules still build candidate edges. GAT only learns which
-      connected neighbors matter more, so we avoid full-graph smoothing.
+    V9 gated diagnostics version:
+      - keeps the original positive and competitive candidate edges;
+      - learns attention weights over each relation separately;
+      - can return self / positive / competitive messages and attention entropy
+        so the downstream decoder can learn how much positive vs competitive
+        graph signal to use per horizon.
     """
     def __init__(self, node_feat_dim, graph_dim=16, dropout=0.10,
                  neighbor_message_scale=0.20, n_heads=4,
@@ -1495,13 +1490,10 @@ class DualRelationalGATEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.leaky_relu = nn.LeakyReLU(attention_leaky_slope)
 
-        # Use a shared self projection, but relation-specific neighbor projections
-        # and relation-specific attention vectors.
         self.self_proj = nn.Linear(node_feat_dim, graph_dim)
         self.pos_proj = nn.Linear(node_feat_dim, graph_dim)
         self.comp_proj = nn.Linear(node_feat_dim, graph_dim)
 
-        # Multi-head attention over fixed KNN candidate sets.
         self.pos_attn = nn.Parameter(torch.empty(self.n_heads, graph_dim * 2))
         self.comp_attn = nn.Parameter(torch.empty(self.n_heads, graph_dim * 2))
         nn.init.xavier_uniform_(self.pos_attn)
@@ -1518,50 +1510,80 @@ class DualRelationalGATEncoder(nn.Module):
             nn.LayerNorm(graph_dim),
         )
 
-    def _gat_message(self, h_self, h_neigh, attn_vec):
+    def _gat_message(self, h_self, h_neigh, attn_vec, return_alpha=False):
         """
         h_self:  [N,G]
         h_neigh: [N,K,G]
         attn_vec:[heads,2G]
-        returns: [N,G]
+        returns msg [N,G], optionally alpha [N,K,heads].
         """
         N, K, G = h_neigh.shape
         self_rep = h_self[:, None, :].expand(N, K, G)
         pair = torch.cat([self_rep, h_neigh], dim=-1)  # [N,K,2G]
 
-        # score[n,k,head]
         score = torch.einsum('nkd,hd->nkh', pair, attn_vec)
         score = self.leaky_relu(score)
-        alpha = torch.softmax(score, dim=1)  # normalize over neighbors K
-        alpha = self.dropout(alpha)
+        alpha = torch.softmax(score, dim=1)
+        alpha_drop = self.dropout(alpha)
 
-        # msg[n,head,g]
-        msg = torch.einsum('nkh,nkg->nhg', alpha, h_neigh)
+        msg = torch.einsum('nkh,nkg->nhg', alpha_drop, h_neigh)
         msg = msg.reshape(N, self.n_heads * G)
+        if return_alpha:
+            return msg, alpha
         return msg
 
-    def forward(self, node_features, neighbor_idx, competitive_neighbor_idx=None):
-        # node_features: [N,F]
-        # neighbor_idx: [N,K]
-        # competitive_neighbor_idx: [N,K]
-        h_self = self.self_proj(node_features)              # [N,G]
+    @staticmethod
+    def _entropy_from_alpha(alpha):
+        # alpha [N,K,heads] -> [N]
+        eps = 1e-8
+        ent = -(alpha.clamp_min(eps) * torch.log(alpha.clamp_min(eps))).sum(dim=1)  # [N,heads]
+        return ent.mean(dim=1)
 
-        pos_raw = node_features[neighbor_idx]               # [N,K,F]
-        h_pos_neigh = self.pos_proj(pos_raw)                # [N,K,G]
-        pos_msg_heads = self._gat_message(h_self, h_pos_neigh, self.pos_attn)
+    def forward(self, node_features, neighbor_idx, competitive_neighbor_idx=None, return_aux=False):
+        h_self = self.self_proj(node_features)  # [N,G]
+
+        pos_raw = node_features[neighbor_idx]
+        h_pos_neigh = self.pos_proj(pos_raw)
+        if return_aux:
+            pos_msg_heads, pos_alpha = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=True)
+        else:
+            pos_msg_heads = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=False)
+            pos_alpha = None
         h_pos = self.neighbor_message_scale * self.pos_head_mix(pos_msg_heads)
 
         if competitive_neighbor_idx is None:
             h_comp = torch.zeros_like(h_pos)
+            comp_alpha = None
         else:
-            comp_raw = node_features[competitive_neighbor_idx]  # [N,K,F]
-            h_comp_neigh = self.comp_proj(comp_raw)             # [N,K,G]
-            comp_msg_heads = self._gat_message(h_self, h_comp_neigh, self.comp_attn)
+            comp_raw = node_features[competitive_neighbor_idx]
+            h_comp_neigh = self.comp_proj(comp_raw)
+            if return_aux:
+                comp_msg_heads, comp_alpha = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=True)
+            else:
+                comp_msg_heads = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=False)
+                comp_alpha = None
             h_comp = self.neighbor_message_scale * self.comp_head_mix(comp_msg_heads)
 
-        # Do not hard subtract competitive message. Let the MLP learn whether
-        # competitive context should suppress or boost each target.
-        return self.out(torch.cat([h_self, h_pos, h_comp], dim=-1))
+        graph_emb = self.out(torch.cat([h_self, h_pos, h_comp], dim=-1))
+        if not return_aux:
+            return graph_emb
+
+        out = {
+            "graph_emb": graph_emb,
+            "self_msg": h_self,
+            "pos_msg": h_pos,
+            "comp_msg": h_comp,
+            "pos_norm": torch.norm(h_pos, dim=-1),
+            "comp_norm": torch.norm(h_comp, dim=-1),
+            "graph_norm": torch.norm(graph_emb, dim=-1),
+        }
+        if pos_alpha is not None:
+            out["pos_attn_entropy"] = self._entropy_from_alpha(pos_alpha)
+            out["pos_attn_max"] = pos_alpha.max(dim=1).values.mean(dim=1)
+        if comp_alpha is not None:
+            out["comp_attn_entropy"] = self._entropy_from_alpha(comp_alpha)
+            out["comp_attn_max"] = comp_alpha.max(dim=1).values.mean(dim=1)
+        return out
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
@@ -1892,7 +1914,7 @@ class ExposureForecastModelV2(nn.Module):
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
                  use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
-                 use_graph_head=False, graph_head_scale=0.05):
+                 use_graph_head=False, graph_head_scale=0.05, use_graph_gate=True):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1908,6 +1930,7 @@ class ExposureForecastModelV2(nn.Module):
         # Default is off for maximum stability; turn on only for ablation.
         self.use_graph_head = bool(use_graph_head and self.use_graphsage)
         self.graph_head_scale = float(graph_head_scale)
+        self.use_graph_gate = bool(use_graph_gate and self.use_graphsage)
         if self.use_graphsage:
             node_np = graph_assets["node_features"].astype(np.float32)
             neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
@@ -1928,7 +1951,7 @@ class ExposureForecastModelV2(nn.Module):
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
             print(f"DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
-            print(f"Category-only graph v7: GL is static only; graph_emb is light context/residual. Optional graph-delta head={self.use_graph_head}, scale={self.graph_head_scale}.")
+            print(f"Category-only graph v9: GL is static only; DualGAT positive/competitive messages are horizon-gated. Optional graph-delta head={self.use_graph_head}, scale={self.graph_head_scale}, graph_gate={self.use_graph_gate}.")
         else:
             self.graph_encoder = None
             print("DualRelationalGAT disabled")
@@ -1943,6 +1966,21 @@ class ExposureForecastModelV2(nn.Module):
             )
         else:
             self.graph_delta_head = None
+
+        if self.use_graphsage:
+            # Horizon-level graph gates. These learn how much positive and competitive
+            # graph message to use for each ASIN and each future week.
+            gate_in_dim = context_dim + self.graph_dim * 3
+            self.graph_gate_net = nn.Sequential(
+                nn.Linear(gate_in_dim, max(32, self.graph_dim * 4)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, self.graph_dim * 4), 2),
+            )
+            self.graph_fusion_norm = nn.LayerNorm(self.graph_dim)
+        else:
+            self.graph_gate_net = None
+            self.graph_fusion_norm = None
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -2056,17 +2094,59 @@ class ExposureForecastModelV2(nn.Module):
         enc_out = self.encoder(x)
         g = None
 
+        graph_aux = None
         if self.use_graphsage:
             if asin_idx is None:
                 raise ValueError("asin_idx is required when use_graphsage=True")
-            graph_emb_all = self.graph_encoder(self.graph_node_features, self.graph_neighbor_idx, self.graph_competitive_neighbor_idx)  # [N,G]
-            g = graph_emb_all[asin_idx.long()]                                                     # [B,G]
+            graph_all = self.graph_encoder(
+                self.graph_node_features,
+                self.graph_neighbor_idx,
+                self.graph_competitive_neighbor_idx,
+                return_aux=True,
+            )
+            idx = asin_idx.long()
+            g = graph_all["graph_emb"][idx]       # [B,G]
+            g_self = graph_all["self_msg"][idx]   # [B,G]
+            g_pos = graph_all["pos_msg"][idx]     # [B,G]
+            g_comp = graph_all["comp_msg"][idx]   # [B,G]
+
             B, H, _ = future_context.shape
-            g_rep = g[:, None, :].expand(B, H, -1)
+            if self.use_graph_gate and self.graph_gate_net is not None:
+                g_self_rep = g_self[:, None, :].expand(B, H, -1)
+                g_pos_rep = g_pos[:, None, :].expand(B, H, -1)
+                g_comp_rep = g_comp[:, None, :].expand(B, H, -1)
+                gate_in = torch.cat([future_context, g_self_rep, g_pos_rep, g_comp_rep], dim=-1)
+                gate_logits = self.graph_gate_net(gate_in)
+                gates = torch.sigmoid(gate_logits)
+                pos_gate = gates[..., 0:1]
+                comp_gate = gates[..., 1:2]
+                g_rep = self.graph_fusion_norm(g_self_rep + pos_gate * g_pos_rep + comp_gate * g_comp_rep)
+            else:
+                pos_gate = torch.ones(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+                comp_gate = torch.ones(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+                g_rep = g[:, None, :].expand(B, H, -1)
+
             future_context = torch.cat([future_context, g_rep], dim=-1)
+            if return_aux:
+                graph_aux = {
+                    "graph_pos_gate": pos_gate.squeeze(-1),
+                    "graph_comp_gate": comp_gate.squeeze(-1),
+                    "graph_gate": 0.5 * (pos_gate.squeeze(-1) + comp_gate.squeeze(-1)),
+                    "graph_pos_minus_comp_gate": (pos_gate.squeeze(-1) - comp_gate.squeeze(-1)),
+                    "graph_pos_norm": graph_all["pos_norm"][idx],
+                    "graph_comp_norm": graph_all["comp_norm"][idx],
+                    "graph_emb_norm": graph_all["graph_norm"][idx],
+                    "graph_pos_attn_entropy": graph_all.get("pos_attn_entropy", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_comp_attn_entropy": graph_all.get("comp_attn_entropy", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_pos_attn_max": graph_all.get("pos_attn_max", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_comp_attn_max": graph_all.get("comp_attn_max", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                }
 
         dec_out = self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
-        return self._apply_graph_delta_head(dec_out, g)
+        dec_out = self._apply_graph_delta_head(dec_out, g)
+        if return_aux and isinstance(dec_out, dict) and graph_aux is not None:
+            dec_out.update(graph_aux)
+        return dec_out
 
 
 # ============================================================
@@ -2619,6 +2699,30 @@ def predict_exposure_v2(
             gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
             gate_np = gate_t.cpu().numpy()
 
+            def _aux_horizon_np(name):
+                v = last_aux.get(name, None)
+                if v is None:
+                    return np.full((b["future_instock_dph"].shape[0], b["future_instock_dph"].shape[1]), np.nan)
+                return v.detach().cpu().numpy()
+
+            def _aux_asin_np(name):
+                v = last_aux.get(name, None)
+                if v is None:
+                    return np.full((b["future_instock_dph"].shape[0],), np.nan)
+                return v.detach().cpu().numpy()
+
+            graph_pos_gate_np = _aux_horizon_np("graph_pos_gate")
+            graph_comp_gate_np = _aux_horizon_np("graph_comp_gate")
+            graph_gate_np = _aux_horizon_np("graph_gate")
+            graph_pos_minus_comp_gate_np = _aux_horizon_np("graph_pos_minus_comp_gate")
+            graph_pos_norm_np = _aux_asin_np("graph_pos_norm")
+            graph_comp_norm_np = _aux_asin_np("graph_comp_norm")
+            graph_emb_norm_np = _aux_asin_np("graph_emb_norm")
+            graph_pos_attn_entropy_np = _aux_asin_np("graph_pos_attn_entropy")
+            graph_comp_attn_entropy_np = _aux_asin_np("graph_comp_attn_entropy")
+            graph_pos_attn_max_np = _aux_asin_np("graph_pos_attn_max")
+            graph_comp_attn_max_np = _aux_asin_np("graph_comp_attn_max")
+
             if apply_funnel_constraint:
                 # apply funnel to all prediction views
                 for arr in (pred, mu_np, dist_mean_np, dist_p50_np):
@@ -2659,6 +2763,20 @@ def predict_exposure_v2(
                         "gate_total":        gate_np[i, h, 0],
                         "gate_buy_box":      gate_np[i, h, 1],
                         "gate_instock":      gate_np[i, h, 2],
+
+                        # DualGAT gating diagnostics. These are model-learned horizon-level
+                        # weights for positive vs competitive graph messages.
+                        "graph_pos_gate": graph_pos_gate_np[i, h],
+                        "graph_comp_gate": graph_comp_gate_np[i, h],
+                        "graph_gate": graph_gate_np[i, h],
+                        "graph_pos_minus_comp_gate": graph_pos_minus_comp_gate_np[i, h],
+                        "graph_pos_norm": graph_pos_norm_np[i],
+                        "graph_comp_norm": graph_comp_norm_np[i],
+                        "graph_emb_norm": graph_emb_norm_np[i],
+                        "graph_pos_attn_entropy": graph_pos_attn_entropy_np[i],
+                        "graph_comp_attn_entropy": graph_comp_attn_entropy_np[i],
+                        "graph_pos_attn_max": graph_pos_attn_max_np[i],
+                        "graph_comp_attn_max": graph_comp_attn_max_np[i],
                     })
     return pd.DataFrame(rows)
 
@@ -3418,6 +3536,7 @@ def run_exposure_v2(
     graph_message_scale=0.04,
     use_graph_head=False,
     graph_head_scale=0.05,
+    use_graph_gate=True,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -3469,6 +3588,7 @@ def run_exposure_v2(
         graph_message_scale=graph_message_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -3792,6 +3912,7 @@ def _train_one_exposure_window(
     graph_message_scale=0.04,
     use_graph_head=False,
     graph_head_scale=0.05,
+    use_graph_gate=True,
     use_encoder_self_attn=True,
 ):
     tr_ds = ExposureDatasetRolling(
@@ -3838,6 +3959,7 @@ def _train_one_exposure_window(
         graph_message_scale=graph_message_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -4106,6 +4228,7 @@ def run_exposure_v2(
     graph_message_scale=0.04,
     use_graph_head=False,
     graph_head_scale=0.05,
+    use_graph_gate=True,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4262,6 +4385,7 @@ def run_exposure_v2_rolling(
     graph_message_scale=0.04,
     use_graph_head=False,
     graph_head_scale=0.05,
+    use_graph_gate=True,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4627,6 +4751,7 @@ def run_exposure_v2_final_scot_5000(
     graph_message_scale=0.04,
     use_graph_head=False,
     graph_head_scale=0.05,
+    use_graph_gate=True,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4825,11 +4950,123 @@ def print_exposure_diagnostics(pred_df):
         "final_summary": final_summary,
     }
 
+
+
+def diagnose_graph_gates(pred_df, target="instock", verbose=True):
+    """
+    Compact diagnostics for V9 DualGAT horizon-level positive/competitive graph gates.
+    It checks whether the model uses graph differently by horizon, active state,
+    prediction error direction, and ASIN true-sum bucket.
+    """
+    required = ["graph_pos_gate", "graph_comp_gate", "graph_gate", "graph_pos_minus_comp_gate"]
+    if pred_df is None or len(pred_df) == 0 or not all(c in pred_df.columns for c in required):
+        if verbose:
+            print("[Graph gate diagnostics] No graph gate columns found. Run V9 gated file with use_graphsage=True.")
+        return {}
+
+    true_col = f"true_{target}_dph" if target != "instock" else "true_instock_dph"
+    pred_col = f"pred_{target}_dph" if target != "instock" else "pred_instock_dph"
+    if true_col not in pred_df.columns or pred_col not in pred_df.columns:
+        true_col, pred_col = "true_instock_dph", "pred_instock_dph"
+
+    df = pred_df.copy()
+    df["err"] = df[pred_col] - df[true_col]
+    df["abs_err"] = df["err"].abs()
+    df["active"] = (df[true_col] > 0).astype(int)
+    df["under"] = (df["err"] < 0).astype(int)
+
+    by_h = df.groupby("horizon").agg(
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        true_mean=(true_col, "mean"),
+        pred_mean=(pred_col, "mean"),
+        WAPE_num=("abs_err", "sum"),
+        WAPE_den=(true_col, lambda x: np.abs(x).sum() + 1e-8),
+    ).reset_index()
+    by_h["WAPE"] = by_h["WAPE_num"] / by_h["WAPE_den"]
+    by_h = by_h.drop(columns=["WAPE_num", "WAPE_den"])
+
+    by_active = df.groupby("active").agg(
+        n=("asin", "count"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        true_mean=(true_col, "mean"),
+        pred_mean=(pred_col, "mean"),
+    ).reset_index()
+
+    by_error = df.groupby("under").agg(
+        n=("asin", "count"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        abs_err_mean=("abs_err", "mean"),
+    ).reset_index()
+
+    asin = df.groupby("asin").agg(
+        true_sum=(true_col, "sum"),
+        pred_sum=(pred_col, "sum"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_norm=("graph_pos_norm", "mean"),
+        comp_norm=("graph_comp_norm", "mean"),
+        pos_attn_entropy=("graph_pos_attn_entropy", "mean"),
+        comp_attn_entropy=("graph_comp_attn_entropy", "mean"),
+    ).reset_index()
+    try:
+        asin["true_sum_bucket"] = pd.qcut(asin["true_sum"], q=4, duplicates="drop")
+        by_bucket = asin.groupby("true_sum_bucket").agg(
+            n=("asin", "count"),
+            true_sum_mean=("true_sum", "mean"),
+            pred_sum_mean=("pred_sum", "mean"),
+            pos_gate_mean=("pos_gate_mean", "mean"),
+            comp_gate_mean=("comp_gate_mean", "mean"),
+            gate_mean=("gate_mean", "mean"),
+            pos_norm_mean=("pos_norm", "mean"),
+            comp_norm_mean=("comp_norm", "mean"),
+        ).reset_index()
+        by_bucket["ratio"] = by_bucket["pred_sum_mean"] / (by_bucket["true_sum_mean"] + 1e-8)
+    except Exception as e:
+        by_bucket = pd.DataFrame({"error": [str(e)]})
+
+    probe = pd.DataFrame([
+        {"probe": "corr_pos_gate_true", "value": _corr(df["graph_pos_gate"], df[true_col])},
+        {"probe": "corr_comp_gate_true", "value": _corr(df["graph_comp_gate"], df[true_col])},
+        {"probe": "corr_pos_minus_comp_true", "value": _corr(df["graph_pos_minus_comp_gate"], df[true_col])},
+        {"probe": "corr_graph_gate_abs_err", "value": _corr(df["graph_gate"], df["abs_err"])},
+    ])
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("DUALGAT V9 GRAPH GATE DIAGNOSTICS")
+        print("=" * 100)
+        print("\n[Gate by horizon]")
+        print(by_h.round(4).to_string(index=False))
+        print("\n[Gate by active/zero target]")
+        print(by_active.round(4).to_string(index=False))
+        print("\n[Gate by error direction: under=1 means pred < true]")
+        print(by_error.round(4).to_string(index=False))
+        print("\n[Gate by ASIN true-sum bucket]")
+        print(by_bucket.round(4).to_string(index=False))
+        print("\n[Gate probes]")
+        print(probe.round(4).to_string(index=False))
+        print("\nInterpretation:")
+        print("- pos_gate rising with active/high true_sum means positive graph is used as helpful borrowing.")
+        print("- comp_gate rising in under/high-error groups may indicate competitive message is suppressing too much.")
+        print("- flat gates across horizon/active buckets means graph is not yet distinguishing useful vs harmful relations.")
+
+    return {"by_horizon": by_h, "by_active": by_active, "by_error": by_error, "by_true_sum_bucket": by_bucket, "probe": probe}
+
 # ============================================================
-# USAGE: DualGAT exposure only; pass final MU exposure hats to demand
+# USAGE: DualGAT V9 gated exposure only; pass final MU exposure hats to demand
 # ============================================================
 # Run this file in Jupyter:
-# %run -i exposure_model_only_categorygraph_glstatic_dualGAT_v8.py
+# %run -i exposure_model_only_nb_mu_hats_v2_DUALGAT_GATED_DIAGNOSTICS.py
 #
 # exposure_result = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
@@ -4843,6 +5080,7 @@ def print_exposure_diagnostics(pred_df):
 #     # Encoder / graph
 #     use_encoder_self_attn=True,
 #     use_graphsage=True,       # In this file this enables DualRelationalGAT, not mean GraphSAGE.
+#     use_graph_gate=True,      # Learn per-horizon positive/competitive graph usage.
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
@@ -4864,7 +5102,9 @@ def print_exposure_diagnostics(pred_df):
 # exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
 # summarize_exposure_hat_for_demand(
 #     exposure_hat_for_demand,
-#     title="DUALGAT MU HAT TO PASS INTO DEMAND",
+#     title="DUALGAT V9 GATED MU HAT TO PASS INTO DEMAND",
 # )
+#
+# graph_gate_diagnostics = diagnose_graph_gates(forecast_df, target="instock", verbose=True)
 #
 # Then run the demand model in a separate cell/file and pass only exposure_hat_for_demand.
