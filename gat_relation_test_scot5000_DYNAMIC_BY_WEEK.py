@@ -14,9 +14,10 @@
 #
 # Core features emphasized:
 #   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand, ind_promotion, list_price
+#   dynamic category rank / magnitude hierarchy features by origin_week
 #
 # Usage is at the bottom. Designed for Jupyter:
-#   %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK_PROMO_PRICE_v2.py
+#   %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v3.py
 # ============================================================
 
 import warnings
@@ -172,7 +173,30 @@ SIGNAL_PREFIX = {
 }
 
 
+def _tail_mean(x, k):
+    x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return 0.0
+    return float(np.mean(x[-min(k, len(x)):]))
+
+
+def _tail_zero_rate(x, k):
+    x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return 1.0
+    t = x[-min(k, len(x)):]
+    return float(np.mean(t <= 0))
+
+
 def _series_summary_features(x, prefix):
+    """
+    Dynamic signal summary for one ASIN before one origin_week.
+
+    In addition to long-term level/active/zero stats, this explicitly builds
+    recent momentum and zero/stock penalties that should drive dynamic category rank:
+      - promotion can move an ASIN up temporarily
+      - long recent zero / low in-stock / low buybox should move it down
+    """
     x = np.asarray(x, dtype=float)
     x = np.clip(x[np.isfinite(x)], 0, None)
     if len(x) == 0:
@@ -184,20 +208,34 @@ def _series_summary_features(x, prefix):
     q90 = float(np.quantile(x, 0.90))
     q95 = float(np.quantile(x, 0.95))
     mx = float(np.max(x))
-    s = float(np.sum(x))
+    ssum = float(np.sum(x))
     active_vals = x[x > 0]
     active_mean = float(np.mean(active_vals)) if len(active_vals) else 0.0
     active_q90 = float(np.quantile(active_vals, 0.90)) if len(active_vals) else 0.0
-    recent = x[-13:] if len(x) >= 13 else x
-    recent_mean = float(np.mean(recent)) if len(recent) else 0.0
+
+    recent4 = _tail_mean(x, 4)
+    recent13 = _tail_mean(x, 13)
+    recent26 = _tail_mean(x, 26)
+    long52 = _tail_mean(x, 52)
+
+    def log_ratio(num, den):
+        return float(np.log1p(max(num, 0.0)) - np.log1p(max(den, 0.0)))
+
     return {
-        f"{prefix}_log_sum": np.log1p(s),
+        f"{prefix}_log_sum": np.log1p(ssum),
         f"{prefix}_log_mean": np.log1p(mean),
         f"{prefix}_log_q75": np.log1p(q75),
         f"{prefix}_log_q90": np.log1p(q90),
         f"{prefix}_log_q95": np.log1p(q95),
         f"{prefix}_log_max": np.log1p(mx),
-        f"{prefix}_log_recent13_mean": np.log1p(recent_mean),
+        f"{prefix}_log_recent4_mean": np.log1p(recent4),
+        f"{prefix}_log_recent13_mean": np.log1p(recent13),
+        f"{prefix}_log_recent26_mean": np.log1p(recent26),
+        f"{prefix}_log_long52_mean": np.log1p(long52),
+        f"{prefix}_recent13_vs_long52_logratio": log_ratio(recent13, long52),
+        f"{prefix}_recent4_vs_recent13_logratio": log_ratio(recent4, recent13),
+        f"{prefix}_recent13_zero_rate": _tail_zero_rate(x, 13),
+        f"{prefix}_recent26_zero_rate": _tail_zero_rate(x, 26),
         f"{prefix}_active_rate": float(np.mean(active)),
         f"{prefix}_zero_rate": float(1.0 - np.mean(active)),
         f"{prefix}_cv": float(std / (mean + 1e-6)),
@@ -207,10 +245,116 @@ def _series_summary_features(x, prefix):
     }
 
 
+def _safe_percentile_rank(s):
+    s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if s.notna().sum() <= 1:
+        return pd.Series(0.5, index=s.index)
+    return s.rank(pct=True, method="average").fillna(0.5).clip(0.0, 1.0)
+
+
+def _add_category_dynamic_ranks(prof):
+    """
+    Add origin-specific, within-category dynamic magnitude rank priors.
+
+    These are the standalone GAT diagnostics that match the user's intended use:
+      - promotion / promo-response can push current rank upward
+      - recent stock/demand zeros push rank downward
+      - recent13 vs long52 momentum pushes rank up/down
+      - HBT/top10 brand and price tier provide business hierarchy context
+    """
+    if prof is None or len(prof) == 0:
+        return prof
+    prof = prof.copy()
+
+    # Current raw strength before within-category rank.
+    # DPH funnel is weighted more heavily than demand because this is an exposure relation test.
+    prof["dyn_level_strength_raw"] = (
+        0.30 * prof.get("total_log_recent13_mean", 0.0) +
+        0.25 * prof.get("buybox_log_recent13_mean", 0.0) +
+        0.25 * prof.get("instock_log_recent13_mean", 0.0) +
+        0.20 * prof.get("demand_log_recent13_mean", 0.0)
+    )
+    prof["dyn_long_strength_raw"] = (
+        0.30 * prof.get("total_log_long52_mean", prof.get("total_log_mean", 0.0)) +
+        0.25 * prof.get("buybox_log_long52_mean", prof.get("buybox_log_mean", 0.0)) +
+        0.25 * prof.get("instock_log_long52_mean", prof.get("instock_log_mean", 0.0)) +
+        0.20 * prof.get("demand_log_long52_mean", prof.get("demand_log_mean", 0.0))
+    )
+    prof["dyn_momentum_raw"] = (
+        0.30 * prof.get("total_recent13_vs_long52_logratio", 0.0) +
+        0.25 * prof.get("buybox_recent13_vs_long52_logratio", 0.0) +
+        0.25 * prof.get("instock_recent13_vs_long52_logratio", 0.0) +
+        0.20 * prof.get("demand_recent13_vs_long52_logratio", 0.0)
+    )
+    prof["dyn_zero_penalty_raw"] = (
+        0.20 * prof.get("total_recent13_zero_rate", 1.0) +
+        0.30 * prof.get("buybox_recent13_zero_rate", 1.0) +
+        0.30 * prof.get("instock_recent13_zero_rate", 1.0) +
+        0.20 * prof.get("demand_recent13_zero_rate", 1.0)
+    )
+    prof["dyn_promo_boost_raw"] = (
+        0.50 * prof.get("ind_promotion_current", 0.0) +
+        0.25 * prof.get("promo_recent13_rate", 0.0) +
+        0.25 * prof.get("promo_response_strength", 0.0)
+    )
+    prof["dyn_business_prior_raw"] = (
+        0.20 * prof.get("hbt_is_head", 0.0) -
+        0.10 * prof.get("hbt_is_tail", 0.0) +
+        0.15 * prof.get("ind_top10_brand", 0.0) +
+        0.05 * prof.get("log_review_last", 0.0)
+    )
+
+    # Dynamic composite strength.  This is NOT a label; it is a history/current-known prior.
+    prof["dynamic_strength_raw"] = (
+        0.45 * prof["dyn_level_strength_raw"] +
+        0.20 * prof["dyn_long_strength_raw"] +
+        0.15 * prof["dyn_momentum_raw"] +
+        0.12 * prof["dyn_promo_boost_raw"] +
+        0.08 * prof["dyn_business_prior_raw"] -
+        0.35 * prof["dyn_zero_penalty_raw"]
+    )
+
+    # Category percentiles by origin/category.
+    group_keys = ["origin_week", "category_code"] if "origin_week" in prof.columns else ["category_code"]
+    rank_specs = {
+        "cat_rank_recent13_total": "total_log_recent13_mean",
+        "cat_rank_recent13_buybox": "buybox_log_recent13_mean",
+        "cat_rank_recent13_instock": "instock_log_recent13_mean",
+        "cat_rank_recent13_demand": "demand_log_recent13_mean",
+        "cat_rank_long52_total": "total_log_long52_mean",
+        "cat_rank_momentum": "dyn_momentum_raw",
+        "cat_rank_promo_boost": "dyn_promo_boost_raw",
+        "cat_rank_zero_good": "dyn_zero_penalty_raw",  # inverted below
+        "cat_rank_dynamic_strength": "dynamic_strength_raw",
+    }
+    for out_col, src_col in rank_specs.items():
+        if src_col not in prof.columns:
+            prof[out_col] = 0.5
+            continue
+        if out_col == "cat_rank_zero_good":
+            prof[out_col] = prof.groupby(group_keys)[src_col].transform(lambda x: 1.0 - _safe_percentile_rank(x))
+        else:
+            prof[out_col] = prof.groupby(group_keys)[src_col].transform(_safe_percentile_rank)
+
+    # Final compact rank prior used by pair features.
+    prof["cat_rank_composite_dynamic"] = (
+        0.25 * prof["cat_rank_recent13_total"] +
+        0.20 * prof["cat_rank_recent13_buybox"] +
+        0.20 * prof["cat_rank_recent13_instock"] +
+        0.15 * prof["cat_rank_recent13_demand"] +
+        0.10 * prof["cat_rank_momentum"] +
+        0.05 * prof["cat_rank_promo_boost"] +
+        0.05 * prof["cat_rank_zero_good"]
+    ).clip(0.0, 1.0)
+
+    return prof
+
 def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
     """Build ASIN node features using only weeks < origin_week."""
     origin_week = pd.to_datetime(origin_week)
     hist = df[df["order_week"] < origin_week].copy()
+    current = df[df["order_week"] == origin_week].copy()
+    current_idx = current.sort_values("order_week").groupby("asin").tail(1).set_index("asin") if len(current) else pd.DataFrame()
     if hist.empty:
         return pd.DataFrame()
 
@@ -235,6 +379,20 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
         row["log_list_price_last"] = float(g["log_list_price"].iloc[-1])
         row["log_our_price_mean"] = float(g["log_our_price"].mean())
         row["log_price_mean"] = row["log_list_price_mean"]
+
+        # Current-origin known features. These are not future realized DPH/demand targets.
+        if asin in current_idx.index:
+            cur = current_idx.loc[asin]
+            row["ind_promotion_current"] = float(pd.to_numeric(cur.get("ind_promotion", 0.0), errors="coerce"))
+            row["ind_prime_week_current"] = float(pd.to_numeric(cur.get("ind_prime_week", 0.0), errors="coerce"))
+            row["log_list_price_current"] = float(pd.to_numeric(cur.get("log_list_price", row["log_list_price_last"]), errors="coerce"))
+            row["log_our_price_current"] = float(pd.to_numeric(cur.get("log_our_price", row["log_our_price_mean"]), errors="coerce"))
+        else:
+            row["ind_promotion_current"] = 0.0
+            row["ind_prime_week_current"] = 0.0
+            row["log_list_price_current"] = row["log_list_price_last"]
+            row["log_our_price_current"] = row["log_our_price_mean"]
+        row["log_list_price_current_gap_vs_mean"] = row["log_list_price_current"] - row["log_list_price_mean"]
 
         promo_arr = _safe_numeric(g["ind_promotion"]).values.astype(float)
         row["promo_rate"] = float(np.mean(promo_arr))
@@ -360,6 +518,31 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     feat["funnel_strength_abs_gap"] = abs(feat["funnel_strength_signed_gap"])
     feat["active_strength_signed_gap"] = float(row_j["active_strength"] - row_i["active_strength"])
     feat["active_strength_abs_gap"] = abs(feat["active_strength_signed_gap"])
+
+    # Dynamic magnitude hierarchy features: category-relative rank at origin_week.
+    rank_cols = [
+        "cat_rank_recent13_total", "cat_rank_recent13_buybox", "cat_rank_recent13_instock", "cat_rank_recent13_demand",
+        "cat_rank_long52_total", "cat_rank_momentum", "cat_rank_promo_boost", "cat_rank_zero_good", "cat_rank_dynamic_strength",
+        "cat_rank_composite_dynamic",
+    ]
+    for rc in rank_cols:
+        ri_val = float(row_i.get(rc, 0.5))
+        rj_val = float(row_j.get(rc, 0.5))
+        short = rc.replace("cat_rank_", "rank_")
+        feat[f"{short}_i"] = ri_val
+        feat[f"{short}_j"] = rj_val
+        feat[f"{short}_signed_gap_j_minus_i"] = rj_val - ri_val
+        feat[f"{short}_abs_gap"] = abs(rj_val - ri_val)
+        feat[f"j_higher_{short}"] = float(rj_val > ri_val + 0.10)
+    feat["j_higher_dynamic_rank"] = float(feat.get("rank_composite_dynamic_signed_gap_j_minus_i", 0.0) > 0.10)
+    feat["i_higher_dynamic_rank"] = float(feat.get("rank_composite_dynamic_signed_gap_j_minus_i", 0.0) < -0.10)
+    feat["dynamic_rank_abs_gap"] = abs(feat.get("rank_composite_dynamic_signed_gap_j_minus_i", 0.0))
+
+    # Current-origin promo interaction: promotion can temporarily lift rank.
+    feat["i_promo_current"] = float(row_i.get("ind_promotion_current", 0.0))
+    feat["j_promo_current"] = float(row_j.get("ind_promotion_current", 0.0))
+    feat["j_promo_i_not_current"] = float(feat["j_promo_current"] > 0.5 and feat["i_promo_current"] <= 0.5)
+    feat["both_promo_current"] = float(feat["j_promo_current"] > 0.5 and feat["i_promo_current"] > 0.5)
 
     # interactions important for competitive pressure
     feat["stronger_top10_competitor"] = float(feat["j_top10_i_not"] * feat["j_stronger_funnel"])
@@ -541,6 +724,28 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
     return 0
 
 
+
+def _future_rank_map(profile_df, future_dict):
+    """Compute future label-window within-category rank for diagnostics/training target."""
+    if profile_df is None or profile_df.empty:
+        return {}
+    tmp = profile_df[["asin", "category_code"]].copy()
+    vals = []
+    for asin in tmp["asin"].astype(str).values:
+        fut = future_dict.get(asin, None)
+        if fut is None:
+            vals.append(0.0)
+        else:
+            vals.append(float(np.log1p(
+                fut.get("total_sum", 0.0) +
+                fut.get("buybox_sum", 0.0) +
+                fut.get("instock_sum", 0.0) +
+                fut.get("demand_sum", 0.0)
+            )))
+    tmp["future_strength"] = vals
+    tmp["future_cat_rank"] = tmp.groupby("category_code")["future_strength"].transform(_safe_percentile_rank)
+    return tmp.set_index("asin")[["future_strength", "future_cat_rank"]].to_dict("index")
+
 def build_dynamic_pair_dataset(
     df,
     origin_weeks=None,
@@ -579,10 +784,13 @@ def build_dynamic_pair_dataset(
         if prof.empty:
             continue
         prof["origin_week"] = origin
+        # Add dynamic category rank / magnitude hierarchy priors for this origin.
+        prof = _add_category_dynamic_ranks(prof)
         profile_rows.append(prof)
         asin_set = set(prof["asin"].astype(str))
         seqs = _get_recent_sequences(df, origin, asin_set, lookback_weeks=lookback_weeks)
         fut = _future_profile(df, origin, asin_set, label_horizon=label_horizon)
+        fut_rank = _future_rank_map(prof, fut)
 
         prof_idx = prof.set_index("asin")
         cat_counts = prof["category_code"].value_counts()
@@ -614,6 +822,16 @@ def build_dynamic_pair_dataset(
                 rj = prof_idx.loc[b]
                 ef = _edge_features(ri, rj, seqs.get(a), seqs.get(b))
                 y = _weak_relation_label(ef, fut.get(a), fut.get(b))
+                fri = fut_rank.get(a, {"future_strength": 0.0, "future_cat_rank": 0.5})
+                frj = fut_rank.get(b, {"future_strength": 0.0, "future_cat_rank": 0.5})
+                future_rank_gap = float(frj.get("future_cat_rank", 0.5) - fri.get("future_cat_rank", 0.5))
+                if future_rank_gap > 0.15:
+                    rank_label, rank_label_name = 1, "j_higher"
+                elif future_rank_gap < -0.15:
+                    rank_label, rank_label_name = 2, "i_higher"
+                else:
+                    rank_label, rank_label_name = 0, "close_rank"
+
                 row = {
                     "origin_week": origin,
                     "asin_i": a,
@@ -621,14 +839,27 @@ def build_dynamic_pair_dataset(
                     "category_code": cat,
                     "label": int(y),
                     "label_name": {0: "neutral", 1: "competitive", 2: "positive"}[int(y)],
+                    "rank_label": int(rank_label),
+                    "rank_label_name": rank_label_name,
+                    "future_strength_i": float(fri.get("future_strength", 0.0)),
+                    "future_strength_j": float(frj.get("future_strength", 0.0)),
+                    "future_cat_rank_i": float(fri.get("future_cat_rank", 0.5)),
+                    "future_cat_rank_j": float(frj.get("future_cat_rank", 0.5)),
+                    "future_rank_gap_j_minus_i": future_rank_gap,
                     "hbt_i": ri["hbt"],
                     "hbt_j": rj["hbt"],
                     "top10_i": ri["ind_top10_brand"],
                     "top10_j": rj["ind_top10_brand"],
                     "funnel_strength_i": ri["funnel_strength"],
                     "funnel_strength_j": rj["funnel_strength"],
-                    "log_list_price_i": ri.get("log_list_price_mean", ri.get("log_price_mean", 0.0)),
-                    "log_list_price_j": rj.get("log_list_price_mean", rj.get("log_price_mean", 0.0)),
+                    "dynamic_rank_i": ri.get("cat_rank_composite_dynamic", 0.5),
+                    "dynamic_rank_j": rj.get("cat_rank_composite_dynamic", 0.5),
+                    "dynamic_strength_raw_i": ri.get("dynamic_strength_raw", 0.0),
+                    "dynamic_strength_raw_j": rj.get("dynamic_strength_raw", 0.0),
+                    "ind_promotion_current_i": ri.get("ind_promotion_current", 0.0),
+                    "ind_promotion_current_j": rj.get("ind_promotion_current", 0.0),
+                    "log_list_price_i": ri.get("log_list_price_current", ri.get("log_list_price_mean", ri.get("log_price_mean", 0.0))),
+                    "log_list_price_j": rj.get("log_list_price_current", rj.get("log_list_price_mean", rj.get("log_price_mean", 0.0))),
                     "promo_rate_i": ri.get("promo_rate", 0.0),
                     "promo_rate_j": rj.get("promo_rate", 0.0),
                     "promo_response_i": ri.get("promo_response_strength", 0.0),
@@ -698,7 +929,11 @@ def train_relation_classifier(pair_df, epochs=30, batch_size=512, lr=1e-3, seed=
         raise ValueError("pair_df is empty")
 
     # feature columns: numeric only, excluding IDs/labels
-    exclude = {"origin_week", "asin_i", "asin_j", "category_code", "label", "label_name", "hbt_i", "hbt_j"}
+    exclude = {
+        "origin_week", "asin_i", "asin_j", "category_code", "label", "label_name", "hbt_i", "hbt_j",
+        "rank_label", "rank_label_name",
+        "future_strength_i", "future_strength_j", "future_cat_rank_i", "future_cat_rank_j", "future_rank_gap_j_minus_i",
+    }
     feat_cols = [c for c in pair_df.columns if c not in exclude and pd.api.types.is_numeric_dtype(pair_df[c])]
     df = pair_df.copy()
     for c in feat_cols:
@@ -817,9 +1052,242 @@ def train_relation_classifier(pair_df, epochs=30, batch_size=512, lr=1e-3, seed=
     }
 
 
+
+
+def train_pairwise_rank_classifier(pair_df, epochs=30, batch_size=512, lr=1e-3, seed=42, verbose=True):
+    """
+    Separate pairwise magnitude hierarchy test.
+
+    Target:
+      0 = close_rank
+      1 = asin_j should rank higher than asin_i in the future label window
+      2 = asin_i should rank higher than asin_j in the future label window
+
+    Input uses only history/current-known dynamic rank features, not future rank columns.
+    """
+    if pair_df.empty:
+        raise ValueError("pair_df is empty")
+    if "rank_label" not in pair_df.columns:
+        raise ValueError("pair_df must contain rank_label")
+
+    exclude = {
+        "origin_week", "asin_i", "asin_j", "category_code", "label", "label_name", "hbt_i", "hbt_j",
+        "rank_label", "rank_label_name",
+        "future_strength_i", "future_strength_j", "future_cat_rank_i", "future_cat_rank_j", "future_rank_gap_j_minus_i",
+    }
+    feat_cols = [c for c in pair_df.columns if c not in exclude and pd.api.types.is_numeric_dtype(pair_df[c])]
+    df = pair_df.copy()
+    for c in feat_cols:
+        df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    origins = sorted(pd.to_datetime(df["origin_week"].unique()))
+    if len(origins) >= 3:
+        split = int(len(origins) * 0.75)
+        train_origins = set(origins[:split])
+        test_origins = set(origins[split:])
+        tr = df[pd.to_datetime(df["origin_week"]).isin(train_origins)].copy()
+        te = df[pd.to_datetime(df["origin_week"]).isin(test_origins)].copy()
+    else:
+        tr = df.sample(frac=0.75, random_state=seed)
+        te = df.drop(tr.index)
+
+    def _balanced_by_rank(d, max_per_class=60000, seed0=42):
+        parts = []
+        for lab, g in d.groupby("rank_label"):
+            if len(g) > max_per_class:
+                parts.append(g.sample(n=max_per_class, random_state=seed0 + int(lab)))
+            else:
+                parts.append(g)
+        return pd.concat(parts, ignore_index=True).sample(frac=1.0, random_state=seed0).reset_index(drop=True)
+
+    tr = _balanced_by_rank(tr, max_per_class=60000, seed0=seed)
+    te = _balanced_by_rank(te, max_per_class=60000, seed0=seed + 1)
+
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(tr[feat_cols].values.astype(float))
+    Xte = scaler.transform(te[feat_cols].values.astype(float))
+    ytr = tr["rank_label"].values.astype(int)
+    yte = te["rank_label"].values.astype(int)
+
+    tr_ds = PairRelationDataset(Xtr, ytr)
+    te_ds = PairRelationDataset(Xte, yte)
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
+    te_ld = DataLoader(te_ds, batch_size=batch_size, shuffle=False)
+
+    model = EdgeAwareRelationClassifier(input_dim=Xtr.shape[1], n_classes=3).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    counts = np.bincount(ytr, minlength=3).astype(float)
+    weights = counts.sum() / np.maximum(counts, 1.0)
+    weights = weights / weights.mean()
+    class_weight = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+
+    best_sd, best_f1 = None, -1
+    for ep in range(epochs):
+        model.train()
+        losses = []
+        for xb, yb in tr_ld:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+            logits = model(xb)
+            loss = F.cross_entropy(logits, yb, weight=class_weight)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            opt.step()
+            losses.append(loss.item())
+
+        model.eval()
+        preds, ys = [], []
+        with torch.no_grad():
+            for xb, yb in te_ld:
+                pr = torch.softmax(model(xb.to(DEVICE)), dim=-1).cpu().numpy()
+                preds.append(np.argmax(pr, axis=1))
+                ys.append(yb.numpy())
+        preds = np.concatenate(preds)
+        ys = np.concatenate(ys)
+        f1 = f1_score(ys, preds, average="macro")
+        if f1 > best_f1:
+            best_f1 = f1
+            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if verbose and (ep == 0 or (ep + 1) % 5 == 0 or ep == epochs - 1):
+            acc = accuracy_score(ys, preds)
+            print(f"[rank] Epoch {ep+1:03d} | train_loss={np.mean(losses):.4f} | test_acc={acc:.4f} | macro_f1={f1:.4f}")
+
+    if best_sd is not None:
+        model.load_state_dict(best_sd)
+
+    Xall = scaler.transform(df[feat_cols].values.astype(float))
+    all_ld = DataLoader(PairRelationDataset(Xall, df["rank_label"].values.astype(int)), batch_size=batch_size, shuffle=False)
+    model.eval()
+    all_probs = []
+    with torch.no_grad():
+        for xb, _ in all_ld:
+            all_probs.append(torch.softmax(model(xb.to(DEVICE)), dim=-1).cpu().numpy())
+    all_probs = np.concatenate(all_probs)
+
+    scored = df.copy()
+    scored["score_close_rank"] = all_probs[:, 0]
+    scored["score_j_higher"] = all_probs[:, 1]
+    scored["score_i_higher"] = all_probs[:, 2]
+    scored["pred_rank_label"] = np.argmax(all_probs, axis=1)
+    scored["pred_rank_label_name"] = scored["pred_rank_label"].map({0: "close_rank", 1: "j_higher", 2: "i_higher"})
+
+    Xte2 = scaler.transform(te[feat_cols].values.astype(float))
+    with torch.no_grad():
+        pte = torch.softmax(model(torch.tensor(Xte2, dtype=torch.float32, device=DEVICE)), dim=-1).cpu().numpy()
+    pred_te = np.argmax(pte, axis=1)
+    report = classification_report(yte, pred_te, target_names=["close_rank", "j_higher", "i_higher"], output_dict=True, zero_division=0)
+    cm = confusion_matrix(yte, pred_te, labels=[0, 1, 2])
+
+    return {
+        "rank_model": model,
+        "rank_scaler": scaler,
+        "rank_feature_cols": feat_cols,
+        "rank_scored_pair_df": scored,
+        "rank_heldout_report": report,
+        "rank_confusion_matrix": cm,
+        "rank_best_macro_f1": best_f1,
+    }
+
 # -----------------------------
 # Diagnostics
 # -----------------------------
+
+
+def diagnose_dynamic_rank_scores(rank_scored_pair_df, profile_df=None, top_n=30, verbose=True):
+    df = rank_scored_pair_df.copy()
+
+    rank_summary = (
+        df.groupby("pred_rank_label_name")
+        .agg(
+            n_pairs=("asin_i", "size"),
+            mean_score_j_higher=("score_j_higher", "mean"),
+            mean_score_i_higher=("score_i_higher", "mean"),
+            mean_future_rank_gap=("future_rank_gap_j_minus_i", "mean"),
+            mean_dynamic_rank_gap=("rank_composite_dynamic_signed_gap_j_minus_i", "mean") if "rank_composite_dynamic_signed_gap_j_minus_i" in df.columns else ("score_j_higher", "mean"),
+            mean_dynamic_rank_abs_gap=("dynamic_rank_abs_gap", "mean") if "dynamic_rank_abs_gap" in df.columns else ("score_j_higher", "mean"),
+            mean_j_promo_current=("j_promo_current", "mean") if "j_promo_current" in df.columns else ("score_j_higher", "mean"),
+            mean_i_promo_current=("i_promo_current", "mean") if "i_promo_current" in df.columns else ("score_i_higher", "mean"),
+        )
+        .reset_index()
+        .sort_values("n_pairs", ascending=False)
+    )
+
+    by_origin = (
+        df.groupby("origin_week")
+        .agg(
+            n_pairs=("asin_i", "size"),
+            j_higher_rate=("pred_rank_label", lambda x: float(np.mean(np.asarray(x)==1))),
+            i_higher_rate=("pred_rank_label", lambda x: float(np.mean(np.asarray(x)==2))),
+            close_rank_rate=("pred_rank_label", lambda x: float(np.mean(np.asarray(x)==0))),
+            avg_score_j_higher=("score_j_higher", "mean"),
+            avg_score_i_higher=("score_i_higher", "mean"),
+        )
+        .reset_index()
+    )
+
+    top_j = df.sort_values("score_j_higher", ascending=False).head(top_n)
+    top_i = df.sort_values("score_i_higher", ascending=False).head(top_n)
+
+    corr_cols = [c for c in [
+        "rank_composite_dynamic_signed_gap_j_minus_i", "dynamic_rank_abs_gap",
+        "rank_recent13_total_signed_gap_j_minus_i", "rank_recent13_buybox_signed_gap_j_minus_i",
+        "rank_recent13_instock_signed_gap_j_minus_i", "rank_recent13_demand_signed_gap_j_minus_i",
+        "rank_momentum_signed_gap_j_minus_i", "rank_promo_boost_signed_gap_j_minus_i", "rank_zero_good_signed_gap_j_minus_i",
+        "j_promo_current", "i_promo_current", "j_promo_i_not_current", "both_promo_current",
+        "funnel_strength_signed_gap", "active_strength_signed_gap",
+        "promo_response_signed_gap_j_minus_i", "log_list_price_signed_gap_j_minus_i",
+    ] if c in df.columns]
+    corr_rows = []
+    for c in corr_cols:
+        for score in ["score_j_higher", "score_i_higher"]:
+            corr_rows.append({"feature": c, "score": score, "corr": _corr_aligned(df[c].values, df[score].values)})
+    rank_score_feature_corr = pd.DataFrame(corr_rows).sort_values(["score", "corr"], ascending=[True, False])
+
+    top_ranked_asins = pd.DataFrame()
+    if profile_df is not None and not profile_df.empty and "cat_rank_composite_dynamic" in profile_df.columns:
+        cols = [c for c in [
+            "origin_week", "asin", "category_code", "cat_rank_composite_dynamic",
+            "cat_rank_recent13_total", "cat_rank_recent13_buybox", "cat_rank_recent13_instock", "cat_rank_recent13_demand",
+            "cat_rank_momentum", "cat_rank_promo_boost", "cat_rank_zero_good",
+            "dynamic_strength_raw", "ind_promotion_current", "promo_response_strength", "hbt", "ind_top10_brand",
+            "total_log_recent13_mean", "buybox_log_recent13_mean", "instock_log_recent13_mean", "demand_log_recent13_mean",
+            "instock_recent13_zero_rate", "buybox_recent13_zero_rate", "demand_recent13_zero_rate",
+        ] if c in profile_df.columns]
+        top_ranked_asins = profile_df.sort_values(["origin_week", "category_code", "cat_rank_composite_dynamic"], ascending=[True, True, False])[cols].groupby(["origin_week", "category_code"]).head(5).reset_index(drop=True)
+
+    if verbose:
+        print("\n=== Dynamic magnitude-rank prediction summary ===")
+        print(rank_summary.to_string(index=False))
+        print("\n=== Rank by origin week ===")
+        print(by_origin.tail(10).to_string(index=False))
+        print("\n=== Rank score feature correlations ===")
+        print(rank_score_feature_corr.head(30).to_string(index=False))
+        preview_cols = [c for c in [
+            "origin_week", "asin_i", "asin_j", "category_code", "score_j_higher", "score_i_higher", "score_close_rank",
+            "dynamic_rank_i", "dynamic_rank_j", "rank_composite_dynamic_signed_gap_j_minus_i",
+            "future_cat_rank_i", "future_cat_rank_j", "future_rank_gap_j_minus_i",
+            "i_promo_current", "j_promo_current", "funnel_strength_i", "funnel_strength_j",
+            "hbt_i", "hbt_j", "top10_i", "top10_j"
+        ] if c in df.columns]
+        print("\n=== Top pairs where ASIN_j should rank higher ===")
+        print(top_j[preview_cols].head(10).to_string(index=False))
+        print("\n=== Top pairs where ASIN_i should rank higher ===")
+        print(top_i[preview_cols].head(10).to_string(index=False))
+        if not top_ranked_asins.empty:
+            print("\n=== Top dynamic-ranked ASINs per category/origin preview ===")
+            print(top_ranked_asins.head(20).to_string(index=False))
+
+    return {
+        "rank_summary": rank_summary,
+        "rank_by_origin": by_origin,
+        "top_j_higher_pairs": top_j,
+        "top_i_higher_pairs": top_i,
+        "rank_score_feature_corr": rank_score_feature_corr,
+        "top_ranked_asins": top_ranked_asins,
+    }
+
 
 def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
     df = scored_pair_df.copy()
@@ -940,9 +1408,14 @@ def run_dynamic_gat_relation_test_scot5000(
     if pair_df.empty:
         raise ValueError("No pair data constructed. Check category sizes / history length / data columns.")
 
-    print("\nPair label distribution:")
+    print("\nPair relation label distribution:")
     print(pair_df["label_name"].value_counts().to_string())
+    print("\nPair dynamic-rank label distribution:")
+    print(pair_df["rank_label_name"].value_counts().to_string())
 
+    print("\n" + "=" * 80)
+    print("TRAIN RELATION CLASSIFIER: neutral / competitive / positive")
+    print("=" * 80)
     train_out = train_relation_classifier(
         pair_df,
         epochs=epochs,
@@ -952,15 +1425,34 @@ def run_dynamic_gat_relation_test_scot5000(
     )
     diag = diagnose_relation_scores(train_out["scored_pair_df"], verbose=True)
 
-    print("\nHeldout report:")
+    print("\nRelation heldout report:")
     print(pd.DataFrame(train_out["heldout_report"]).T.to_string())
-    print("\nConfusion matrix [neutral, competitive, positive]:")
+    print("\nRelation confusion matrix [neutral, competitive, positive]:")
     print(train_out["confusion_matrix"])
+
+    print("\n" + "=" * 80)
+    print("TRAIN PAIRWISE DYNAMIC MAGNITUDE-RANK CLASSIFIER")
+    print("Classes: close_rank / asin_j higher / asin_i higher")
+    print("=" * 80)
+    rank_out = train_pairwise_rank_classifier(
+        pair_df,
+        epochs=epochs,
+        batch_size=batch_size,
+        seed=seed,
+        verbose=True,
+    )
+    rank_diag = diagnose_dynamic_rank_scores(rank_out["rank_scored_pair_df"], profile_df=profile_df, verbose=True)
+
+    print("\nRank heldout report:")
+    print(pd.DataFrame(rank_out["rank_heldout_report"]).T.to_string())
+    print("\nRank confusion matrix [close_rank, j_higher, i_higher]:")
+    print(rank_out["rank_confusion_matrix"])
 
     return {
         "joint_df": df,
         "profile_df": profile_df,
         "pair_df": pair_df,
+
         "model": train_out["model"],
         "scaler": train_out["scaler"],
         "feature_cols": train_out["feature_cols"],
@@ -973,6 +1465,19 @@ def run_dynamic_gat_relation_test_scot5000(
         "category_relation_summary": diag["by_category"],
         "origin_relation_summary": diag["by_origin"],
         "score_feature_corr": diag["score_feature_corr"],
+
+        "rank_model": rank_out["rank_model"],
+        "rank_scaler": rank_out["rank_scaler"],
+        "rank_feature_cols": rank_out["rank_feature_cols"],
+        "rank_scored_pair_df": rank_out["rank_scored_pair_df"],
+        "rank_heldout_report": rank_out["rank_heldout_report"],
+        "rank_confusion_matrix": rank_out["rank_confusion_matrix"],
+        "rank_diagnostics": rank_diag,
+        "top_j_higher_pairs": rank_diag["top_j_higher_pairs"],
+        "top_i_higher_pairs": rank_diag["top_i_higher_pairs"],
+        "top_ranked_asins": rank_diag["top_ranked_asins"],
+        "rank_origin_summary": rank_diag["rank_by_origin"],
+        "rank_score_feature_corr": rank_diag["rank_score_feature_corr"],
     }
 
 
@@ -980,7 +1485,7 @@ def run_dynamic_gat_relation_test_scot5000(
 # FINAL USAGE ONLY
 # ============================================================
 # In Jupyter, run this file after data_raw1 and scot_df exist:
-# %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK_PROMO_PRICE_v2.py
+# %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v3.py
 #
 # Then run:
 #
@@ -998,6 +1503,10 @@ def run_dynamic_gat_relation_test_scot5000(
 # )
 #
 # scored_pair_df = dynamic_gat_relation_result["scored_pair_df"]
+# rank_scored_pair_df = dynamic_gat_relation_result["rank_scored_pair_df"]
+# top_ranked_asins = dynamic_gat_relation_result["top_ranked_asins"]
+# top_j_higher_pairs = dynamic_gat_relation_result["top_j_higher_pairs"]
+# top_i_higher_pairs = dynamic_gat_relation_result["top_i_higher_pairs"]
 # top_positive_pairs = dynamic_gat_relation_result["top_positive_pairs"]
 # top_competitive_pairs = dynamic_gat_relation_result["top_competitive_pairs"]
 # category_relation_summary = dynamic_gat_relation_result["category_relation_summary"]
