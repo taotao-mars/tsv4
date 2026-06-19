@@ -13,10 +13,10 @@
 #   - relation classes: positive / competitive / neutral
 #
 # Core features emphasized:
-#   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand
+#   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand, ind_promotion, list_price
 #
 # Usage is at the bottom. Designed for Jupyter:
-#   %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK.py
+#   %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK_PROMO_PRICE_v2.py
 # ============================================================
 
 import warnings
@@ -130,10 +130,21 @@ def _prepare_joint_data(data_raw1, scot_df=None, n_asins=5000, seed=42):
     else:
         out["log_review_count"] = 0.0
 
-    if "our_price" in out.columns:
-        out["log_price"] = np.log1p(_safe_numeric(out["our_price"]).clip(lower=0.0))
+    # price features: prefer list_price for relation learning; keep our_price as fallback/auxiliary
+    if "list_price" in out.columns:
+        out["log_list_price"] = np.log1p(_safe_numeric(out["list_price"]).clip(lower=0.0))
+    elif "our_price" in out.columns:
+        out["log_list_price"] = np.log1p(_safe_numeric(out["our_price"]).clip(lower=0.0))
     else:
-        out["log_price"] = 0.0
+        out["log_list_price"] = 0.0
+
+    if "our_price" in out.columns:
+        out["log_our_price"] = np.log1p(_safe_numeric(out["our_price"]).clip(lower=0.0))
+    else:
+        out["log_our_price"] = out["log_list_price"]
+
+    # backward compatible name used by the earlier version
+    out["log_price"] = out["log_list_price"]
 
     if "ind_promotion" in out.columns:
         out["ind_promotion"] = _safe_numeric(out["ind_promotion"]).clip(0, 1)
@@ -220,13 +231,32 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
         row["ind_top10_brand"] = float(np.nanmax(_safe_numeric(g["ind_top10_brand"]).values))
         row["log_review_last"] = float(g["log_review_count"].iloc[-1])
         row["log_review_mean"] = float(g["log_review_count"].mean())
-        row["log_price_mean"] = float(g["log_price"].mean())
-        row["promo_rate"] = float(g["ind_promotion"].mean())
+        row["log_list_price_mean"] = float(g["log_list_price"].mean())
+        row["log_list_price_last"] = float(g["log_list_price"].iloc[-1])
+        row["log_our_price_mean"] = float(g["log_our_price"].mean())
+        row["log_price_mean"] = row["log_list_price_mean"]
+
+        promo_arr = _safe_numeric(g["ind_promotion"]).values.astype(float)
+        row["promo_rate"] = float(np.mean(promo_arr))
+        row["promo_recent13_rate"] = float(np.mean(promo_arr[-13:])) if len(promo_arr) else 0.0
+        row["promo_ever"] = float(np.max(promo_arr) > 0) if len(promo_arr) else 0.0
         row["prime_rate"] = float(g["ind_prime_week"].mean())
         row["hist_len"] = float(len(g))
 
         for c in SIGNAL_COLS:
             row.update(_series_summary_features(g[c].values, SIGNAL_PREFIX[c]))
+
+        # promotion response: how much demand / exposure lifts during promotion weeks
+        promo_mask = promo_arr > 0.5
+        nonpromo_mask = ~promo_mask
+        for c in SIGNAL_COLS:
+            pfx = SIGNAL_PREFIX[c]
+            vals = np.asarray(g[c].values, dtype=float)
+            promo_mean = float(np.mean(vals[promo_mask])) if np.any(promo_mask) else 0.0
+            nonpromo_mean = float(np.mean(vals[nonpromo_mask])) if np.any(nonpromo_mask) else 0.0
+            row[f"{pfx}_promo_log_mean"] = np.log1p(promo_mean)
+            row[f"{pfx}_nonpromo_log_mean"] = np.log1p(nonpromo_mean)
+            row[f"{pfx}_promo_lift"] = np.log1p(promo_mean) - np.log1p(nonpromo_mean)
 
         # compound strength used for edge construction
         row["funnel_strength"] = (
@@ -234,6 +264,9 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
         ) / 4.0
         row["active_strength"] = (
             row["total_active_rate"] + row["buybox_active_rate"] + row["instock_active_rate"] + row["demand_active_rate"]
+        ) / 4.0
+        row["promo_response_strength"] = (
+            row["total_promo_lift"] + row["buybox_promo_lift"] + row["instock_promo_lift"] + row["demand_promo_lift"]
         ) / 4.0
         rows.append(row)
 
@@ -256,6 +289,8 @@ def _get_recent_sequences(df, origin_week, asins, lookback_weeks=52):
         item = {}
         for c in SIGNAL_COLS:
             item[c] = g[c].reindex(weeks).fillna(0.0).values.astype(float)
+        item["ind_promotion"] = g["ind_promotion"].reindex(weeks).fillna(0.0).values.astype(float)
+        item["log_list_price"] = g["log_list_price"].reindex(weeks).ffill().bfill().fillna(0.0).values.astype(float)
         out[asin] = item
     return out
 
@@ -278,6 +313,31 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     feat["j_is_top10_brand"] = float(row_j["ind_top10_brand"] > 0.5)
     feat["i_is_top10_brand"] = float(row_i["ind_top10_brand"] > 0.5)
     feat["j_top10_i_not"] = float((row_j["ind_top10_brand"] > 0.5) and (row_i["ind_top10_brand"] <= 0.5))
+
+    # list_price / price-tier relation.  Positive pairs usually share price tier;
+    # competitive pairs can have price gaps only when combined with strength / brand gaps.
+    li = float(row_i.get("log_list_price_mean", row_i.get("log_price_mean", 0.0)))
+    lj = float(row_j.get("log_list_price_mean", row_j.get("log_price_mean", 0.0)))
+    feat["log_list_price_abs_gap"] = abs(lj - li)
+    feat["log_list_price_signed_gap_j_minus_i"] = lj - li
+    feat["same_price_tier_soft"] = float(abs(lj - li) <= 0.25)
+    feat["price_tier_gap_large"] = float(abs(lj - li) >= 0.75)
+
+    # promotion-level relation from ASIN profile
+    pi = float(row_i.get("promo_rate", 0.0)); pj = float(row_j.get("promo_rate", 0.0))
+    pri = float(row_i.get("promo_recent13_rate", 0.0)); prj = float(row_j.get("promo_recent13_rate", 0.0))
+    feat["promo_rate_abs_gap"] = abs(pj - pi)
+    feat["promo_recent13_abs_gap"] = abs(prj - pri)
+    feat["same_promo_regime_soft"] = float(abs(pj - pi) <= 0.15 and abs(prj - pri) <= 0.20)
+    feat["j_more_promoted"] = float(pj > pi + 0.20)
+
+    for prefix in ["total", "buybox", "instock", "demand"]:
+        lift_i = float(row_i.get(f"{prefix}_promo_lift", 0.0))
+        lift_j = float(row_j.get(f"{prefix}_promo_lift", 0.0))
+        feat[f"{prefix}_promo_lift_abs_gap"] = abs(lift_j - lift_i)
+        feat[f"{prefix}_promo_lift_signed_gap_j_minus_i"] = lift_j - lift_i
+    feat["promo_response_abs_gap"] = abs(float(row_j.get("promo_response_strength", 0.0)) - float(row_i.get("promo_response_strength", 0.0)))
+    feat["promo_response_signed_gap_j_minus_i"] = float(row_j.get("promo_response_strength", 0.0)) - float(row_i.get("promo_response_strength", 0.0))
 
     # direct DPH/demand gap features
     gap_cols = []
@@ -305,20 +365,63 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     feat["stronger_top10_competitor"] = float(feat["j_top10_i_not"] * feat["j_stronger_funnel"])
     feat["hbt_diff_and_j_stronger"] = float(feat["hbt_diff"] * feat["j_stronger_funnel"])
     feat["brand_diff_and_j_stronger"] = float(feat["top10_brand_diff"] * feat["j_stronger_funnel"])
+    feat["stronger_top10_price_gap"] = float(feat["stronger_top10_competitor"] * feat["log_list_price_abs_gap"])
+    feat["j_promo_stronger_funnel"] = float(feat["j_more_promoted"] * feat["j_stronger_funnel"])
 
-    # historical aligned correlations, if sequences available
+    # historical aligned correlations / active-overlap / promotion co-movement, if sequences available
     if seq_i is not None and seq_j is not None:
+        promo_i = np.asarray(seq_i.get("ind_promotion", []), dtype=float) > 0.5
+        promo_j = np.asarray(seq_j.get("ind_promotion", []), dtype=float) > 0.5
+        if len(promo_i) == len(promo_j) and len(promo_i) > 0:
+            feat["promo_overlap_rate"] = float(np.mean(promo_i & promo_j))
+            feat["promo_i_only_rate"] = float(np.mean(promo_i & (~promo_j)))
+            feat["promo_j_only_rate"] = float(np.mean((~promo_i) & promo_j))
+            feat["promo_any_overlap_jaccard"] = float(np.sum(promo_i & promo_j) / (np.sum(promo_i | promo_j) + 1e-6))
+        else:
+            feat["promo_overlap_rate"] = 0.0
+            feat["promo_i_only_rate"] = 0.0
+            feat["promo_j_only_rate"] = 0.0
+            feat["promo_any_overlap_jaccard"] = 0.0
+
         for c in SIGNAL_COLS:
             p = SIGNAL_PREFIX[c]
-            corr = _corr_aligned(seq_i.get(c, []), seq_j.get(c, []))
+            xi = np.asarray(seq_i.get(c, []), dtype=float)
+            xj = np.asarray(seq_j.get(c, []), dtype=float)
+            corr = _corr_aligned(xi, xj)
             feat[f"hist_corr_{p}"] = corr
             feat[f"hist_neg_corr_{p}"] = max(0.0, -corr)
             feat[f"hist_pos_corr_{p}"] = max(0.0, corr)
+            if len(xi) == len(xj) and len(xi) > 0:
+                ai = xi > 0; aj = xj > 0
+                feat[f"active_overlap_{p}"] = float(np.mean(ai & aj))
+                feat[f"zero_overlap_{p}"] = float(np.mean((~ai) & (~aj)))
+                feat[f"active_jaccard_{p}"] = float(np.sum(ai & aj) / (np.sum(ai | aj) + 1e-6))
+                # promotion stealing proxy: j is promoted and strong while i is weak
+                if len(promo_j) == len(xi):
+                    j_promo = promo_j
+                    j_high = xj > (np.quantile(xj, 0.75) + 1e-9)
+                    i_low = xi <= (np.quantile(xi, 0.50) + 1e-9)
+                    feat[f"promo_steal_j_to_i_{p}"] = float(np.mean(j_promo & j_high & i_low))
+                else:
+                    feat[f"promo_steal_j_to_i_{p}"] = 0.0
+            else:
+                feat[f"active_overlap_{p}"] = 0.0
+                feat[f"zero_overlap_{p}"] = 0.0
+                feat[f"active_jaccard_{p}"] = 0.0
+                feat[f"promo_steal_j_to_i_{p}"] = 0.0
     else:
         for p in ["total", "buybox", "instock", "demand"]:
             feat[f"hist_corr_{p}"] = 0.0
             feat[f"hist_neg_corr_{p}"] = 0.0
             feat[f"hist_pos_corr_{p}"] = 0.0
+            feat[f"active_overlap_{p}"] = 0.0
+            feat[f"zero_overlap_{p}"] = 0.0
+            feat[f"active_jaccard_{p}"] = 0.0
+            feat[f"promo_steal_j_to_i_{p}"] = 0.0
+        feat["promo_overlap_rate"] = 0.0
+        feat["promo_i_only_rate"] = 0.0
+        feat["promo_j_only_rate"] = 0.0
+        feat["promo_any_overlap_jaccard"] = 0.0
 
     # compact totals
     feat["mean_abs_gap_all"] = float(np.mean(gap_cols)) if gap_cols else 0.0
@@ -352,13 +455,15 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
     if fut_i is None or fut_j is None:
         # fallback based on historical edge features only
         pos_like = (
-            edge_feat.get("mean_abs_gap_all", 9) < 0.45 and
+            edge_feat.get("mean_abs_gap_all", 9) < 0.55 and
             edge_feat.get("same_hbt", 0) > 0.5 and
-            edge_feat.get("same_top10_brand", 0) > 0.5
+            edge_feat.get("same_top10_brand", 0) > 0.5 and
+            edge_feat.get("same_price_tier_soft", 0) > 0.5 and
+            edge_feat.get("same_promo_regime_soft", 0) > 0.5
         )
         comp_like = (
             edge_feat.get("j_stronger_funnel", 0) > 0.5 and
-            (edge_feat.get("hbt_diff", 0) > 0.5 or edge_feat.get("top10_brand_diff", 0) > 0.5) and
+            (edge_feat.get("hbt_diff", 0) > 0.5 or edge_feat.get("top10_brand_diff", 0) > 0.5 or edge_feat.get("stronger_top10_competitor", 0) > 0.5) and
             edge_feat.get("funnel_strength_abs_gap", 0) > 0.6
         )
         return 2 if pos_like else (1 if comp_like else 0)
@@ -377,23 +482,53 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
     abs_strength_gap = abs(strength_gap)
     both_active = float((fut_i["instock_active_rate"] > 0) and (fut_j["instock_active_rate"] > 0))
 
-    # positive: similar future movement + similar scale + same hbt/top10 usually
-    positive = (
-        mean_pos_corr >= 0.35 and
-        abs_strength_gap <= 0.75 and
-        both_active > 0 and
-        edge_feat.get("mean_abs_gap_all", 9) <= 0.75
-    ) or (
-        edge_feat.get("mean_abs_gap_all", 9) <= 0.35 and
+    # Positive: not all same-category pairs are positive.  A positive pair should look
+    # similar historically in demand + exposure funnel, and usually share hbt/top10/price/promo regime.
+    hist_level_close = edge_feat.get("mean_abs_gap_all", 9) <= 0.65
+    product_regime_close = (
         edge_feat.get("same_hbt", 0) > 0.5 and
-        edge_feat.get("same_top10_brand", 0) > 0.5
+        edge_feat.get("same_top10_brand", 0) > 0.5 and
+        edge_feat.get("same_price_tier_soft", 0) > 0.5 and
+        edge_feat.get("same_promo_regime_soft", 0) > 0.5
+    )
+    active_overlap_good = np.mean([
+        edge_feat.get("active_jaccard_total", 0),
+        edge_feat.get("active_jaccard_buybox", 0),
+        edge_feat.get("active_jaccard_instock", 0),
+        edge_feat.get("active_jaccard_demand", 0),
+    ]) >= 0.20
+    promo_similar = edge_feat.get("promo_any_overlap_jaccard", 0) >= 0.20 or edge_feat.get("same_promo_regime_soft", 0) > 0.5
+
+    positive = (
+        hist_level_close and
+        product_regime_close and
+        both_active > 0 and
+        abs_strength_gap <= 0.85 and
+        (mean_pos_corr >= 0.20 or active_overlap_good or promo_similar)
     )
 
-    # competitive: same category pair with clear strong/weak contrast, often hbt/top10 diff
+    # Competitive: same category, clear strong/weak contrast, often top-brand/head/HBT/price/promo response gap.
+    promo_steal = np.mean([
+        edge_feat.get("promo_steal_j_to_i_total", 0),
+        edge_feat.get("promo_steal_j_to_i_buybox", 0),
+        edge_feat.get("promo_steal_j_to_i_instock", 0),
+        edge_feat.get("promo_steal_j_to_i_demand", 0),
+    ])
+    dominant_neighbor = (
+        edge_feat.get("j_stronger_funnel", 0) > 0.5 or
+        edge_feat.get("stronger_top10_competitor", 0) > 0.5 or
+        edge_feat.get("j_promo_stronger_funnel", 0) > 0.5
+    )
+    regime_contrast = (
+        edge_feat.get("hbt_diff", 0) > 0.5 or
+        edge_feat.get("top10_brand_diff", 0) > 0.5 or
+        edge_feat.get("price_tier_gap_large", 0) > 0.5 or
+        edge_feat.get("promo_response_abs_gap", 0) > 0.50
+    )
     competitive = (
-        abs_strength_gap >= 1.00 and
-        (edge_feat.get("hbt_diff", 0) > 0.5 or edge_feat.get("top10_brand_diff", 0) > 0.5 or edge_feat.get("stronger_top10_competitor", 0) > 0.5) and
-        (mean_neg_corr >= 0.10 or edge_feat.get("funnel_strength_abs_gap", 0) >= 0.75)
+        dominant_neighbor and
+        regime_contrast and
+        (abs_strength_gap >= 1.00 or edge_feat.get("funnel_strength_abs_gap", 0) >= 0.75 or promo_steal >= 0.10 or mean_neg_corr >= 0.10)
     )
 
     if competitive and not positive:
@@ -492,6 +627,12 @@ def build_dynamic_pair_dataset(
                     "top10_j": rj["ind_top10_brand"],
                     "funnel_strength_i": ri["funnel_strength"],
                     "funnel_strength_j": rj["funnel_strength"],
+                    "log_list_price_i": ri.get("log_list_price_mean", ri.get("log_price_mean", 0.0)),
+                    "log_list_price_j": rj.get("log_list_price_mean", rj.get("log_price_mean", 0.0)),
+                    "promo_rate_i": ri.get("promo_rate", 0.0),
+                    "promo_rate_j": rj.get("promo_rate", 0.0),
+                    "promo_response_i": ri.get("promo_response_strength", 0.0),
+                    "promo_response_j": rj.get("promo_response_strength", 0.0),
                 }
                 row.update(ef)
                 pair_rows.append(row)
@@ -733,6 +874,11 @@ def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
         "same_hbt", "same_top10_brand", "top10_brand_diff", "stronger_top10_competitor",
         "hist_corr_total", "hist_corr_buybox", "hist_corr_instock", "hist_corr_demand",
         "funnel_strength_abs_gap", "active_strength_abs_gap",
+        "log_list_price_abs_gap", "same_price_tier_soft", "price_tier_gap_large",
+        "promo_rate_abs_gap", "promo_recent13_abs_gap", "same_promo_regime_soft",
+        "promo_overlap_rate", "promo_any_overlap_jaccard", "promo_response_abs_gap",
+        "promo_steal_j_to_i_total", "promo_steal_j_to_i_buybox", "promo_steal_j_to_i_instock", "promo_steal_j_to_i_demand",
+        "active_jaccard_total", "active_jaccard_buybox", "active_jaccard_instock", "active_jaccard_demand",
     ] if c in df.columns]
     corr_rows = []
     for c in corr_cols:
@@ -749,7 +895,7 @@ def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
         print("\n=== Top feature correlations with scores ===")
         print(score_feature_corr.head(30).to_string(index=False))
         print("\n=== Top positive pairs preview ===")
-        cols = [c for c in ["origin_week", "asin_i", "asin_j", "category_code", "score_positive", "score_competitive", "hbt_i", "hbt_j", "top10_i", "top10_j", "same_hbt", "same_top10_brand", "total_log_q90_abs_gap", "buybox_log_q90_abs_gap", "instock_log_q90_abs_gap", "demand_log_q90_abs_gap"] if c in top_pos.columns]
+        cols = [c for c in ["origin_week", "asin_i", "asin_j", "category_code", "score_positive", "score_competitive", "hbt_i", "hbt_j", "top10_i", "top10_j", "same_hbt", "same_top10_brand", "log_list_price_abs_gap", "same_price_tier_soft", "promo_rate_abs_gap", "promo_overlap_rate", "promo_response_abs_gap", "total_log_q90_abs_gap", "buybox_log_q90_abs_gap", "instock_log_q90_abs_gap", "demand_log_q90_abs_gap"] if c in top_pos.columns]
         print(top_pos[cols].head(10).to_string(index=False))
         print("\n=== Top competitive pairs preview ===")
         print(top_comp[cols].head(10).to_string(index=False))
@@ -834,7 +980,7 @@ def run_dynamic_gat_relation_test_scot5000(
 # FINAL USAGE ONLY
 # ============================================================
 # In Jupyter, run this file after data_raw1 and scot_df exist:
-# %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK.py
+# %run -i gat_relation_test_scot5000_DYNAMIC_BY_WEEK_PROMO_PRICE_v2.py
 #
 # Then run:
 #
