@@ -1,7 +1,5 @@
-# ============================================================
-# 1. Run exposure model first
-# ============================================================
-# %run -i tcn_exposure_v2_5_categorygraph_direct20_clean.py
+# 1. 先跑 exposure v10
+%run -i exposure_model_only_nb_mu_hats_v2_DYNAMIC_RELATION_GRAPH_v10.py
 
 exposure_result = run_exposure_v2_final_scot_5000(
     data_raw1=data_raw1,
@@ -12,44 +10,39 @@ exposure_result = run_exposure_v2_final_scot_5000(
     patience=6,
     batch_size=128,
 
+    use_encoder_self_attn=True,
     use_graphsage=True,
+    use_graph_gate=True,
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
 
     use_graph_head=False,
-    graph_head_scale=0.05,
+    graph_head_scale=0.03,
 
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
     graph_static_weight=1.0,
     graph_brand_weight=0.3,
-
-    use_encoder_self_attn=True,
 )
 
-exposure_hat_for_demand = exposure_result["exposure_hat_for_demand"].copy()
+# 关键：拿这个 dataframe
+exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
 
 summarize_exposure_hat_for_demand(
     exposure_hat_for_demand,
-    title="DIRECT-20 CLEAN HAT TO PASS INTO DEMAND",
+    title="V10 DYNAMIC RELATION GRAPH MU HAT TO PASS INTO DEMAND",
 )
-
-
-# ============================================================
-# 2. Run demand model with ALL 3 predicted exposure variables
-# ============================================================
-# %run -i demand_external_exposure3_clean_3modes.py
 
 demand_result_all3 = run_demand_with_predicted_exposure_all3(
     data_raw1=data_raw1,
     scot_df=scot_df,
     exposure_result_or_hat=exposure_hat_for_demand,
     n_asins=5000,
+    epochs=60,
     history=52,
     horizon=20,
-    epochs=60,
     batch_size=64,
     M_eval=100,
 )
