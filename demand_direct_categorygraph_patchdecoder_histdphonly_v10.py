@@ -1,526 +1,1989 @@
-"""
-Clean demand model with external predicted exposure hats only.
+# VERSION V7: category-only graph + GL static + optional small graph-delta head + ASIN 20w sum loss.
+# V5: adds historical DEMAND profile features to graph strength / KNN node features / edge scoring.
+# Only consumes data_raw1/scot_df and outputs three exposure hats for downstream demand.
+# SAFE version: renamed generic prepare_data_* functions to prepare_exposure_data_*
+# to avoid namespace collision with demand model functions when using %run -i.
+# ============================================================
+# TCN Exposure Model V3 - SINGLE-HEAD PATCH + MAGNITUDE-AWARE DUAL GRAPH + ASIN-SUM LOSS
+# Patch decoder + long-horizon weighted loss + magnitude-aware positive/competitive graph + compact diagnostics:
+#   - remove two-head p_active^gamma * magnitude combination
+#   - predict log1p(total/buy_box/in_stock DPH) directly with one exposure head
+#   - keep a small auxiliary active head only for diagnostics / representation learning
+#   - keep GL diagnostics and final summary table
+#   - add category_code code/frequency/unknown static features without changing run input API
+#   - add ENN one-z-per-window regime conditioning WITHOUT multiplicative active gate
+#   - add path-level peak/top-k/under-peak losses to protect high exposure regime
+# Purpose: stabilize point exposure forecasts and learn joint 20-week exposure regimes.
+# Long-run balanced preset:
+#   - category_code is kept
+#   - channel-specific zero loss is softened to avoid systematic underprediction
+#   - mean-level penalty is slightly stronger to keep overall ratio near 1
+#   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
+#   - optional dual-relation DualRelationalGAT ASIN graph embedding for exposure/click relation modeling
+#     positive edges capture co-movement / similar products
+#     competitive edges capture same-category attention competition
+#     node/edge features include GL/category + hbt + ind_top10_brand + customer_active_review_count
+#       + zero/peak/transition history
 
-No internal exposure decoder.
-No true future DPH is used as demand input.
-Supported exposure modes:
-  - instock_only
-  - buybox_only
-  - all3
-"""
+#
+# 改动：
+#   1. HistoryEncoder 保留全序列输出 [B, 52, D]（原来只取最后一步）
+#   2. Decoder 加 Cross-Attention：Q=decoder, K=V=encoder全序列
+#   3. _make_future_context 加 horizon decay，anchor不再是常数
+#   4. exposure_loss 加 Hurdle：BCE(occurrence) + Huber(magnitude)
+#   5. 去掉 TFT / AnchorAttentionBlender / grid_search_blending
+#
+# 不变：
+#   数据加载、ExposureDataset、评估函数、训练loop接口
+#   forward(x, future_context) → log_hat [B, H, 3]
+#   explicit NB sampling inference: mc_reduce="p50"/"nb_sample" uses alpha_head
+# ============================================================
 
+
+# ============================================================
+# V8 GAT PATCH
+# - Keeps category-aware KNN/competitive edge construction unchanged.
+# - Replaces DualGraphSAGE mean aggregation with DualRelationalGAT attention aggregation.
+# - API is backward-compatible: use_graphsage=True now enables the GAT graph encoder.
+# - Recommended first ablation: use_graphsage=True, use_graph_head=False, graph_message_scale=0.03~0.05.
+# ============================================================
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, r2_score
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+
 
 torch.manual_seed(42)
 np.random.seed(42)
 
+# ============================================================
+# GPU / device helpers
+# ============================================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_CUDA = DEVICE.type == "cuda"
+print(f"Using device: {DEVICE}")
+if USE_CUDA:
+    try:
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    except Exception:
+        pass
 
-# =====================================================
-# 0. Sampling
-# =====================================================
+def get_device(device=None):
+    if device is None:
+        return DEVICE
+    return torch.device(device)
 
-def prepare_data_sample(data_raw1, n_asins=5000):
-    data_raw1 = data_raw1.copy()
-    data_raw1["order_week"] = pd.to_datetime(data_raw1["order_week"])
-    sample_asins = np.random.choice(
-        data_raw1["asin"].unique(),
-        size=min(n_asins, data_raw1["asin"].nunique()),
-        replace=False
-    )
-    data_small = data_raw1[data_raw1["asin"].isin(sample_asins)].copy()
-    print("Sample ASINs:", data_small["asin"].nunique())
-    print("Sample rows:", len(data_small))
-    return data_small
+def batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
+
+def dataloader_pin_memory():
+    return bool(USE_CUDA)
 
 
+# ============================================================
+# 原有工具函数（不变）
+# ============================================================
 
-def prepare_data_from_sample_scot_intersection(
-    data_raw1,
-    scot_df,
-    n_asins=5000,
-    seed=42,
+def _safe_numeric(s, fill=0.0):
+    return pd.to_numeric(s, errors="coerce").fillna(fill)
+
+
+def fill_missing_dph_after_scot_merge(df, verbose=True):
+    """
+    Clean exposure DPH targets after sampling / SCOT intersection.
+
+    Business rule: missing DPH means no observed exposure for that ASIN-week,
+    so set missing total_dph / buy_box_dph / in_stock_dph to 0.
+    This is done before extreme filtering and model feature construction so that
+    all downstream zero-rate / GL / category diagnostics are consistent.
+    """
+    out = df.copy()
+    dph_cols = ["total_dph", "buy_box_dph", "in_stock_dph"]
+    existing = [c for c in dph_cols if c in out.columns]
+
+    if verbose and existing:
+        na_before = out[existing].isna().sum()
+
+    for c in existing:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    # Optional but useful: if demand is missing, also treat as zero observed demand.
+    if "fbi_demand" in out.columns:
+        out["fbi_demand"] = pd.to_numeric(out["fbi_demand"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if verbose and existing:
+        na_after = out[existing].isna().sum()
+        filled = (na_before - na_after).astype(int)
+        print("DPH null → 0 after sample/SCOT step:", filled.to_dict())
+
+    return out
+
+def _wape(y, p):
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    return np.sum(np.abs(y - p)) / (np.sum(np.abs(y)) + 1e-8)
+
+def _corr(y, p):
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    if np.std(y) < 1e-8 or np.std(p) < 1e-8:
+        return np.nan
+    return np.corrcoef(y, p)[0, 1]
+
+def _safe_spearman(y, p):
+    y = pd.Series(np.asarray(y, dtype=float)).rank(method="average").values
+    p = pd.Series(np.asarray(p, dtype=float)).rank(method="average").values
+    if np.std(y) < 1e-8 or np.std(p) < 1e-8:
+        return np.nan
+    return float(np.corrcoef(y, p)[0, 1])
+
+def _auc(y_binary, score):
+    try:
+        if len(np.unique(y_binary)) < 2:
+            return np.nan
+        return roc_auc_score(y_binary, score)
+    except Exception:
+        return np.nan
+
+
+# ============================================================
+# 数据加载（不变，完整保留）
+# ============================================================
+
+def prepare_exposure_data_from_sample(
+    data_raw1, scot_df=None, n_asins=5000, seed=42,
 ):
     """
-    Sample ASINs from data_raw1, then keep only ASINs also present in scot_df.
+    直接从data_raw1采样n_asins个ASIN，不再做SCOT intersection。
+
+    原因：SCOT intersection把5000个ASIN压缩到~3000，
+    减少了训练样本量，增加了过拟合风险。
+    现在直接用5000个ASIN，数据量更大，泛化更好。
+
+    scot_df参数保留但不使用，保持接口兼容。
     """
     df = data_raw1.copy()
-    scot = scot_df.copy()
-
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
-    scot["asin"] = scot["asin"].astype(str)
 
     rng = np.random.default_rng(seed)
     unique_asins = df["asin"].dropna().unique()
-
     sample_asins = rng.choice(
         unique_asins,
         size=min(n_asins, len(unique_asins)),
         replace=False,
     )
 
-    sample_asin_set = set(sample_asins)
-    scot_asin_set = set(scot["asin"].dropna().unique())
-    intersect_asins = sorted(sample_asin_set & scot_asin_set)
-
-    print("\n" + "=" * 80)
-    print("SAMPLE-SCOT ASIN INTERSECTION")
-    print("=" * 80)
-    print("Sample ASINs:", len(sample_asin_set))
-    print("SCOT ASINs:", len(scot_asin_set))
-    print("Intersection ASINs:", len(intersect_asins))
-    print("Sample ASINs missing in SCOT:", len(sample_asin_set - scot_asin_set))
-
-    data_small = df[df["asin"].isin(intersect_asins)].copy()
-    sample_asin_df = pd.DataFrame({"asin": list(sample_asins)})
-    intersect_asin_df = pd.DataFrame({"asin": intersect_asins})
-
-    print("Data rows after intersection:", len(data_small))
-    print("Data ASINs after intersection:", data_small["asin"].nunique())
-
-    return data_small, sample_asin_df, intersect_asin_df
-
-
-def add_zero_rate_group(data_raw, zero_thresholds=(0.4, 0.7)):
-    df = data_raw.copy()
-    df["fbi_demand"] = pd.to_numeric(df["fbi_demand"], errors="coerce").fillna(0).clip(lower=0)
-    asin_stats = (
-        df.groupby("asin")
-        .agg(
-            zero_rate=("fbi_demand", lambda x: (x == 0).mean()),
-            total_demand=("fbi_demand", "sum"),
-            n_weeks=("fbi_demand", "count"),
-        )
-        .reset_index()
-    )
-    low, high = zero_thresholds
-    def assign_group(z):
-        if z < low: return "low_sparse"
-        elif z < high: return "mid_sparse"
-        else: return "high_sparse"
-    asin_stats["zero_group"] = asin_stats["zero_rate"].apply(assign_group)
-    df = df.merge(asin_stats[["asin", "zero_rate", "zero_group"]], on="asin", how="left")
-    print("\nASIN counts by zero-rate group:")
-    print(asin_stats.groupby("zero_group")["asin"].nunique().reset_index(name="n_asins"))
-    return df, asin_stats
-
-
-# =====================================================
-# 1. Data loading
-# =====================================================
-
-
-def _infer_pkg_dimension_cols(df):
-    """
-    Infer package height, length, and width columns for package-volume diagnostics.
-    Diagnostic only; not used as model input.
-    """
-    lower_map = {c.lower(): c for c in df.columns}
-
-    candidates = {
-        "height": [
-            "pkg_height", "package_height", "pkg_h", "height",
-            "item_height", "unit_height"
-        ],
-        "length": [
-            "pkg_length", "package_length", "pkg_l", "length",
-            "item_length", "unit_length"
-        ],
-        "width": [
-            "pkg_width", "package_width", "pkg_w", "width",
-            "item_width", "unit_width"
-        ],
-    }
-
-    out = {}
-
-    for dim_name, names in candidates.items():
-        out[dim_name] = None
-        for name in names:
-            if name in lower_map:
-                out[dim_name] = lower_map[name]
-                break
-
+    out = df[df["asin"].isin(set(sample_asins))].copy()
+    out = fill_missing_dph_after_scot_merge(out, verbose=True)
+    print(f"Sampled ASINs: {len(sample_asins)} | Rows: {len(out)}")
     return out
 
 
+# 向后兼容：保留旧函数名
+def prepare_exposure_data_from_sample_scot_intersection(
+    data_raw1, scot_df=None, n_asins=5000, seed=42,
+):
+    return prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
 
-def _get_1d_col(df, col):
+def filter_extreme_asins(data_raw, q=0.99):
+    df = data_raw.copy()
+    stats = (
+        df.groupby("asin")
+        .agg(
+            max_demand=("fbi_demand", "max"),
+            max_total_dph=("total_dph", "max"),
+            max_buy_box_dph=("buy_box_dph", "max"),
+            max_instock_dph=("in_stock_dph", "max"),
+        )
+        .reset_index()
+    )
+    thresholds = {c: stats[c].quantile(q) for c in ["max_demand", "max_total_dph", "max_buy_box_dph", "max_instock_dph"]}
+    keep = stats[
+        (stats["max_demand"] <= thresholds["max_demand"]) &
+        (stats["max_total_dph"] <= thresholds["max_total_dph"]) &
+        (stats["max_buy_box_dph"] <= thresholds["max_buy_box_dph"]) &
+        (stats["max_instock_dph"] <= thresholds["max_instock_dph"])
+    ]["asin"]
+    out = df[df["asin"].isin(set(keep))].copy()
+    print(f"Extreme filter: {df['asin'].nunique()} → {out['asin'].nunique()} ASINs")
+    return out
+
+
+def _encode_static_features(df):
     """
-    Return one 1-D Series even if df has duplicate column names.
+    Static ASIN-level features encoding.
+
+    新增：
+      glance_view_band_cat → /6 归一化（值1-6，完全静态）
+      hbt                  → head=1 / body=0
+      ind_amxl_hb          → binary，直接用
+      sort_type            → /3 归一化
+      ind_new_asin         → binary，直接用
+      ind_amxl_hb          → binary
     """
-    x = df[col]
-    if isinstance(x, pd.DataFrame):
-        x = x.iloc[:, 0]
-    return x
-
-
-
-def _compute_total_dph_cap(df, q=0.995):
-    """
-    Compute a global cap from total_dph.
-
-    For fast experiments, this uses the current modeling dataframe.
-    For a stricter production backtest, compute this cap using training weeks only.
-    """
-    if "total_dph" not in df.columns:
-        return np.inf
-
-    s = pd.to_numeric(df["total_dph"], errors="coerce").fillna(0.0).clip(lower=0)
-
-    if len(s) == 0 or s.sum() <= 0:
-        return np.inf
-
-    cap = float(s.quantile(q))
-
-    if not np.isfinite(cap) or cap <= 0:
-        return np.inf
-
-    return cap
-
-
-def _apply_dph_cap(df, cap):
-    """
-    Apply one total_dph-based cap to total_dph, buy_box_dph, and in_stock_dph.
-    This stabilizes heavy-tailed exposure decoder targets.
-    """
-    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
-            if np.isfinite(cap):
-                df[c] = df[c].clip(upper=cap)
-    return df
-
-
-
-def _select_stock_decoder_extra_cols(data_raw):
-    """
-    Select additional features to help the external exposure covariates.
-
-    These are NOT true future in_stock_dph. They are product / popularity / price / promo
-    / package features that can help predict future exposure.
-
-    We keep a conservative list to avoid leakage-prone realized future outcomes.
-    """
-    candidate_cols = [
-        # Product/category/static identity proxies
-        "gl_product_group",
-        "category_code",
-        "brand_class",
-        "sort_type",
-        "variation",
-        "ind_new_asin",
-        "ind_amxl_hb",
-        "hbt",
-        "ind_target_audience",
-        "ind_top10_brand",
-        "ind_top10_review_brand",
-
-        # Review / popularity proxies.
-        # NOTE: total_dph and buy_box_dph are intentionally excluded here
-        # because future realized traffic / buy-box signals may cause leakage.
-        "cust_avg_active_review_rating",
-        "customer_active_review_count",
-        "customer_average_review_rating",
-        "customer_review_count",
-        "glance_view_band_cat",
-        "hb_rank",
-        "hb_score",
-        "facebook_fan_count",
-        "instagram_fan_count",
-        "twitter_follower_count",
-        "youtube_subscriber_count",
-
-        # Price / promotion
-        "list_price",
-        "price_bands",
-        "ind_promotion",
-        "promotion_amount",
-        "promotion_ratio",
-        "promotion_pricing_amount",
-        "promotion_type",
-        "pricing_type",
-        "asin_promo_start_week",
-        "asin_promo_end_week",
-        "asin_promo_wordcount",
-
-        # Package / AMXL size
-        "pkg_height",
-        "pkg_length",
-        "pkg_width",
-        "pkg_weight",
-
-        # Calendar-ish columns
-        "order_month",
-        "order_year",
-        "week_index",
-        "ind_prime_week",
-    ]
-
-    # Avoid realized target / future outcome columns.
-    exclude_cols = {
-        "fbi_demand",
-        "order_units",
-        "scot_oos",
-        "in_stock_dph",
-        "asin",
-        "order_week",
-    }
-
-    cols = [
-        c for c in candidate_cols
-        if c in data_raw.columns and c not in exclude_cols
-    ]
-
-    return cols
-
-
-def _encode_stock_decoder_extra_features(df, extra_cols):
-    """
-    Convert extra external-exposure related features to numeric features.
-
-    Object/categorical columns are ordinal-encoded by pandas.factorize.
-    This keeps the implementation lightweight and avoids requiring sklearn encoders.
-    """
+    df = df.copy()
     out_cols = []
 
-    for c in extra_cols:
-        new_c = f"stock_extra__{c}"
-
+    # ── 原有：gl_product_group / ind_top10_brand
+    # ── 新增：category_code（细粒度品类；比GL更细，用于zero/seasonality分层）────
+    for c in ["gl_product_group", "category_code", "ind_top10_brand"]:
         if c not in df.columns:
             continue
 
-        if pd.api.types.is_numeric_dtype(df[c]):
-            val = pd.to_numeric(_get_1d_col(df, c), errors="coerce").fillna(0.0)
+        raw = df[c].astype(str).fillna("MISSING").str.strip()
+        raw = raw.replace({"": "MISSING", "nan": "MISSING", "None": "MISSING", "none": "MISSING"})
 
-            # Conservative transforms by feature type.
-            cl = c.lower()
-            if (
-                "count" in cl or "dph" in cl or "price" in cl
-                or "amount" in cl or "rank" in cl or "score" in cl
-                or "height" in cl or "length" in cl or "width" in cl
-                or "weight" in cl or "wordcount" in cl
-            ):
-                val = np.log1p(val.clip(lower=0))
+        # category_code 中 unknown 本身是强信号：catalog缺失/长尾/不稳定。
+        # 保留为单独静态特征，尤其帮助zero判断。
+        if c == "category_code":
+            lower = raw.str.lower()
+            df["stock_static__category_code__is_unknown"] = (
+                lower.isin(["unknown", "missing", "nan", "none", ""] )
+            ).astype(float)
 
-            # Scale robustly to avoid huge values.
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-            mean = float(val.mean())
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
+        codes, uniques = pd.factorize(raw)
+        denom = max(len(uniques) - 1, 1)
+        df[f"stock_static__{c}__code"] = codes.astype(float) / denom
+        freq = raw.value_counts(normalize=True)
+        df[f"stock_static__{c}__freq"] = raw.map(freq).fillna(0.0).astype(float)
+        out_cols.extend([f"stock_static__{c}__code", f"stock_static__{c}__freq"])
 
-        else:
-            codes, uniques = pd.factorize(_get_1d_col(df, c).astype(str).fillna("MISSING"))
-            # normalize category code to roughly [0,1]
-            denom = max(len(uniques) - 1, 1)
-            df[new_c] = codes.astype(float) / denom
+        if c == "category_code":
+            out_cols.append("stock_static__category_code__is_unknown")
 
-        out_cols.append(new_c)
+    # ── 新增：glance_view_band_cat（值1-6，静态）─────────────
+    if "glance_view_band_cat" in df.columns:
+        gv = _safe_numeric(df["glance_view_band_cat"]).clip(1, 6)
+        df["stock_static__glance_view_band__norm"] = gv / 6.0
+        out_cols.append("stock_static__glance_view_band__norm")
+
+    # ── 新增：hbt（head=1 / body=0，静态）────────────────────
+    if "hbt" in df.columns:
+        df["stock_static__hbt__is_head"] = (
+            df["hbt"].astype(str).str.lower().str.strip() == "head"
+        ).astype(float)
+        out_cols.append("stock_static__hbt__is_head")
+
+    # ── 新增：ind_amxl_hb（binary，静态）─────────────────────
+    if "ind_amxl_hb" in df.columns:
+        df["stock_static__ind_amxl_hb"] = _safe_numeric(df["ind_amxl_hb"]).clip(0, 1)
+        out_cols.append("stock_static__ind_amxl_hb")
+
+    # ── 新增：sort_type（1/2/3，静态）────────────────────────
+    if "sort_type" in df.columns:
+        df["stock_static__sort_type__norm"] = (
+            _safe_numeric(df["sort_type"]).clip(1, 3) / 3.0
+        )
+        out_cols.append("stock_static__sort_type__norm")
+
+    # ── 新增：ind_new_asin（binary，静态）────────────────────
+    if "ind_new_asin" in df.columns:
+        df["stock_static__ind_new_asin"] = _safe_numeric(
+            df["ind_new_asin"]
+        ).clip(0, 1)
+        out_cols.append("stock_static__ind_new_asin")
 
     return df, out_cols
 
 
-
-def _safe_numeric(df, col, default=0.0):
-    if col not in df.columns:
-        df[col] = default
-    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
-    return df
+def _event_thanksgiving_date(year):
+    nov = pd.date_range(f"{year}-11-01", f"{year}-11-30", freq="D")
+    return nov[nov.weekday == 3][3]
 
 
-def _rolling_mean(arr, window):
-    return pd.Series(arr).rolling(window, min_periods=1).mean().values
+def _make_event_calendar(min_year, max_year):
+    events = []
+    for y in range(min_year - 1, max_year + 2):
+        tg = _event_thanksgiving_date(y)
+        events += [
+            ("event_NewYear",              pd.Timestamp(f"{y}-01-01")),
+            ("event_PrimeDay_proxy_July",  pd.Timestamp(f"{y}-07-15")),
+            ("event_BackToSchool_proxy",   pd.Timestamp(f"{y}-08-15")),
+            ("event_Thanksgiving",         tg),
+            ("event_BlackFriday",          tg + pd.Timedelta(days=1)),
+            ("event_CyberMonday",          tg + pd.Timedelta(days=4)),
+            ("event_Christmas",            pd.Timestamp(f"{y}-12-25")),
+        ]
+    ev = pd.DataFrame(events, columns=["event_name", "event_date"])
+    ev["event_week"] = ev["event_date"].dt.to_period("W-SUN").apply(lambda r: r.start_time)
+    return ev
 
 
-def _rolling_max(arr, window):
-    return pd.Series(arr).rolling(window, min_periods=1).max().values
-
-
-def _rolling_std(arr, window):
-    return pd.Series(arr).rolling(window, min_periods=2).std().fillna(0).values
-
-
-def _rolling_positive_mean(arr, window):
+def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4):
     """
-    FIX: arr[lo:i] not arr[lo:i+1]
-    Excludes current timestep to prevent data leakage.
+    改动：
+      1. event_window_weeks 2 → 4（大件商品研究周期更长）
+      2. 新增 pre_event_proximity：节假日前连续临近程度
+         exp(-0.15 * weeks_until_event)，越近越大
+      3. 新增 post_event_decay：节假日后连续衰减
+         exp(-0.15 * weeks_since_event)，越远越小
+         解决历史末尾是峰值导致的overbias问题
     """
-    out = np.zeros(len(arr), dtype=np.float32)
-    for i in range(len(arr)):
-        lo = max(0, i - window)
-        vals = arr[lo:i]          # ← FIX: exclude current step
-        vals = vals[vals > 0]
-        out[i] = vals.mean() if len(vals) > 0 else 0.0
-    return out
+    out = df.copy()
+    out[week_col] = pd.to_datetime(out[week_col])
+    out["week_start"] = out[week_col].dt.to_period("W-SUN").apply(lambda r: r.start_time)
+    events = _make_event_calendar(out[week_col].dt.year.min(), out[week_col].dt.year.max())
+    event_names = sorted(events["event_name"].unique().tolist())
+
+    out["is_event_window"] = 0.0
+    out["weeks_to_nearest_event"] = 99.0
+    out["abs_weeks_to_nearest_event"] = 99.0
+    out["is_pre_event"] = 0.0
+    out["is_post_event"] = 0.0
+    out["pre_event_proximity"] = 0.0   # 新增
+    out["post_event_decay"] = 0.0      # 新增
+
+    for ev_name in event_names:
+        out[f"{ev_name}_window"] = 0.0
+        out[f"{ev_name}_week_exact"] = 0.0
+
+    for _, r in events.iterrows():
+        ev_name = r["event_name"]
+        ev_week = r["event_week"]
+        diff = ((out["week_start"] - ev_week).dt.days / 7).round().astype(int)
+        in_window = diff.abs() <= event_window_weeks
+        exact_week = diff == 0
+        out.loc[in_window, "is_event_window"] = 1.0
+        out.loc[in_window, f"{ev_name}_window"] = 1.0
+        out.loc[exact_week, f"{ev_name}_week_exact"] = 1.0
+        current_abs = out["abs_weeks_to_nearest_event"].astype(float)
+        new_abs = diff.abs().astype(float)
+        replace = new_abs < current_abs
+        out.loc[replace, "weeks_to_nearest_event"] = diff[replace].astype(float)
+        out.loc[replace, "abs_weeks_to_nearest_event"] = new_abs[replace].astype(float)
+
+    out["is_pre_event"] = ((out["weeks_to_nearest_event"] < 0) & (out["is_event_window"] > 0)).astype(float)
+    out["is_post_event"] = ((out["weeks_to_nearest_event"] > 0) & (out["is_event_window"] > 0)).astype(float)
+
+    # ── 连续衰减特征（归一化之前计算，用原始周数）──────────────
+    weeks_raw = out["weeks_to_nearest_event"].astype(float)
+
+    # 节假日前：还有8周=0.30, 还有4周=0.55, 还有1周=0.86, 当周=1.00
+    weeks_until = (-weeks_raw).clip(lower=0.0)
+    out["pre_event_proximity"] = np.exp(-0.15 * weeks_until)
+
+    # 节假日后：过了1周=0.86, 过了5周=0.47, 过了10周=0.22
+    weeks_since = weeks_raw.clip(lower=0.0)
+    out["post_event_decay"] = np.exp(-0.15 * weeks_since)
+
+    # 归一化（在连续特征计算之后）
+    out["weeks_to_nearest_event"] = out["weeks_to_nearest_event"].clip(-20, 20) / 20.0
+    out["abs_weeks_to_nearest_event"] = out["abs_weeks_to_nearest_event"].clip(0, 20) / 20.0
+
+    event_cols = (
+        [
+            "is_event_window",
+            "weeks_to_nearest_event",
+            "abs_weeks_to_nearest_event",
+            "is_pre_event",
+            "is_post_event",
+            "pre_event_proximity",   # 新增
+            "post_event_decay",      # 新增
+        ]
+        + [f"{ev_name}_window" for ev_name in event_names]
+        + [f"{ev_name}_week_exact" for ev_name in event_names]
+    )
+    return out, event_cols
 
 
-def _rolling_positive_quantile(arr, window, q):
-    """
-    FIX: arr[lo:i] not arr[lo:i+1]
-    Excludes current timestep to prevent data leakage.
-    """
-    out = np.zeros(len(arr), dtype=np.float32)
-    for i in range(len(arr)):
-        lo = max(0, i - window)
-        vals = arr[lo:i]          # ← FIX: exclude current step
-        vals = vals[vals > 0]
-        out[i] = np.quantile(vals, q) if len(vals) > 0 else 0.0
-    return out
 
 
-def _rolling_max_lag(arr, window):
-    """Lag-safe rolling max excluding current step."""
-    out = np.zeros(len(arr), dtype=np.float32)
-    for i in range(len(arr)):
-        lo = max(0, i - window)
-        vals = arr[lo:i]
-        out[i] = vals.max() if len(vals) > 0 else 0.0
-    return out
+# ============================================================
+# DualRelationalGAT assets: ASIN graph construction + diagnostics support
+# ============================================================
 
-
-def _zero_streak(active):
-    out = np.zeros(len(active), dtype=np.float32)
+def _run_lengths(mask):
+    """Return lengths of consecutive True runs in a boolean array."""
+    arr = np.asarray(mask).astype(bool)
+    runs = []
     cur = 0
-    for i, a in enumerate(active):
-        if a > 0: cur = 0
-        else: cur += 1
-        out[i] = cur
+    for v in arr:
+        if v:
+            cur += 1
+        else:
+            if cur > 0:
+                runs.append(cur)
+            cur = 0
+    if cur > 0:
+        runs.append(cur)
+    return runs
+
+
+def _top_share(x, frac=0.20):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    x = x[x > 0]
+    if len(x) == 0 or x.sum() <= 0:
+        return 0.0
+    k = max(1, int(np.ceil(len(x) * frac)))
+    return float(np.sort(x)[::-1][:k].sum() / (x.sum() + 1e-8))
+
+
+def _last_run_length(mask, value=True):
+    arr = np.asarray(mask).astype(bool)
+    if len(arr) == 0:
+        return 0.0
+    target = bool(value)
+    cnt = 0
+    for v in arr[::-1]:
+        if bool(v) == target:
+            cnt += 1
+        else:
+            break
+    return float(cnt)
+
+
+def _build_graphsage_assets(
+    df,
+    graph_horizon=20,
+    neighbor_k=10,
+    graph_zero_weight=0.03,
+    graph_level_peak_weight=2.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.3,
+    verbose=True,
+):
+    """
+    Build a shallow ASIN KNN graph for DualRelationalGAT.
+
+    Important design choices:
+      1. Use only history before the final forecast window per ASIN.
+      2. Strengthen active-only magnitude / peak features so graph is not only a zero detector.
+      3. Include ind_top10_brand as graph node feature and edge-similarity signal.
+      4. Down-weight zero features in KNN similarity to avoid graph12-style underprediction.
+      5. OOS is historical-only: past OOS enters encoder and graph summaries, but future
+         scot_oos is NOT used as a known future covariate and no future hard mask is applied.
+
+    Returns:
+      node_features: standardized ASIN node feature matrix [N,F]
+      neighbor_idx:  top-k neighbor indices [N,K]
+      asin_to_idx:   mapping used by Dataset batches
+      meta_df/raw_feature_df for graph diagnostics
+    """
+    work = df.copy()
+    work["asin"] = work["asin"].astype(str)
+    work["order_week"] = pd.to_datetime(work["order_week"])
+    work = work.sort_values(["asin", "order_week"]).reset_index(drop=True)
+
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph", "fbi_demand", "scot_oos", "our_price",
+              "customer_active_review_count", "customer_review_count", "ind_promotion", "ind_prime_week", "ind_top10_brand", "list_price"]:
+        if c in work.columns:
+            work[c] = _safe_numeric(work[c]).fillna(0.0)
+
+    rows = []
+    meta_rows = []
+    for asin, g0 in work.groupby("asin", sort=False):
+        g0 = g0.sort_values("order_week").reset_index(drop=True)
+        # avoid leakage: drop the final forecast horizon from graph statistics
+        if len(g0) > graph_horizon:
+            g = g0.iloc[:-int(graph_horizon)].copy()
+        else:
+            g = g0.copy()
+        if len(g) == 0:
+            g = g0.copy()
+
+        instock = _safe_numeric(g.get("in_stock_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        buy = _safe_numeric(g.get("buy_box_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        total = _safe_numeric(g.get("total_dph", 0.0)).clip(lower=0.0).values.astype(float)
+        demand = _safe_numeric(g.get("fbi_demand", 0.0)).clip(lower=0.0).values.astype(float)
+        # Historical demand profile is safe here because g excludes the final forecast horizon.
+        # It is used only as an ASIN-strength/popularity prior for the exposure graph.
+        demand_mean = float(np.mean(demand)) if len(demand) else 0.0
+        demand_median = float(np.median(demand)) if len(demand) else 0.0
+        demand_q75 = float(np.quantile(demand, 0.75)) if len(demand) else 0.0
+        demand_q90 = float(np.quantile(demand, 0.90)) if len(demand) else 0.0
+        demand_q95 = float(np.quantile(demand, 0.95)) if len(demand) else 0.0
+        demand_max = float(np.max(demand)) if len(demand) else 0.0
+        demand_sum = float(np.sum(demand)) if len(demand) else 0.0
+        demand_std = float(np.std(demand)) if len(demand) else 0.0
+        demand_cv = demand_std / (demand_mean + 1e-8)
+        oos = _safe_numeric(g.get("scot_oos", 0.0)).clip(0, 1).values.astype(float) if "scot_oos" in g.columns else np.zeros(len(g))
+        # Historical-only OOS summaries. These are safe because g excludes the final forecast horizon.
+        oos_bool = oos >= 0.5
+        oos_rate_all = float(np.mean(oos_bool)) if len(oos_bool) else 0.0
+        oos_rate_13 = float(np.mean(oos_bool[-13:])) if len(oos_bool) else 0.0
+        oos_rate_26 = float(np.mean(oos_bool[-26:])) if len(oos_bool) else 0.0
+        last_oos = float(oos_bool[-1]) if len(oos_bool) else 0.0
+        oos_streak = float(_last_run_length(oos_bool, True)) if len(oos_bool) else 0.0
+        weeks_since_last_oos = float((len(oos_bool) - 1 - np.where(oos_bool)[0][-1]) if np.any(oos_bool) else len(oos_bool)) if len(oos_bool) else 0.0
+
+        active = instock > 0
+        active50 = instock > 50
+        zero = ~active
+        active_prev = active[:-1] if len(active) > 1 else np.array([], dtype=bool)
+        active_next = active[1:] if len(active) > 1 else np.array([], dtype=bool)
+        a2z = float(np.sum(active_prev & (~active_next)) / (np.sum(active_prev) + 1e-8)) if len(active_prev) else 0.0
+        z2a = float(np.sum((~active_prev) & active_next) / (np.sum(~active_prev) + 1e-8)) if len(active_prev) else 0.0
+        active_runs = _run_lengths(active)
+        zero_runs = _run_lengths(zero)
+
+        pos_instock = instock[instock > 0]
+        active_only_mean = float(pos_instock.mean()) if len(pos_instock) else 0.0
+        active_only_q75 = float(np.quantile(pos_instock, 0.75)) if len(pos_instock) else 0.0
+        active_only_q90 = float(np.quantile(pos_instock, 0.90)) if len(pos_instock) else 0.0
+        active_only_q95 = float(np.quantile(pos_instock, 0.95)) if len(pos_instock) else 0.0
+
+        instock_mean = float(np.mean(instock)) if len(instock) else 0.0
+        instock_median = float(np.median(instock)) if len(instock) else 0.0
+        instock_q75 = float(np.quantile(instock, 0.75)) if len(instock) else 0.0
+        instock_q90 = float(np.quantile(instock, 0.90)) if len(instock) else 0.0
+        instock_q95 = float(np.quantile(instock, 0.95)) if len(instock) else 0.0
+        instock_max = float(np.max(instock)) if len(instock) else 0.0
+        instock_std = float(np.std(instock)) if len(instock) else 0.0
+        instock_cv = instock_std / (instock_mean + 1e-8)
+        max_over_mean = instock_max / (instock_mean + 1e-8)
+        q95_over_mean = instock_q95 / (instock_mean + 1e-8)
+        active_q95_over_mean = active_only_q95 / (active_only_mean + 1e-8)
+
+        # approximate concentration / burst features
+        sorted_x = np.sort(np.asarray(instock, dtype=float))
+        if len(sorted_x) > 0 and sorted_x.sum() > 0:
+            n = len(sorted_x)
+            gini = float((2 * np.arange(1, n + 1) @ sorted_x) / (n * sorted_x.sum() + 1e-8) - (n + 1) / n)
+        else:
+            gini = 0.0
+
+        gl = str(g0["gl_product_group"].iloc[0]) if "gl_product_group" in g0.columns else "MISSING"
+        cat = str(g0["category_code"].iloc[0]) if "category_code" in g0.columns else "MISSING"
+        hbt = str(g0["hbt"].iloc[0]) if "hbt" in g0.columns else "MISSING"
+        topbrand = float(_safe_numeric(g0["ind_top10_brand"].iloc[[0]]).iloc[0]) if "ind_top10_brand" in g0.columns else 0.0
+        # Relation graph uses list_price if available because it is a cleaner price-tier signal;
+        # fall back to our_price for older data.
+        if "list_price" in g.columns:
+            price_mean = float(_safe_numeric(g.get("list_price", 0.0)).clip(lower=0.0).mean())
+        elif "our_price" in g.columns:
+            price_mean = float(_safe_numeric(g.get("our_price", 0.0)).clip(lower=0.0).mean())
+        else:
+            price_mean = 0.0
+        # Prefer customer_active_review_count if present; fall back to customer_review_count.
+        review_col = "customer_active_review_count" if "customer_active_review_count" in g.columns else ("customer_review_count" if "customer_review_count" in g.columns else None)
+        review_last = float(_safe_numeric(g[review_col]).clip(lower=0.0).iloc[-1]) if review_col is not None and len(g) else 0.0
+        promo_rate = float(_safe_numeric(g.get("ind_promotion", 0.0)).clip(0, 1).mean()) if "ind_promotion" in g.columns else 0.0
+        prime_rate = float(_safe_numeric(g.get("ind_prime_week", 0.0)).clip(0, 1).mean()) if "ind_prime_week" in g.columns else 0.0
+
+        rows.append({
+            "asin": asin,
+            # zero / active
+            "instock_zero_rate": float(np.mean(instock <= 0)) if len(instock) else 1.0,
+            "buybox_zero_rate": float(np.mean(buy <= 0)) if len(buy) else 1.0,
+            "total_zero_rate": float(np.mean(total <= 0)) if len(total) else 1.0,
+            "instock_active_rate": float(np.mean(instock > 0)) if len(instock) else 0.0,
+            "instock_active50_rate": float(np.mean(active50)) if len(instock) else 0.0,
+            "demand_active_rate": float(np.mean(demand > 0)) if len(demand) else 0.0,
+            # Historical demand magnitude / popularity features.
+            "log_demand_sum": np.log1p(demand_sum),
+            "log_demand_mean": np.log1p(demand_mean),
+            "log_demand_median": np.log1p(demand_median),
+            "log_demand_q75": np.log1p(demand_q75),
+            "log_demand_q90": np.log1p(demand_q90),
+            "log_demand_q95": np.log1p(demand_q95),
+            "log_demand_max": np.log1p(demand_max),
+            "demand_cv": float(np.clip(demand_cv, 0, 50)),
+            "oos_rate": oos_rate_all,
+            "oos_rate_13": oos_rate_13,
+            "oos_rate_26": oos_rate_26,
+            "last_oos": last_oos,
+            "log_oos_streak": np.log1p(oos_streak),
+            "log_weeks_since_last_oos": np.log1p(weeks_since_last_oos),
+            # level / peak: overall
+            "log_instock_mean": np.log1p(instock_mean),
+            "log_instock_median": np.log1p(instock_median),
+            "log_instock_q75": np.log1p(instock_q75),
+            "log_instock_q90": np.log1p(instock_q90),
+            "log_instock_q95": np.log1p(instock_q95),
+            "log_instock_max": np.log1p(instock_max),
+            "instock_cv": float(np.clip(instock_cv, 0, 50)),
+            "instock_gini": gini,
+            "top10_share": _top_share(instock, 0.10),
+            "top20_share": _top_share(instock, 0.20),
+            "max_over_mean": float(np.clip(max_over_mean, 0, 100)),
+            "q95_over_mean": float(np.clip(q95_over_mean, 0, 100)),
+            # level / peak: active-only, key to avoid graph under active weeks
+            "log_active_only_mean": np.log1p(active_only_mean),
+            "log_active_only_q75": np.log1p(active_only_q75),
+            "log_active_only_q90": np.log1p(active_only_q90),
+            "log_active_only_q95": np.log1p(active_only_q95),
+            "active_q95_over_mean": float(np.clip(active_q95_over_mean, 0, 100)),
+            # buybox / total scale for funnel information
+            "log_buybox_mean": np.log1p(float(np.mean(buy)) if len(buy) else 0.0),
+            "log_total_mean": np.log1p(float(np.mean(total)) if len(total) else 0.0),
+            # transition
+            "active_to_zero_rate": a2z,
+            "zero_to_active_rate": z2a,
+            "log_avg_active_spell": np.log1p(float(np.mean(active_runs)) if active_runs else 0.0),
+            "log_avg_zero_spell": np.log1p(float(np.mean(zero_runs)) if zero_runs else 0.0),
+            "last_active_streak": np.log1p(_last_run_length(active, True)),
+            "last_zero_streak": np.log1p(_last_run_length(active, False)),
+            "weeks_since_last_positive": np.log1p((len(active) - 1 - np.where(active)[0][-1]) if np.any(active) else len(active)),
+            # static / business
+            "ind_top10_brand": topbrand,
+            "log_price_mean": np.log1p(price_mean),
+            "log_review_last": np.log1p(review_last),
+            "promo_rate": promo_rate,
+            "prime_rate": prime_rate,
+        })
+        meta_rows.append({"asin": asin, "gl_product_group": gl, "category_code": cat, "hbt": hbt, "ind_top10_brand": topbrand})
+
+    feat = pd.DataFrame(rows).fillna(0.0)
+    meta = pd.DataFrame(meta_rows)
+    if len(feat) == 0:
+        raise ValueError("No ASINs available to build DualGraphSAGE assets.")
+
+    # Encode GL/category/hbt as continuous normalized codes + frequencies for node features and KNN.
+    for c in ["gl_product_group", "category_code", "hbt"]:
+        raw = meta[c].astype(str).fillna("MISSING")
+        codes, uniques = pd.factorize(raw)
+        denom = max(len(uniques) - 1, 1)
+        feat[f"{c}_code"] = codes.astype(float) / denom
+        freq = raw.value_counts(normalize=True)
+        feat[f"{c}_freq"] = raw.map(freq).fillna(0.0).astype(float)
+        if c == "category_code":
+            feat["category_is_unknown"] = raw.str.lower().isin(["unknown", "missing", "nan", "none", ""]).astype(float)
+        if c == "hbt":
+            hbt_lower = raw.str.lower()
+            feat["hbt_is_unknown"] = hbt_lower.isin(["unknown", "missing", "nan", "none", ""]).astype(float)
+            feat["hbt_is_head"] = hbt_lower.str.contains("head").astype(float)
+            feat["hbt_is_body"] = hbt_lower.str.contains("body").astype(float)
+            feat["hbt_is_tail"] = hbt_lower.str.contains("tail").astype(float)
+
+    # ------------------------------------------------------------
+    # Magnitude-aware ASIN profile buckets for within-category graph.
+    # These buckets are computed from historical-only features, because
+    # g excludes the final forecast horizon above. They help distinguish
+    # high / medium / low exposure ASINs inside the same category.
+    # ------------------------------------------------------------
+    def _safe_group_qbucket(values, q=4):
+        s = pd.Series(values).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if len(s) <= 1 or s.nunique(dropna=False) <= 1:
+            return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+        q_eff = int(min(q, max(1, s.nunique())))
+        try:
+            return pd.qcut(s.rank(method="first"), q=q_eff, labels=False, duplicates="drop").astype(int)
+        except Exception:
+            return pd.Series(np.zeros(len(s), dtype=int), index=s.index)
+
+    # Strength proxy for within-category magnitude buckets.
+    # V5: demand is added as a historical popularity signal. HBT is intentionally NOT a main
+    # strength driver because diagnostics showed its within-category direction can be unstable.
+    exposure_strength = (
+        0.70 * feat.get("log_instock_mean", 0.0).astype(float) +
+        0.70 * feat.get("log_active_only_q95", 0.0).astype(float) +
+        0.35 * feat.get("log_buybox_mean", 0.0).astype(float) +
+        0.25 * feat.get("log_total_mean", 0.0).astype(float)
+    )
+    demand_strength = (
+        0.35 * feat.get("log_demand_mean", 0.0).astype(float) +
+        0.35 * feat.get("log_demand_q90", 0.0).astype(float) +
+        0.20 * feat.get("log_demand_sum", 0.0).astype(float) +
+        0.10 * feat.get("demand_active_rate", 0.0).astype(float)
+    )
+    weak_static_strength = (
+        0.08 * feat.get("log_review_last", 0.0).astype(float) +
+        0.05 * feat.get("ind_top10_brand", 0.0).astype(float)
+    )
+    feat["graph_exposure_strength"] = exposure_strength
+    feat["graph_demand_strength"] = demand_strength
+    feat["graph_strength_score"] = 0.60 * exposure_strength + 0.35 * demand_strength + 0.05 * weak_static_strength
+
+    feat["magnitude_bucket"] = 0
+    feat["active_bucket"] = 0
+    # Bucket within category so that high/low ASINs in the same category are separated.
+    cat_series = meta["category_code"].astype(str).fillna("MISSING")
+    for _, idxs in cat_series.groupby(cat_series).groups.items():
+        idxs = list(idxs)
+        feat.loc[idxs, "magnitude_bucket"] = _safe_group_qbucket(feat.loc[idxs, "graph_strength_score"], q=4).values
+        feat.loc[idxs, "active_bucket"] = _safe_group_qbucket(feat.loc[idxs, "instock_active_rate"], q=3).values
+
+    feat["magnitude_bucket_norm"] = feat["magnitude_bucket"].astype(float) / 3.0
+    feat["active_bucket_norm"] = feat["active_bucket"].astype(float) / 2.0
+
+    zero_cols = [
+        "instock_zero_rate", "buybox_zero_rate", "total_zero_rate",
+        "oos_rate", "oos_rate_13", "oos_rate_26", "last_oos",
+        "log_oos_streak", "log_weeks_since_last_oos",
+    ]
+    level_peak_cols = [
+        "log_instock_mean", "log_instock_median", "log_instock_q75", "log_instock_q90",
+        "log_instock_q95", "log_instock_max", "instock_cv", "instock_gini",
+        "top10_share", "top20_share", "max_over_mean", "q95_over_mean",
+        "log_active_only_mean", "log_active_only_q75", "log_active_only_q90", "log_active_only_q95",
+        "active_q95_over_mean", "log_buybox_mean", "log_total_mean",
+    ]
+    demand_cols = [
+        "log_demand_sum", "log_demand_mean", "log_demand_median", "log_demand_q75",
+        "log_demand_q90", "log_demand_q95", "log_demand_max", "demand_cv",
+        "demand_active_rate", "graph_demand_strength"
+    ]
+    transition_cols = ["active_to_zero_rate", "zero_to_active_rate", "log_avg_active_spell", "log_avg_zero_spell", "last_active_streak", "last_zero_streak", "weeks_since_last_positive"]
+    static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown",
+                   "hbt_code", "hbt_freq", "hbt_is_unknown", "hbt_is_head", "hbt_is_body", "hbt_is_tail",
+                   "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
+    brand_cols = ["ind_top10_brand"]
+    node_feature_cols = list(dict.fromkeys(
+        zero_cols + level_peak_cols + demand_cols + transition_cols + static_cols + brand_cols +
+        ["instock_active_rate", "instock_active50_rate",
+         "graph_exposure_strength", "graph_strength_score", "magnitude_bucket_norm", "active_bucket_norm"]
+    ))
+    for c in node_feature_cols:
+        if c not in feat.columns:
+            feat[c] = 0.0
+
+    X_raw = feat[node_feature_cols].astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0).values
+    scaler = StandardScaler()
+    X_std = scaler.fit_transform(X_raw).astype(np.float32)
+
+    # Weighted KNN features. Zero is down-weighted; active-only level/peak is emphasized.
+    weight_map = {c: 1.0 for c in node_feature_cols}
+    for c in zero_cols:
+        weight_map[c] = float(graph_zero_weight)
+    for c in level_peak_cols:
+        weight_map[c] = float(graph_level_peak_weight)
+    # Demand is useful as an ASIN popularity prior, but should not dominate exposure-specific features.
+    for c in demand_cols:
+        weight_map[c] = min(float(graph_level_peak_weight), 1.25)
+    for c in transition_cols:
+        weight_map[c] = float(graph_transition_weight)
+    for c in static_cols:
+        weight_map[c] = float(graph_static_weight)
+    for c in brand_cols:
+        weight_map[c] = float(graph_brand_weight)
+    W = np.asarray([weight_map.get(c, 1.0) for c in node_feature_cols], dtype=np.float32)
+    X_knn = X_std * W[None, :]
+
+    N = X_knn.shape[0]
+    K = max(1, min(int(neighbor_k), max(N - 1, 1)))
+
+    # ------------------------------------------------------------
+    # CATEGORY-ONLY magnitude-aware dual graph construction (v6).
+    # GL is intentionally NOT used to select graph neighbors; GL remains a static/model feature.
+    # Positive graph: same category + close exposure/demand/active buckets.
+    # Competitive graph: same category + far exposure/demand/active buckets.
+    # For very small categories, we keep weak self-neighbors instead of falling back to GL,
+    # because GL is too coarse and can over-smooth different categories.
+    # ------------------------------------------------------------
+    def _fallback_neighbors(i, K):
+        if N <= 1:
+            return [i] * K
+        # global nearest fallback, excluding self
+        sims = X_knn @ X_knn[i]
+        order = np.argsort(-sims)
+        out = [int(j) for j in order if int(j) != int(i)]
+        if not out:
+            out = [int(i)]
+        while len(out) < K:
+            out.append(out[-1])
+        return out[:K]
+
+    cat_arr = meta["category_code"].astype(str).values
+    gl_arr = meta["gl_product_group"].astype(str).values
+    hbt_arr = meta["hbt"].astype(str).str.lower().values if "hbt" in meta.columns else np.array(["missing"] * N)
+    top_arr = meta["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta.columns else np.zeros(N)
+    mag_arr = feat["magnitude_bucket"].astype(int).values
+    act_arr = feat["active_bucket"].astype(int).values
+    strength_arr = feat["graph_strength_score"].astype(float).values
+    strength_z = (strength_arr - np.nanmean(strength_arr)) / (np.nanstd(strength_arr) + 1e-8)
+    demand_strength_arr = feat.get("graph_demand_strength", pd.Series(np.zeros(N))).astype(float).values
+    demand_strength_z = (demand_strength_arr - np.nanmean(demand_strength_arr)) / (np.nanstd(demand_strength_arr) + 1e-8)
+
+    # ------------------------------------------------------------------
+    # V10 learned-relation-inspired edge scoring.
+    # These are the exact business signals validated in the standalone
+    # dynamic relation test: total/buybox/instock/demand + HBT + top10 brand
+    # + ind_promotion + list_price.  They are historical-only here because
+    # feat is built after dropping the forecast horizon.
+    # ------------------------------------------------------------------
+    def _z_arr(col):
+        v = feat.get(col, pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+        return (v - np.nanmean(v)) / (np.nanstd(v) + 1e-8)
+
+    z_total_mean   = _z_arr("log_total_mean")
+    z_buybox_mean  = _z_arr("log_buybox_mean")
+    z_instock_mean = _z_arr("log_instock_mean")
+    z_demand_mean  = _z_arr("log_demand_mean")
+    z_instock_q90  = _z_arr("log_instock_q90")
+    z_demand_q90   = _z_arr("log_demand_q90")
+    z_price        = _z_arr("log_price_mean")
+    promo_arr      = feat.get("promo_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
+    prime_arr      = feat.get("prime_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
+    instock_ar     = feat.get("instock_active_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
+    demand_ar      = feat.get("demand_active_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
+    total_zero     = feat.get("total_zero_rate", pd.Series(np.ones(N))).astype(float).fillna(1.0).values
+    buybox_zero    = feat.get("buybox_zero_rate", pd.Series(np.ones(N))).astype(float).fillna(1.0).values
+    instock_zero   = feat.get("instock_zero_rate", pd.Series(np.ones(N))).astype(float).fillna(1.0).values
+
+    def _relation_components(i, cand):
+        cand = np.asarray(cand, dtype=int)
+        # closeness gaps: smaller => positive relation
+        level_gap = (
+            np.abs(z_total_mean[cand] - z_total_mean[i]) +
+            np.abs(z_buybox_mean[cand] - z_buybox_mean[i]) +
+            np.abs(z_instock_mean[cand] - z_instock_mean[i]) +
+            np.abs(z_demand_mean[cand] - z_demand_mean[i])
+        ) / 4.0
+        peak_gap = (
+            np.abs(z_instock_q90[cand] - z_instock_q90[i]) +
+            np.abs(z_demand_q90[cand] - z_demand_q90[i])
+        ) / 2.0
+        active_gap = (np.abs(instock_ar[cand] - instock_ar[i]) + np.abs(demand_ar[cand] - demand_ar[i])) / 2.0
+        zero_gap = (np.abs(total_zero[cand] - total_zero[i]) + np.abs(buybox_zero[cand] - buybox_zero[i]) + np.abs(instock_zero[cand] - instock_zero[i])) / 3.0
+        price_gap = np.abs(z_price[cand] - z_price[i])
+        promo_gap = np.abs(promo_arr[cand] - promo_arr[i])
+        prime_gap = np.abs(prime_arr[cand] - prime_arr[i])
+        same_hbt = (hbt_arr[cand] == hbt_arr[i]).astype(float)
+        hbt_diff = 1.0 - same_hbt
+        brand_same = (top_arr[cand] == top_arr[i]).astype(float)
+        brand_diff = 1.0 - brand_same
+        funnel_strength_gap = np.abs(strength_z[cand] - strength_z[i])
+        demand_gap = np.abs(demand_strength_z[cand] - demand_strength_z[i])
+        stronger = np.maximum(strength_z[cand] - strength_z[i], 0.0)
+        stronger_demand = np.maximum(demand_strength_z[cand] - demand_strength_z[i], 0.0)
+        stronger_top10 = ((top_arr[cand] > top_arr[i]).astype(float) * (stronger > 0).astype(float))
+        # positive: similar funnel/demand, same HBT/brand, similar promo and price regime
+        pos_score = (
+            2.00
+            - 1.45 * level_gap
+            - 0.65 * peak_gap
+            - 0.75 * active_gap
+            - 0.55 * zero_gap
+            - 0.45 * price_gap
+            - 0.65 * promo_gap
+            - 0.15 * prime_gap
+            + 0.42 * same_hbt
+            + 0.38 * brand_same
+        )
+        # competitive: same category but stronger/different HBT/brand/price/promo regime.
+        comp_score = (
+            0.90 * funnel_strength_gap
+            + 0.65 * demand_gap
+            + 0.45 * stronger
+            + 0.35 * stronger_demand
+            + 0.50 * hbt_diff
+            + 0.45 * brand_diff
+            + 0.65 * stronger_top10
+            + 0.35 * price_gap
+            + 0.45 * promo_gap
+            + 0.20 * prime_gap
+        )
+        return pos_score, comp_score, {
+            "level_gap": level_gap,
+            "active_gap": active_gap,
+            "price_gap": price_gap,
+            "promo_gap": promo_gap,
+            "same_hbt": same_hbt,
+            "brand_same": brand_same,
+            "stronger_top10": stronger_top10,
+        }
+
+    neigh_rows = []
+    comp_rows = []
+    pos_score_rows = []
+    comp_score_rows = []
+    all_idx = np.arange(N)
+    min_category_graph_size = max(4, min(K + 1, 10))
+    for i in range(N):
+        # Candidate pool: STRICT same-category only.
+        # Do NOT fall back to same GL here; GL is kept as a static feature only.
+        same_cat = all_idx[(cat_arr == cat_arr[i]) & (all_idx != i)]
+        same_gl = all_idx[(gl_arr == gl_arr[i]) & (all_idx != i)]  # diagnostics only
+        cand_pos = same_cat
+
+        # If category is too small, avoid noisy GL/global smoothing.
+        if len(cand_pos) < 1:
+            pos = [i] * K
+        else:
+            # Positive relation: same-category ASINs with close historical total/buybox/instock/demand,
+            # similar HBT, top10-brand state, promotion regime, and list-price tier.
+            pos_score, _, pos_info = _relation_components(i, cand_pos)
+            # Keep a tiny KNN similarity tie-breaker so near-identical profiles rank stably.
+            sim = X_knn[cand_pos] @ X_knn[i]
+            score = pos_score + 0.03 * sim
+            order = np.argsort(-score)
+            pos = [int(cand_pos[j]) for j in order[:K]]
+            pos_scores = [float(score[j]) for j in order[:K]]
+            if not pos:
+                pos = _fallback_neighbors(i, K)
+                pos_scores = [0.0] * len(pos)
+            while len(pos) < K:
+                pos.append(pos[-1])
+                pos_scores.append(pos_scores[-1] if pos_scores else 0.0)
+        neigh_rows.append(pos[:K])
+        pos_score_rows.append(pos_scores[:K])
+
+        # Competitive/contrast relation: STRICT same-category but far magnitude/demand/active buckets
+        # or much stronger/weaker strength. No GL fallback, to avoid cross-category smoothing.
+        cand_comp = same_cat
+        if len(cand_comp) < 1:
+            comp = [i] * K
+        else:
+            # Competitive relation: same-category ASINs with clear stronger/weaker or regime contrast:
+            # funnel/demand gap + HBT/top10 brand/list-price/promotion contrast.
+            _, comp_score, comp_info = _relation_components(i, cand_comp)
+            order = np.argsort(-comp_score)
+            comp = [int(cand_comp[j]) for j in order[:K]]
+            comp_scores = [float(comp_score[j]) for j in order[:K]]
+            if not comp:
+                comp = _fallback_neighbors(i, K)
+                comp_scores = [0.0] * len(comp)
+            while len(comp) < K:
+                comp.append(comp[-1])
+                comp_scores.append(comp_scores[-1] if comp_scores else 0.0)
+        comp_rows.append(comp[:K])
+        comp_score_rows.append(comp_scores[:K])
+
+    neigh_idx = np.asarray(neigh_rows, dtype=np.int64)
+    comp_idx = np.asarray(comp_rows, dtype=np.int64)
+    pos_edge_score = np.asarray(pos_score_rows, dtype=np.float32) if len(pos_score_rows) else np.zeros((N, K), dtype=np.float32)
+    comp_edge_score = np.asarray(comp_score_rows, dtype=np.float32) if len(comp_score_rows) else np.zeros((N, K), dtype=np.float32)
+    # Standardize edge scores before using them as GAT attention bias.
+    pos_edge_score = (pos_edge_score - np.nanmean(pos_edge_score)) / (np.nanstd(pos_edge_score) + 1e-8)
+    comp_edge_score = (comp_edge_score - np.nanmean(comp_edge_score)) / (np.nanstd(comp_edge_score) + 1e-8)
+
+    asin_list = feat["asin"].astype(str).tolist()
+    asin_to_idx = {a: i for i, a in enumerate(asin_list)}
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("DUAL-RELATION GRAPHSAGE ASSET BUILD")
+        print("=" * 100)
+        print(f"Nodes: {N} | K={K} | node_feat_dim={len(node_feature_cols)}")
+        print(f"Weights: zero={graph_zero_weight}, level_peak={graph_level_peak_weight}, demand<=1.25, transition={graph_transition_weight}, static={graph_static_weight}, brand={graph_brand_weight}")
+        print("Key graph features V10: dynamic-relation edge scorer using total/buybox/instock/demand + HBT + top10 brand + ind_promotion + list_price")
+        try:
+            print("Magnitude bucket counts:", feat["magnitude_bucket"].value_counts().sort_index().to_dict())
+            print("Active bucket counts:", feat["active_bucket"].value_counts().sort_index().to_dict())
+        except Exception:
+            pass
+        try:
+            nb = neigh_idx
+            same_gl = []
+            same_cat = []
+            same_brand = []
+            gl_arr = meta["gl_product_group"].astype(str).values
+            cat_arr = meta["category_code"].astype(str).values
+            br_arr = meta["ind_top10_brand"].astype(float).values
+            for i in range(N):
+                same_gl.append(np.mean(gl_arr[nb[i]] == gl_arr[i]))
+                same_cat.append(np.mean(cat_arr[nb[i]] == cat_arr[i]))
+                same_brand.append(np.mean(br_arr[nb[i]] == br_arr[i]))
+            print(f"Positive-neighbor homophily (category-only; GL static): same_GL={np.mean(same_gl):.3f} | same_category={np.mean(same_cat):.3f} | same_top10_brand_state={np.mean(same_brand):.3f}")
+            try:
+                cb = comp_idx
+                comp_same_cat = []
+                comp_diff_hbt = []
+                comp_stronger_brand = []
+                hbt_arr = meta["hbt"].astype(str).values if "hbt" in meta.columns else np.array(["missing"] * N)
+                for i in range(N):
+                    comp_same_cat.append(np.mean(cat_arr[cb[i]] == cat_arr[i]))
+                    comp_diff_hbt.append(np.mean(hbt_arr[cb[i]] != hbt_arr[i]))
+                    comp_stronger_brand.append(np.mean(br_arr[cb[i]] > br_arr[i]))
+                print(f"Competitive-neighbor diagnostic: same_category={np.mean(comp_same_cat):.3f} | diff_HBT={np.mean(comp_diff_hbt):.3f} | stronger_top10_brand={np.mean(comp_stronger_brand):.3f}")
+                print(f"Relation edge score diagnostics: pos_score_mean={float(np.nanmean(pos_edge_score)):.3f}, pos_score_std={float(np.nanstd(pos_edge_score)):.3f} | comp_score_mean={float(np.nanmean(comp_edge_score)):.3f}, comp_score_std={float(np.nanstd(comp_edge_score)):.3f}")
+            except Exception as e2:
+                print(f"Competitive-neighbor diagnostic skipped: {e2}")
+        except Exception as e:
+            print(f"Neighbor homophily diagnostic skipped: {e}")
+
+    raw_feature_df = pd.concat([feat[["asin"]].reset_index(drop=True), feat[node_feature_cols].reset_index(drop=True)], axis=1)
+
+    return {
+        "node_features": X_std.astype(np.float32),
+        "neighbor_idx": neigh_idx.astype(np.int64),
+        "competitive_neighbor_idx": comp_idx.astype(np.int64),
+        "positive_edge_score": pos_edge_score.astype(np.float32),
+        "competitive_edge_score": comp_edge_score.astype(np.float32),
+        "asin_to_idx": asin_to_idx,
+        "idx_to_asin": asin_list,
+        "node_feature_names": node_feature_cols,
+        "raw_feature_df": raw_feature_df,
+        "meta_df": meta.reset_index(drop=True),
+        "feature_groups": {
+            "zero": zero_cols,
+            "level_peak": level_peak_cols,
+            "demand": demand_cols,
+            "transition": transition_cols,
+            "static": static_cols,
+            "brand": brand_cols,
+        },
+        "weights": {
+            "zero": graph_zero_weight,
+            "level_peak": graph_level_peak_weight,
+            "transition": graph_transition_weight,
+            "static": graph_static_weight,
+            "brand": graph_brand_weight,
+        },
+    }
+
+
+def load_exposure_data(data_raw, dph_cap_q=0.995, use_graphsage=False, graph_horizon=20, neighbor_k=10, graph_zero_weight=0.03, graph_level_peak_weight=2.2, graph_transition_weight=1.0, graph_static_weight=1.0, graph_brand_weight=0.3):
+    df = data_raw.copy()
+    df["asin"] = df["asin"].astype(str)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+    df = df.sort_values(["asin", "order_week"]).reset_index(drop=True)
+
+    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph"]:
+        df[c] = _safe_numeric(df[c]).clip(lower=0.0)
+
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        cap = df[c].quantile(dph_cap_q)
+        df[c] = df[c].clip(upper=cap)
+
+    df["our_price"] = _safe_numeric(df.get("our_price", 0.0)).clip(lower=0.0)
+    df["scot_oos"]  = _safe_numeric(df.get("scot_oos",  0.0)).clip(0, 1)
+    # IMPORTANT: scot_oos is used as historical input only. It is NOT included in
+    # future_context and there is no future OOS hard mask, avoiding leakage.
+
+    # ── 新增动态特征 ──────────────────────────────────────────
+    # ind_promotion：动态binary，99.1% ASIN有变化，进active_head
+    if "ind_promotion" in df.columns:
+        df["ind_promotion"] = _safe_numeric(df["ind_promotion"]).clip(0, 1)
+    else:
+        df["ind_promotion"] = 0.0
+
+    # ind_prime_week：动态binary，3.7%是PrimeDay周，进active_head
+    if "ind_prime_week" in df.columns:
+        df["ind_prime_week"] = _safe_numeric(df["ind_prime_week"]).clip(0, 1)
+    else:
+        df["ind_prime_week"] = 0.0
+
+    # customer_active_review_count：动态，极度右偏，log变换后进mag_head
+    if "customer_active_review_count" in df.columns:
+        df["log_review_count"] = np.log1p(
+            _safe_numeric(df["customer_active_review_count"]).clip(lower=0.0)
+        )
+    else:
+        df["log_review_count"] = 0.0
+
+    # ── 全局price log变换（修复：原来是per-ASIN归一化，丢失跨ASIN信息）
+    # raw skew=19.6，log1p之后skew=-0.046，分布完美正态
+    global_price_log = np.log1p(df["our_price"])
+    # 全局标准化保留价格水平信息
+    price_mean = global_price_log.mean()
+    price_std  = global_price_log.std() + 1e-8
+    df["our_price_log_norm"] = (global_price_log - price_mean) / price_std
+
+    df["order_month"]  = df["order_week"].dt.month.astype(float)
+    df["month_sin"]    = np.sin(2 * np.pi * df["order_month"] / 12.0)
+    df["month_cos"]    = np.cos(2 * np.pi * df["order_month"] / 12.0)
+    df["season_winter"] = df["order_month"].isin([12, 1, 2]).astype(float)
+    df["season_spring"] = df["order_month"].isin([3, 4, 5]).astype(float)
+    df["season_summer"] = df["order_month"].isin([6, 7, 8]).astype(float)
+    df["season_fall"]   = df["order_month"].isin([9, 10, 11]).astype(float)
+
+    df, explicit_event_cols = add_explicit_event_features(df, week_col="order_week")
+    df, static_cols = _encode_static_features(df)
+
+    holiday_cols  = [c for c in df.columns if c.startswith("holiday_indicator_")]
+    distance_cols = [c for c in df.columns if c.startswith("distance_")]
+    for c in holiday_cols + distance_cols:
+        df[c] = _safe_numeric(df[c])
+
+    context_cols = list(dict.fromkeys(
+        # ── 动态特征（时间驱动，进active_head）──────────────
+        ["ind_promotion", "ind_prime_week"]
+        + holiday_cols
+        + distance_cols
+        + explicit_event_cols
+        + ["order_month", "month_sin", "month_cos",
+           "season_winter", "season_spring", "season_summer", "season_fall"]
+        # ── 商品特征（进mag_head）────────────────────────────
+        + ["our_price_log_norm", "log_review_count"]
+        + static_cols
+        # ── 历史anchor──────────────────────────────────────
+        + [
+            "hist_total_dph_last_log",   "hist_total_dph_mean4_log",   "hist_total_dph_mean13_log",
+            "hist_buy_box_dph_last_log", "hist_buy_box_dph_mean4_log", "hist_buy_box_dph_mean13_log",
+            "hist_instock_dph_last_log", "hist_instock_dph_mean4_log", "hist_instock_dph_mean13_log",
+            "hist_demand_last_log", "hist_demand_mean4_log", "hist_demand_mean13_log",
+            "hist_demand_active_rate",
+        ]
+    ))
+
+    for c in context_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    data = {}
+    for asin, g in df.groupby("asin"):
+        g = g.sort_values("order_week").reset_index(drop=True)
+        demand  = g["fbi_demand"].values.astype(np.float32)
+        total   = g["total_dph"].values.astype(np.float32)
+        buy     = g["buy_box_dph"].values.astype(np.float32)
+        instock = g["in_stock_dph"].values.astype(np.float32)
+        oos     = g["scot_oos"].values.astype(np.float32)
+
+        # ── price改成全局log归一化（不再per-ASIN归一化）────
+        price_log_norm = g["our_price_log_norm"].values.astype(np.float32)
+
+        # ── encoder历史特征（9维→11维）─────────────────────
+        # 新增：log_review_count（mag信号）, ind_promotion（active信号）
+        week_idx = np.arange(len(g))
+
+        # ── 月份/季节特征 ─────────────────────────────────────
+        month_sin  = g["month_sin"].values.astype(np.float32)
+        month_cos  = g["month_cos"].values.astype(np.float32)
+        season_w   = g["season_winter"].values.astype(np.float32)
+        season_su  = g["season_summer"].values.astype(np.float32)
+
+        # ── 절假日/事件特征（如果存在）───────────────────────
+        is_event   = g["is_event_window"].values.astype(np.float32) \
+                     if "is_event_window" in g.columns else np.zeros(len(g), dtype=np.float32)
+        pre_event  = g["pre_event_proximity"].values.astype(np.float32) \
+                     if "pre_event_proximity" in g.columns else np.zeros(len(g), dtype=np.float32)
+        post_event = g["post_event_decay"].values.astype(np.float32) \
+                     if "post_event_decay" in g.columns else np.zeros(len(g), dtype=np.float32)
+        ind_prime  = g["ind_prime_week"].values.astype(np.float32) \
+                     if "ind_prime_week" in g.columns else np.zeros(len(g), dtype=np.float32)
+
+        # ── GL静态特征（每周重复同一个值）─────────────────────
+        # 让encoder学到不同GL在不同季节/月份的DPH规律
+        # TCN会自动学 GL×季节 的交互，不需要手动写交叉特征
+        gl_code = g["stock_static__gl_product_group__code"].values.astype(np.float32) \
+                  if "stock_static__gl_product_group__code" in g.columns \
+                  else np.zeros(len(g), dtype=np.float32)
+        gl_freq = g["stock_static__gl_product_group__freq"].values.astype(np.float32) \
+                  if "stock_static__gl_product_group__freq" in g.columns \
+                  else np.zeros(len(g), dtype=np.float32)
+
+        # ── Category静态特征：比GL更细，帮助区分同GL内部zero/peak差异 ─────
+        cat_code = g["stock_static__category_code__code"].values.astype(np.float32) \
+                   if "stock_static__category_code__code" in g.columns \
+                   else np.zeros(len(g), dtype=np.float32)
+        cat_freq = g["stock_static__category_code__freq"].values.astype(np.float32) \
+                   if "stock_static__category_code__freq" in g.columns \
+                   else np.zeros(len(g), dtype=np.float32)
+        cat_unknown = g["stock_static__category_code__is_unknown"].values.astype(np.float32) \
+                      if "stock_static__category_code__is_unknown" in g.columns \
+                      else np.zeros(len(g), dtype=np.float32)
+
+        # ── encoder历史特征（19→22维，如果有category_code）────────────────
+        features = np.stack([
+            np.log1p(demand),                               # 历史需求
+            (demand > 0).astype(float),                     # 需求active
+            np.log1p(total),                                # 历史total_dph
+            np.log1p(buy),                                  # 历史buy_box_dph
+            np.log1p(instock),                              # 历史instock_dph
+            price_log_norm,                                 # 全局log归一化价格
+            oos,                                            # 缺货信号
+            np.sin(2 * np.pi * week_idx / 52.0),           # 年内周期sin
+            np.cos(2 * np.pi * week_idx / 52.0),           # 年内周期cos
+            g["log_review_count"].values.astype(np.float32),  # 评论数
+            g["ind_promotion"].values.astype(np.float32),     # 促销标记
+            month_sin,    # 月份sin
+            month_cos,    # 月份cos
+            season_w,     # 冬季（感恩节/圣诞）
+            season_su,    # 夏季（PrimeDay/户外）
+            pre_event,    # 节假日临近程度
+            post_event,   # 节假日后衰减
+            # ── 新增：GL品类（让encoder学GL×季节交互）────────
+            gl_code,      # GL编码（办公/园艺/家具等）
+            gl_freq,      # GL频率（品类大小）
+            cat_code,     # category_code编码（细粒度品类）
+            cat_freq,     # category_code频率（类别大小/稀疏度）
+            cat_unknown,  # category_code是否unknown（catalog缺失信号）
+        ], axis=1).astype(np.float32)
+
+        data[asin] = {
+            "week":           g["order_week"].values,
+            "features":       features,
+            "demand":         demand,
+            "total_dph":      total,
+            "buy_box_dph":    buy,
+            "in_stock_dph":   instock,
+            "future_context": g[context_cols].values.astype(np.float32),
+            "context_cols":   context_cols,
+        }
+
+    enc_dim = next(iter(data.values()))["features"].shape[1] if len(data) else 0
+    print(f"ASINs: {len(data)} | Context dim: {len(context_cols)} | Encoder dim: {enc_dim}")
+    if "category_code" in df.columns:
+        n_cat = df["category_code"].astype(str).nunique()
+        unk_rate = df.get("stock_static__category_code__is_unknown", pd.Series(0, index=df.index)).mean()
+        print(f"Category code enabled: n_category={n_cat} | unknown_rate={unk_rate:.4f}")
+
+    graph_assets = None
+    if use_graphsage:
+        graph_assets = _build_graphsage_assets(
+            df,
+            graph_horizon=graph_horizon,
+            neighbor_k=neighbor_k,
+            graph_zero_weight=graph_zero_weight,
+            graph_level_peak_weight=graph_level_peak_weight,
+            graph_transition_weight=graph_transition_weight,
+            graph_static_weight=graph_static_weight,
+            graph_brand_weight=graph_brand_weight,
+            verbose=True,
+        )
+        # Attach ASIN index for dataset batches. Missing ASINs are assigned 0 defensively.
+        asin_to_idx = graph_assets["asin_to_idx"]
+        for a, dct in data.items():
+            dct["asin_idx"] = int(asin_to_idx.get(str(a), 0))
+
+    return data, len(context_cols), context_cols, graph_assets
+
+
+# ============================================================
+# Dataset
+# 改动：_make_future_context 加 horizon decay
+# ============================================================
+
+class ExposureDataset(Dataset):
+    def __init__(self, data, history=13, horizon=20, mode="train",
+                 val_weeks=20, anchor_decay=0.08):
+        self.samples = []
+        self.data = data
+        self.history = history
+        self.horizon = horizon
+        self.anchor_decay = anchor_decay  # 新增：控制anchor衰减速度
+
+        for asin, d in data.items():
+            T = len(d["features"])
+            if mode == "train":
+                starts = range(max(0, T - val_weeks - horizon - history + 1))
+            else:
+                s = T - history - horizon
+                starts = [s] if s >= 0 else []
+            for start in starts:
+                self.samples.append((asin, start))
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _hist_mean(arr, end, window):
+        x = arr[max(0, end - window):end]
+        return float(np.mean(x)) if len(x) > 0 else 0.0
+
+    def _make_future_context(self, d, start):
+        h  = self.history
+        H  = self.horizon
+        fc = d["future_context"][start+h:start+h+H].copy()
+        cols = d["context_cols"]
+        idx  = {c: i for i, c in enumerate(cols)}
+        end  = start + h
+
+        # Freeze dynamic review count at forecast origin to avoid future realized review leakage.
+        # review_count=0 is a useful zero/exposure signal, but future true review_count should not be used.
+        if "log_review_count" in idx and end > 0:
+            fc[:, idx["log_review_count"]] = d["future_context"][end - 1, idx["log_review_count"]]
+
+        total   = d["total_dph"]
+        buy     = d["buy_box_dph"]
+        instock = d["in_stock_dph"]
+        demand  = d["demand"]   # 新增
+
+        # ── anchor随horizon衰减 + post_event校正 ──────────────
+        # 两层校正：
+        #   1. horizon decay：随h增大向mean13收缩（已有）
+        #   2. post_event decay：如果历史末尾是节假日峰值，
+        #      对last_val做校正，避免把峰值传播到所有h的anchor
+
+        # 从future_context里读post_event_decay（第一个h的值，代表当前时刻的节假日位置）
+        # post_event_decay在context_cols里，h=0时的值反映"历史末尾距节假日多远"
+        post_event_col = "post_event_decay"
+        if post_event_col in idx:
+            # 用预测起始时刻（h=0）的post_event_decay校正last_val
+            # 节假日刚过（decay≈1）→ last_val可信；节假日过了很久（decay≈0）→ last_val不可信
+            current_post_decay = float(fc[0, idx[post_event_col]])
+        else:
+            current_post_decay = 1.0  # 没有这个特征就不校正
+
+        for step_h in range(H):
+            # horizon decay：越远越收缩到mean13
+            h_decay = np.exp(-self.anchor_decay * step_h)
+
+            for prefix, arr in [("total", total), ("buy_box", buy), ("instock", instock)]:
+                mean13_val = np.log1p(self._hist_mean(arr, end, 13))
+                mean4_val  = np.log1p(self._hist_mean(arr, end, 4))
+                raw_last   = np.log1p(arr[end - 1]) if end > 0 else 0.0
+
+                # post_event校正：节假日后的峰值向mean13收缩
+                # current_post_decay≈1（刚过节假日）→ last_val被大幅校正
+                # current_post_decay≈0（很久以前的节假日）→ last_val基本不变
+                # 校正公式：corrected = last * (1-post_decay) + mean13 * post_decay
+                # 注意：post_decay越大说明越靠近节假日，此时反而需要校正
+                # 感恩节后1周: post_decay≈0.86 → last_val被压向mean13
+                # 正常周:       post_decay≈0.05 → last_val基本不变
+                post_strength = 0.5
+                effective_post_decay = post_strength * current_post_decay
+                last_val = (
+                    raw_last * (1.0 - effective_post_decay)
+                    + mean13_val * effective_post_decay
+                )
+
+                key_map = {
+                    f"hist_{prefix}_dph_last_log":   h_decay * last_val  + (1 - h_decay) * mean13_val,
+                    f"hist_{prefix}_dph_mean4_log":  h_decay * mean4_val + (1 - h_decay) * mean13_val,
+                    f"hist_{prefix}_dph_mean13_log": mean13_val,
+                }
+                for col, val in key_map.items():
+                    if col in idx:
+                        fc[step_h, idx[col]] = val
+
+        # ── demand anchor（所有h用同一个历史值，demand无需decay）──
+        # EDA显示demand领先instock corr=0.676，加入作为近期活跃信号
+        # demand没有节假日峰值校正的问题（demand本身就是真实信号）
+        demand_last   = np.log1p(demand[end - 1]) if end > 0 else 0.0
+        demand_mean4  = np.log1p(self._hist_mean(demand, end, 4))
+        demand_mean13 = np.log1p(self._hist_mean(demand, end, 13))
+        demand_active_rate = float(np.mean(demand[max(0, end-13):end] > 0)) if end > 0 else 0.0
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            # demand anchor也随h衰减（近期更可信）
+            demand_anchor = h_decay * demand_last + (1 - h_decay) * demand_mean13
+            for col, val in [
+                ("hist_demand_last_log",    demand_anchor),
+                ("hist_demand_mean4_log",   h_decay * demand_mean4  + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean13_log",  demand_mean13),
+                ("hist_demand_active_rate", demand_active_rate),
+            ]:
+                if col in idx:
+                    fc[step_h, idx[col]] = val
+
+        return fc
+
+    def __getitem__(self, i):
+        asin, start = self.samples[i]
+        d = self.data[asin]
+        h = self.history
+        H = self.horizon
+
+        return {
+            "asin": asin,
+            "target_week": [str(w)[:10] for w in d["week"][start+h:start+h+H]],
+            "x":              torch.tensor(d["features"][start:start+h], dtype=torch.float32),
+            "future_context": torch.tensor(self._make_future_context(d, start), dtype=torch.float32),
+            "future_total_dph":    torch.tensor(d["total_dph"][start+h:start+h+H],    dtype=torch.float32),
+            "future_buy_box_dph":  torch.tensor(d["buy_box_dph"][start+h:start+h+H],  dtype=torch.float32),
+            "future_instock_dph":  torch.tensor(d["in_stock_dph"][start+h:start+h+H], dtype=torch.float32),
+            "future_demand":       torch.tensor(d["demand"][start+h:start+h+H],        dtype=torch.float32),
+            "asin_idx":            torch.tensor(int(d.get("asin_idx", 0)), dtype=torch.long),
+        }
+
+
+# ============================================================
+# Collate function: keep target_week as [B][H]
+# ============================================================
+
+def exposure_collate(batch):
+    tensor_keys = [
+        "x",
+        "future_context",
+        "future_total_dph",
+        "future_buy_box_dph",
+        "future_instock_dph",
+        "future_demand",
+        "asin_idx",
+    ]
+    out = {k: torch.stack([b[k] for b in batch], dim=0) for k in tensor_keys}
+    out["asin"] = [b["asin"] for b in batch]
+    out["target_week"] = [b["target_week"] for b in batch]
     return out
 
 
-def load_real_data(data_raw, dph_cap_q=0.995):
+# ============================================================
+# Model V2：TCN全序列Encoder + TCN Decoder + Cross-Attention
+# ============================================================
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=2, dilation=1):
+        super().__init__()
+        self.pad  = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, (self.pad, 0)))
+
+
+class ExposureAwareEncoderSelfAttention(nn.Module):
     """
-    34 history features.
-    Feature index map:
-      0  log1p(demand)
-      1  active indicator
-      2  distance since last active / 52
-      3  sin(2π t/52)
-      4  cos(2π t/52)
-      5  promo_t
-      6  sin(2π t/13)
-      7  cos(2π t/13)
-      8  hist_nonzero_mean_52_log   ← lag-fixed
-      9  hist_nonzero_p75_52_log    ← lag-fixed
-      10 recent_peak_13_log         ← lag-fixed
-      11 in_stock_dph_lag_log
-      12 oos
-      13 active_rate_4
-      14 active_rate_13
-      15 oos_rate_4
-      16 oos_rate_13
-      17 instock_mean_4_log
-      18 instock_mean_13_log
-      19 zero_streak_scaled
-      20 price_log
-      21 positive_mean_4_log        ← lag-fixed
-      22 positive_mean_13_log       ← lag-fixed
-      23 positive_max_13_log        ← lag-fixed
-      24 positive_std_13
+    Sparse / exposure-aware self-attention inside the history encoder.
 
-      Added historical DPH funnel features:
-      25 total_dph_log
-      26 buy_box_dph_log
-      27 total_dph_mean_4_log
-      28 total_dph_mean_13_log
-      29 buy_box_dph_mean_4_log
-      30 buy_box_dph_mean_13_log
-      31 buy_box_rate
-      32 in_stock_rate
-      33 in_stock_given_buybox
+    It is designed for sparse exposure series:
+      - down-weight all-zero history weeks,
+      - up-weight active / peak weeks from demand and DPH history,
+      - keep residual + layer norm for stability.
+
+    Expected raw input feature indices from load_exposure_data():
+      0 = log1p(demand)
+      2 = log1p(total_dph)
+      3 = log1p(buy_box_dph)
+      4 = log1p(in_stock_dph)
     """
-    holiday_cols = [c for c in data_raw.columns if c.startswith("holiday_indicator_")]
-    distance_cols = [c for c in data_raw.columns if c.startswith("distance_")]
-    stock_extra_raw_cols = _select_stock_decoder_extra_cols(data_raw)
-    pkg_cols = _infer_pkg_dimension_cols(data_raw)
+    def __init__(self, d_model=64, n_heads=4, dropout=0.15,
+                 zero_penalty=2.0, active_bias=1.0, peak_bias=1.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.zero_penalty = zero_penalty
+        self.active_bias = active_bias
+        self.peak_bias = peak_bias
 
-    # ------------------------------------------------------------
-    # Future-known context features.
-    # We add business seasonality and major shopping-event proximity
-    # BEFORE keep_cols is created, so these columns truly enter future_context.
-    # ------------------------------------------------------------
-    data_raw = data_raw.copy()
-    data_raw["order_week"] = pd.to_datetime(data_raw["order_week"], errors="coerce")
-    data_raw["order_month"] = data_raw["order_week"].dt.month.astype(float)
-    data_raw["month_sin"] = np.sin(2 * np.pi * data_raw["order_month"] / 12.0)
-    data_raw["month_cos"] = np.cos(2 * np.pi * data_raw["order_month"] / 12.0)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
 
-    data_raw["season_winter"] = data_raw["order_month"].isin([12, 1, 2]).astype(float)
-    data_raw["season_spring"] = data_raw["order_month"].isin([3, 4, 5]).astype(float)
-    data_raw["season_summer"] = data_raw["order_month"].isin([6, 7, 8]).astype(float)
-    data_raw["season_fall"] = data_raw["order_month"].isin([9, 10, 11]).astype(float)
+    def forward(self, enc_out, x_raw):
+        B, T, D = enc_out.shape
 
-    seasonal_cols = [
-        "order_month",
-        "month_sin",
-        "month_cos",
-        "season_winter",
-        "season_spring",
-        "season_summer",
-        "season_fall",
+        demand_log = x_raw[:, :, 0]
+        total_log = x_raw[:, :, 2]
+        buy_log = x_raw[:, :, 3]
+        instock_log = x_raw[:, :, 4]
+
+        active_score = (
+            (demand_log > 0).float()
+            + (total_log > 0).float()
+            + (buy_log > 0).float()
+            + (instock_log > 0).float()
+        ).clamp(max=1.0)
+
+        peak_level = (
+            torch.expm1(demand_log).clamp(min=0.0)
+            + torch.expm1(total_log).clamp(min=0.0)
+            + torch.expm1(buy_log).clamp(min=0.0)
+            + torch.expm1(instock_log).clamp(min=0.0)
+        )
+        peak_score = torch.sqrt(peak_level + 1e-6)
+        peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
+
+        q = self.q_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_head)
+
+        key_bias = (
+            self.active_bias * active_score
+            + self.peak_bias * peak_norm
+            - self.zero_penalty * (1.0 - active_score)
+        )
+        scores = scores + key_bias[:, None, None, :]
+
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        out = self.out_proj(out)
+
+        return self.norm(enc_out + out)
+
+
+class HistoryEncoderFull(nn.Module):
+    """
+    TCN Encoder，输出全序列 [B, T, D]。
+    TCN 后可选一层 exposure-aware self-attention，适合 0 很多的 exposure 序列。
+    """
+    def __init__(self, input_dim, d_model=64, n_heads=4, dropout=0.15,
+                 use_self_attn=True):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        dilations = [1, 2, 4, 8, 13, 26]
+        self.convs = nn.ModuleList([
+            CausalConv1d(d_model, d_model, kernel_size=2, dilation=d)
+            for d in dilations
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
+        self.final_norm = nn.LayerNorm(d_model)
+        self.use_self_attn = use_self_attn
+        self.self_attn = ExposureAwareEncoderSelfAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            zero_penalty=2.0,
+            active_bias=1.0,
+            peak_bias=1.0,
+        ) if use_self_attn else None
+
+    def forward(self, x):
+        h = self.input_proj(x).transpose(1, 2)
+
+        for conv, norm in zip(self.convs, self.norms):
+            z = conv(h)
+            h = h + z
+            h = h.transpose(1, 2)
+            h = norm(h)
+            h = F.gelu(h)
+            h = h.transpose(1, 2)
+
+        enc_out = self.final_norm(h.transpose(1, 2))
+
+        if self.self_attn is not None:
+            enc_out = self.self_attn(enc_out, x)
+
+        return enc_out
+
+
+class HorizonTCNBlock(nn.Module):
+    def __init__(self, d_model, kernel_size=3, dilation=1, dropout=0.10):
+        super().__init__()
+        padding    = dilation * (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size, padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size, padding=padding, dilation=dilation)
+        self.drop  = nn.Dropout(dropout)
+        self.norm  = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        res = x
+        z   = x.transpose(1, 2)
+        z   = self.drop(F.relu(self.conv1(z)))
+        z   = self.drop(F.relu(self.conv2(z)))
+        z   = z.transpose(1, 2)
+        m   = min(z.shape[1], res.shape[1])
+        return self.norm(res[:, :m, :] + z[:, :m, :])
+
+
+
+class DualRelationalGATEncoder(nn.Module):
+    """
+    Lightweight dual-relation GAT encoder for ASIN graphs.
+
+    V10 dynamic relation graph version:
+      - keeps the original positive and competitive candidate edges;
+      - learns attention weights over each relation separately;
+      - can return self / positive / competitive messages and attention entropy
+        so the downstream decoder can learn how much positive vs competitive
+        graph signal to use per horizon.
+    """
+    def __init__(self, node_feat_dim, graph_dim=16, dropout=0.10,
+                 neighbor_message_scale=0.20, n_heads=4,
+                 attention_leaky_slope=0.2):
+        super().__init__()
+        self.neighbor_message_scale = float(neighbor_message_scale)
+        self.graph_dim = int(graph_dim)
+        self.n_heads = int(max(1, n_heads))
+        self.dropout = nn.Dropout(dropout)
+        self.leaky_relu = nn.LeakyReLU(attention_leaky_slope)
+
+        self.self_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.pos_proj = nn.Linear(node_feat_dim, graph_dim)
+        self.comp_proj = nn.Linear(node_feat_dim, graph_dim)
+
+        self.pos_attn = nn.Parameter(torch.empty(self.n_heads, graph_dim * 2))
+        self.comp_attn = nn.Parameter(torch.empty(self.n_heads, graph_dim * 2))
+        nn.init.xavier_uniform_(self.pos_attn)
+        nn.init.xavier_uniform_(self.comp_attn)
+
+        self.pos_head_mix = nn.Linear(graph_dim * self.n_heads, graph_dim)
+        self.comp_head_mix = nn.Linear(graph_dim * self.n_heads, graph_dim)
+
+        self.out = nn.Sequential(
+            nn.Linear(graph_dim * 3, graph_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(graph_dim, graph_dim),
+            nn.LayerNorm(graph_dim),
+        )
+
+    def _gat_message(self, h_self, h_neigh, attn_vec, return_alpha=False, edge_bias=None):
+        """
+        h_self:  [N,G]
+        h_neigh: [N,K,G]
+        attn_vec:[heads,2G]
+        returns msg [N,G], optionally alpha [N,K,heads].
+        """
+        N, K, G = h_neigh.shape
+        self_rep = h_self[:, None, :].expand(N, K, G)
+        pair = torch.cat([self_rep, h_neigh], dim=-1)  # [N,K,2G]
+
+        score = torch.einsum('nkd,hd->nkh', pair, attn_vec)
+        # Optional relation-score attention bias from the dynamic relation graph.
+        # Shape edge_bias=[N,K]; it is standardized in graph_assets.
+        if edge_bias is not None:
+            score = score + edge_bias[:, :, None].to(score.device, dtype=score.dtype)
+        score = self.leaky_relu(score)
+        alpha = torch.softmax(score, dim=1)
+        alpha_drop = self.dropout(alpha)
+
+        msg = torch.einsum('nkh,nkg->nhg', alpha_drop, h_neigh)
+        msg = msg.reshape(N, self.n_heads * G)
+        if return_alpha:
+            return msg, alpha
+        return msg
+
+    @staticmethod
+    def _entropy_from_alpha(alpha):
+        # alpha [N,K,heads] -> [N]
+        eps = 1e-8
+        ent = -(alpha.clamp_min(eps) * torch.log(alpha.clamp_min(eps))).sum(dim=1)  # [N,heads]
+        return ent.mean(dim=1)
+
+    def forward(self, node_features, neighbor_idx, competitive_neighbor_idx=None, return_aux=False,
+                positive_edge_score=None, competitive_edge_score=None):
+        h_self = self.self_proj(node_features)  # [N,G]
+
+        pos_raw = node_features[neighbor_idx]
+        h_pos_neigh = self.pos_proj(pos_raw)
+        if return_aux:
+            pos_msg_heads, pos_alpha = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=True, edge_bias=positive_edge_score)
+        else:
+            pos_msg_heads = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=False, edge_bias=positive_edge_score)
+            pos_alpha = None
+        h_pos = self.neighbor_message_scale * self.pos_head_mix(pos_msg_heads)
+
+        if competitive_neighbor_idx is None:
+            h_comp = torch.zeros_like(h_pos)
+            comp_alpha = None
+        else:
+            comp_raw = node_features[competitive_neighbor_idx]
+            h_comp_neigh = self.comp_proj(comp_raw)
+            if return_aux:
+                comp_msg_heads, comp_alpha = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=True, edge_bias=competitive_edge_score)
+            else:
+                comp_msg_heads = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=False, edge_bias=competitive_edge_score)
+                comp_alpha = None
+            h_comp = self.neighbor_message_scale * self.comp_head_mix(comp_msg_heads)
+
+        graph_emb = self.out(torch.cat([h_self, h_pos, h_comp], dim=-1))
+        if not return_aux:
+            return graph_emb
+
+        out = {
+            "graph_emb": graph_emb,
+            "self_msg": h_self,
+            "pos_msg": h_pos,
+            "comp_msg": h_comp,
+            "pos_norm": torch.norm(h_pos, dim=-1),
+            "comp_norm": torch.norm(h_comp, dim=-1),
+            "graph_norm": torch.norm(graph_emb, dim=-1),
+        }
+        if pos_alpha is not None:
+            out["pos_attn_entropy"] = self._entropy_from_alpha(pos_alpha)
+            out["pos_attn_max"] = pos_alpha.max(dim=1).values.mean(dim=1)
+        if comp_alpha is not None:
+            out["comp_attn_entropy"] = self._entropy_from_alpha(comp_alpha)
+            out["comp_attn_max"] = comp_alpha.max(dim=1).values.mean(dim=1)
+        return out
+
+class TCNDecoderWithCrossAttn(nn.Module):
+    """
+    TCN Decoder + Cross-Attention + distributional exposure head.
+
+    Why this version:
+        Recent two-head runs showed unstable compensation:
+            p_active too high + mag too high + gamma stuck at lower bound.
+        This version removes the final p_active^gamma * magnitude gate.
+
+    Final forecast path:
+        encoder + future_context + cross-attention
+            -> direct_head
+            -> log_hat = log1p(total/buy_box/in_stock DPH)
+
+    Auxiliary active head:
+        Still outputs p_active for diagnostics and a small auxiliary BCE loss,
+        but p_active does NOT enter the final exposure prediction.
+    """
+    def __init__(self, d_model, context_dim, horizon=20,
+                 hidden=96, n_heads=4, dropout=0.10,
+                 anchor_indices=None,
+                 active_feat_indices=None,
+                 mag_feat_indices=None,
+                 active_feat_dim=0,
+                 mag_feat_dim=0,
+                 use_enn=True,
+                 z_dim=8,
+                 residual_scale=2.0,
+                 gate_temperature=1.0):
+        super().__init__()
+        self.horizon = horizon
+        self.anchor_indices = anchor_indices
+        self.active_feat_indices = active_feat_indices
+        self.mag_feat_indices = mag_feat_indices
+        self.use_enn = bool(use_enn)
+        self.z_dim = int(z_dim)
+        self.residual_scale = float(residual_scale)
+        self.gate_temperature = float(gate_temperature)
+
+        if self.use_enn:
+            self.z_proj = nn.Sequential(
+                nn.Linear(self.z_dim, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.z_proj = None
+
+        # future_context + horizon position encoding -> hidden
+        self.input_proj = nn.Sequential(
+            nn.Linear(context_dim + 2, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.tcn = nn.ModuleList([
+            HorizonTCNBlock(hidden, dilation=1, dropout=dropout),
+            HorizonTCNBlock(hidden, dilation=2, dropout=dropout),
+            HorizonTCNBlock(hidden, dilation=4, dropout=dropout),
+        ])
+
+        self.dec_proj = nn.Linear(hidden, d_model)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.post_norm = nn.LayerNorm(d_model)
+
+        # Auxiliary occurrence head. With ENN, z controls the 20-week active/zero regime.
+        z_extra = d_model if self.use_enn else 0
+        active_in = d_model + z_extra + max(active_feat_dim, 0)
+        self.active_head = nn.Sequential(
+            nn.Linear(active_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 3),
+        )
+
+        # Direct mean exposure head. With ENN, z controls level/peak/zero regime.
+        # IMPORTANT: p_active is auxiliary only and does NOT gate final predictions.
+        direct_in = d_model + z_extra + max(active_feat_dim, 0) + max(mag_feat_dim, 0)
+        self.direct_head = nn.Sequential(
+            nn.Linear(direct_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 3),
+            nn.Tanh(),
+        )
+
+        # Distributional over-dispersion head. This is the key difference from
+        # the previous direct-softplus exposure model: prediction can be sampled
+        # from a count distribution, so p50 can naturally be exactly zero.
+        self.alpha_head = nn.Sequential(
+            nn.Linear(direct_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 3),
+        )
+
+        # Patch-specific heads. These are used instead of the generic direct_head/alpha_head
+        # in forward(). The purpose is to give the long horizon its own parameters,
+        # so h14-h20 does not get dominated by the easier short-horizon gradients.
+        def _make_patch_head():
+            return nn.Sequential(
+                nn.Linear(direct_in, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, 3),
+                nn.Tanh(),
+            )
+
+        def _make_patch_alpha_head():
+            return nn.Sequential(
+                nn.Linear(direct_in, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, 3),
+            )
+
+        self.direct_head_short = _make_patch_head()   # h1-h5
+        self.direct_head_mid   = _make_patch_head()   # h6-h13
+        self.direct_head_long  = _make_patch_head()   # h14-h20
+        self.alpha_head_short  = _make_patch_alpha_head()
+        self.alpha_head_mid    = _make_patch_alpha_head()
+        self.alpha_head_long   = _make_patch_alpha_head()
+
+    def forward(self, enc_out, future_context, return_aux=False, z=None):
+        B, H, _ = future_context.shape
+
+        h_idx = torch.arange(H, device=future_context.device).float()
+        h_norm = h_idx.view(1, H, 1).expand(B, H, 1) / max(H, 1)
+        hsin = torch.sin(2 * torch.pi * h_norm)
+        hcos = torch.cos(2 * torch.pi * h_norm)
+
+        x = torch.cat([future_context, hsin, hcos], dim=-1)
+        dec = self.input_proj(x)
+        for block in self.tcn:
+            dec = block(dec)
+
+        q = self.dec_proj(dec)
+        attn_out, attn_w = self.cross_attn(
+            q, enc_out, enc_out,
+            need_weights=return_aux,
+        )
+        z_out = self.post_norm(q + attn_out)  # [B,H,D]
+
+        # One latent z per ASIN-window; repeat across horizon to learn joint path regime.
+        z_emb = None
+        if self.use_enn:
+            if z is None:
+                z = torch.randn(B, self.z_dim, device=future_context.device, dtype=future_context.dtype)
+            z_emb = self.z_proj(z)                         # [B,D]
+            z_rep = z_emb[:, None, :].expand(B, H, -1)      # [B,H,D]
+        else:
+            z = None
+            z_rep = None
+
+        active_parts = [z_out]
+        if z_rep is not None:
+            active_parts.append(z_rep)
+
+        active_feats = None
+        if self.active_feat_indices and len(self.active_feat_indices) > 0:
+            active_feats = future_context[:, :, self.active_feat_indices]
+            active_parts.append(active_feats)
+
+        active_in = torch.cat(active_parts, dim=-1)
+        active_logit = self.active_head(active_in)
+        # Auxiliary active probability for diagnostics/loss only.
+        # It does NOT multiply the final exposure prediction.
+        p_active = torch.sigmoid(active_logit / max(self.gate_temperature, 1e-6))
+
+        direct_parts = [z_out]
+        if z_rep is not None:
+            direct_parts.append(z_rep)
+        if active_feats is not None:
+            direct_parts.append(active_feats)
+
+        mag_feats = None
+        if self.mag_feat_indices and len(self.mag_feat_indices) > 0:
+            mag_feats = future_context[:, :, self.mag_feat_indices]
+            direct_parts.append(mag_feats)
+
+        direct_in = torch.cat(direct_parts, dim=-1)
+        # Patch decoder:
+        #   h1-h5   -> short head
+        #   h6-h13  -> mid head
+        #   h14-h20 -> long head
+        # This directly targets the observed failure mode: short horizons are good,
+        # long horizons flatten / underpredict.
+        res_short = self.direct_head_short(direct_in)
+        res_mid   = self.direct_head_mid(direct_in)
+        res_long  = self.direct_head_long(direct_in)
+        alp_short = self.alpha_head_short(direct_in)
+        alp_mid   = self.alpha_head_mid(direct_in)
+        alp_long  = self.alpha_head_long(direct_in)
+
+        h_patch = torch.arange(1, H + 1, device=future_context.device).view(1, H, 1)
+        m_short = (h_patch <= 5).to(direct_in.dtype)
+        m_mid   = ((h_patch >= 6) & (h_patch <= 13)).to(direct_in.dtype)
+        m_long  = (h_patch >= 14).to(direct_in.dtype)
+
+        residual  = res_short * m_short + res_mid * m_mid + res_long * m_long
+        alpha_raw = alp_short * m_short + alp_mid * m_mid + alp_long * m_long
+        alpha = F.softplus(alpha_raw) + 1e-4
+
+        # Anchor-residual mean log forecast.
+        if self.anchor_indices is not None:
+            ti, bi, ii = self.anchor_indices
+            anchor = torch.stack([
+                future_context[:, :, ti],
+                future_context[:, :, bi],
+                future_context[:, :, ii],
+            ], dim=-1)
+            raw_log_mag = anchor + residual * self.residual_scale
+        else:
+            raw_log_mag = residual * self.residual_scale
+
+        log_mag = F.softplus(raw_log_mag)
+        mag_level = torch.expm1(log_mag).clamp(min=0.0)
+
+        # NO multiplicative gate. This stays a single-head direct forecast.
+        # z enters the direct head, so zero/peak/transition regimes are learned by
+        # shifting the path prediction itself, not by p_active * magnitude.
+        gate = torch.ones_like(p_active)
+        pred_level = mag_level
+        log_hat = log_mag
+
+        if return_aux:
+            nan_like = torch.full_like(log_hat, float("nan"))
+            return {
+                "log_hat": log_hat,             # final direct log1p prediction, no gate
+                "active_logit": active_logit,
+                "p_active": p_active,
+                "log_mag": log_mag,             # ungated magnitude log1p prediction
+                "mag_level": mag_level,
+                "pred_level": pred_level,       # mean / mu on level scale
+                "mu_level": pred_level,
+                "alpha": alpha,                   # NB over-dispersion, same shape [B,H,3]
+                "gamma": nan_like,
+                "gate": gate,
+                "residual": residual,
+                "z": z,
+                "attn_weights": attn_w,
+            }
+        return log_hat
+
+
+class ExposureForecastModelV2(nn.Module):
+    """
+    TCN全序列Encoder + Cross-Attention Decoder + single direct exposure head
+
+    Active Head专属特征（事件/时间驱动）：
+        ind_promotion, ind_prime_week, holiday/distance/event列
+        order_month/season, ind_new_asin, hist_demand_active_rate
+
+    Mag Head专属特征（商品特性驱动）：
+        glance_view_band_cat, hbt, our_price_log_norm
+        log_review_count, gl_product_group, category_code, ind_amxl_hb
+        sort_type, hist_demand_mean13, hist_instock_mean13
+    """
+
+    ACTIVE_FEAT_COLS = [
+        "ind_promotion",
+        "ind_prime_week",
+        "stock_static__ind_new_asin",
+        "stock_static__category_code__code",
+        "stock_static__category_code__freq",
+        "stock_static__category_code__is_unknown",
+        "log_review_count",        # 新增：review高→active率高（零值率从75%降到22%）
+        "order_month", "month_sin", "month_cos",
+        "season_winter", "season_spring", "season_summer", "season_fall",
+        "is_event_window", "weeks_to_nearest_event", "abs_weeks_to_nearest_event",
+        "is_pre_event", "is_post_event",
+        "pre_event_proximity", "post_event_decay",
+        "hist_demand_active_rate",
     ]
 
-    # Major event proximity from distance_* columns.
-    # This is robust to slightly different distance column names.
-    event_keywords = [
-        "black", "cyber", "prime", "christmas", "thanksgiving",
-        "newyear", "new_year", "labor", "memorial",
-    ]
-    proximity_cols = []
-    for c in distance_cols:
-        c_lower = c.lower()
-        if any(k in c_lower for k in event_keywords):
-            new_c = f"{c}_proximity"
-            data_raw[new_c] = (
-                1.0 - pd.to_numeric(data_raw[c], errors="coerce").fillna(0.0).abs()
-            ).clip(0.0, 1.0)
-            proximity_cols.append(new_c)
-
-    # Include holiday indicators, raw distance features, explicit season features,
-    # and major-event proximity features.
-    context_cols = ["our_price"] + holiday_cols + distance_cols + seasonal_cols + proximity_cols
-    context_cols = list(dict.fromkeys(context_cols))
-
-    base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
-
-    # Keep in_stock_dph for history encoder only.
-    # It is intentionally excluded from future_context.
-    # Keep DPH variables for history-only safe proxy features.
-    # They are not used as raw future context.
-    history_only_cols = ["in_stock_dph", "total_dph", "buy_box_dph"]
-
-    extra_diag_cols = [c for c in pkg_cols.values() if c is not None]
-
-    keep_cols = [
-        c for c in base_cols + context_cols + history_only_cols + extra_diag_cols + stock_extra_raw_cols
-        if c in data_raw.columns
-    ]
-
-    # Remove duplicate column names. Duplicates can happen because package columns
-    # are used both for total_size diagnostics and stock-decoder extra features.
-    keep_cols = list(dict.fromkeys(keep_cols))
-
-    df = data_raw[keep_cols].copy()
-
-    # Encode additional product / popularity / promo / size features for stock decoder.
-    df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
-
-    # Add encoded stock-extra columns to future_context.
-    # These features help the external exposure covariates.
-    context_cols = context_cols + stock_extra_cols
-
-    # Forecast-origin-safe historical DPH proxy features.
-    # These columns are placeholders here and are filled inside DemandDataset
-    # using only history up to each forecast origin.
-    dph_proxy_cols = [
+    MAG_FEAT_COLS = [
+        "stock_static__glance_view_band__norm",
+        # HBT is kept as static context but should not dominate graph edges.
+        "stock_static__hbt__is_head",
+        "our_price_log_norm",
+        "log_review_count",
+        # GL is a static/group prior, NOT a graph-neighbor rule.
+        "stock_static__gl_product_group__code",
+        "stock_static__gl_product_group__freq",
+        "stock_static__category_code__code",
+        "stock_static__category_code__freq",
+        "stock_static__category_code__is_unknown",
+        "stock_static__ind_amxl_hb",
+        "stock_static__sort_type__norm",
+        "stock_static__ind_top10_brand__code",
+        # Direct ASIN magnitude priors. These are the main signal supported by diagnostics.
         "hist_total_dph_last_log",
         "hist_total_dph_mean4_log",
         "hist_total_dph_mean13_log",
@@ -530,3577 +1993,3229 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         "hist_instock_dph_last_log",
         "hist_instock_dph_mean4_log",
         "hist_instock_dph_mean13_log",
+        "hist_demand_last_log",
+        "hist_demand_mean4_log",
+        "hist_demand_mean13_log",
+        "hist_demand_active_rate",
     ]
-    for c in dph_proxy_cols:
-        df[c] = 0.0
 
-    context_cols = context_cols + dph_proxy_cols
-    df = df.rename(columns={"asin":"ASIN","order_week":"Week","fbi_demand":"Demand","scot_oos":"OOS"})
-
-    h_col = pkg_cols.get("height")
-    l_col = pkg_cols.get("length")
-    w_col = pkg_cols.get("width")
-
-    if h_col is not None and l_col is not None and w_col is not None:
-        pkg_h = pd.to_numeric(_get_1d_col(df, h_col), errors="coerce").fillna(0).clip(lower=0)
-        pkg_l = pd.to_numeric(_get_1d_col(df, l_col), errors="coerce").fillna(0).clip(lower=0)
-        pkg_w = pd.to_numeric(_get_1d_col(df, w_col), errors="coerce").fillna(0).clip(lower=0)
-        df["pkg_volume_raw"] = pkg_h * pkg_l * pkg_w
-    else:
-        df["pkg_volume_raw"] = np.nan
-
-    df["Week"] = pd.to_datetime(df["Week"])
-    df["Demand"] = pd.to_numeric(df["Demand"], errors="coerce").fillna(0).clip(lower=0)
-    df["OOS"] = pd.to_numeric(df["OOS"], errors="coerce").fillna(0)
-    for c in context_cols:
-        df = _safe_numeric(df, c, default=0.0)
-
-    # Keep raw price for amount diagnostics, then use log price for model context.
-    df["our_price_raw"] = df["our_price"].clip(lower=0)
-    df["our_price"] = np.log1p(df["our_price_raw"])
-
-    # Use historical in_stock_dph directly in the encoder; no lag shift.
-    # Future in_stock_dph is not used in future_context.
-    if "in_stock_dph" in df.columns:
-        df["in_stock_dph"] = pd.to_numeric(df["in_stock_dph"], errors="coerce").fillna(0.0)
-        df["in_stock_dph"] = df["in_stock_dph"].clip(lower=0)
-    else:
-        df["in_stock_dph"] = 0.0
-
-    # Historical total_dph / buy_box_dph are used only as forecast-origin-safe summaries.
-    for c in ["total_dph", "buy_box_dph"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0)
-        else:
-            df[c] = 0.0
-
-    # Cap heavy-tailed DPH targets using total_dph as a unified exposure scale cap.
-    # This cap is applied before constructing decoder targets.
-    dph_cap = _compute_total_dph_cap(df, q=dph_cap_q)
-    df = _apply_dph_cap(df, dph_cap)
-    for c in holiday_cols:
-        df[c] = df[c].clip(lower=0, upper=1)
-
-    # Distance-to-holiday features are future-known scalar calendar features.
-    # Keep direction if raw values are signed: negative = before holiday, positive = after holiday.
-    for c in distance_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        df[c] = df[c].clip(lower=-12, upper=12) / 12.0
-
-    df = df.sort_values(["ASIN", "Week"]).reset_index(drop=True)
-
-    if len(holiday_cols) > 0:
-        holiday_window = np.zeros(len(df), dtype=np.float32)
-        for c in holiday_cols:
-            cur = df[c].values.astype(float)
-            prev_window = np.roll(cur, -1); prev_window[-1] = 0
-            holiday_window = np.maximum(holiday_window, np.maximum(cur, prev_window))
-        df["promo_t"] = holiday_window
-    else:
-        df["promo_t"] = 0.0
-
-    df["t"] = ((df["Week"] - df["Week"].min()).dt.days // 7).astype(int)
-
-    data = {}
-    for asin, group in df.groupby("ASIN"):
-        group = group.reset_index(drop=True)
-        demand = group["Demand"].values.astype(float)
-        oos    = group["OOS"].values.astype(float)
-        weeks  = group["Week"].values
-        t      = group["t"].values
-        T      = len(demand)
-
-        v_t = np.log1p(demand)
-        b_t = (demand > 0).astype(float)
-
-        d_t = np.zeros(T)
-        last = -1
-        for i in range(T):
-            if b_t[i] > 0: last = i
-            d_t[i] = (i - last) / 52.0 if last >= 0 else 1.0
-
-        in_stock_lag = group["in_stock_dph"].values.astype(float)
-        instock_raw  = group["in_stock_dph"].values.astype(float)
-        price_log    = group["our_price"].values.astype(float)
-        price_raw    = group["our_price_raw"].values.astype(float)
-        pkg_volume_raw = group["pkg_volume_raw"].values.astype(float)
-        total_dph_raw = group["total_dph"].values.astype(float)
-        buy_box_dph_raw = group["buy_box_dph"].values.astype(float)
-
-        # All rolling features now exclude current step (leak-free)
-        hist_nonzero_mean_52 = _rolling_positive_mean(demand, 52)
-        hist_nonzero_p75_52  = _rolling_positive_quantile(demand, 52, 0.75)
-        recent_peak_13       = _rolling_max_lag(demand, 13)
-
-        active_rate_4   = _rolling_mean(b_t, 4)
-        active_rate_13  = _rolling_mean(b_t, 13)
-        oos_rate_4      = _rolling_mean(oos, 4)
-        oos_rate_13     = _rolling_mean(oos, 13)
-        instock_mean_4  = _rolling_mean(in_stock_lag, 4)
-        instock_mean_13 = _rolling_mean(in_stock_lag, 13)
-
-        total_dph_mean_4  = _rolling_mean(total_dph_raw, 4)
-        total_dph_mean_13 = _rolling_mean(total_dph_raw, 13)
-        buy_box_dph_mean_4  = _rolling_mean(buy_box_dph_raw, 4)
-        buy_box_dph_mean_13 = _rolling_mean(buy_box_dph_raw, 13)
-
-        buy_box_rate = buy_box_dph_raw / (total_dph_raw + 1.0)
-        in_stock_rate = instock_raw / (total_dph_raw + 1.0)
-        in_stock_given_buybox = instock_raw / (buy_box_dph_raw + 1.0)
-
-        buy_box_rate = np.clip(buy_box_rate, 0.0, 10.0)
-        in_stock_rate = np.clip(in_stock_rate, 0.0, 10.0)
-        in_stock_given_buybox = np.clip(in_stock_given_buybox, 0.0, 10.0)
-
-        zero_streak     = _zero_streak(b_t) / 52.0
-
-        positive_mean_4  = _rolling_positive_mean(demand, 4)
-        positive_mean_13 = _rolling_positive_mean(demand, 13)
-        positive_max_13  = _rolling_max_lag(demand, 13)
-        positive_std_13  = _rolling_std(np.log1p(demand), 13)
-
-        features = np.stack([
-            v_t,
-            b_t,
-            d_t,
-            np.sin(2 * np.pi * t / 52),
-            np.cos(2 * np.pi * t / 52),
-            group["promo_t"].values.astype(float),
-            np.sin(2 * np.pi * t / 13),
-            np.cos(2 * np.pi * t / 13),
-            np.log1p(hist_nonzero_mean_52),   # 8
-            np.log1p(hist_nonzero_p75_52),    # 9
-            np.log1p(recent_peak_13),         # 10
-            np.log1p(in_stock_lag),
-            oos,
-            active_rate_4,
-            active_rate_13,
-            oos_rate_4,
-            oos_rate_13,
-            np.log1p(instock_mean_4),
-            np.log1p(instock_mean_13),
-            zero_streak,
-            price_log,
-            np.log1p(positive_mean_4),
-            np.log1p(positive_mean_13),
-            np.log1p(positive_max_13),
-            positive_std_13,
-
-            np.log1p(total_dph_raw),
-            np.log1p(buy_box_dph_raw),
-            np.log1p(total_dph_mean_4),
-            np.log1p(total_dph_mean_13),
-            np.log1p(buy_box_dph_mean_4),
-            np.log1p(buy_box_dph_mean_13),
-            buy_box_rate,
-            in_stock_rate,
-            in_stock_given_buybox,
-        ], axis=1).astype(np.float32)
-
-        future_context = group[context_cols].values.astype(np.float32)
-
-
-        data[asin] = {
-            "features": features,
-            "future_context": future_context,
-            "demand": demand.astype(np.float32),
-            "week": weeks,
-            "oos": oos.astype(np.float32),
-            "price_raw": price_raw.astype(np.float32),
-            "pkg_volume_raw": pkg_volume_raw.astype(np.float32),
-            "instock_raw": instock_raw.astype(np.float32),
-            "total_dph_raw": total_dph_raw.astype(np.float32),
-            "buy_box_dph_raw": buy_box_dph_raw.astype(np.float32),
-            "dph_proxy_context_idx": {
-                c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
-            },
-        }
-
-    print("History encoder dim: 34")
-    print(f"Package dimension columns for total_size: {pkg_cols}")
-    print("History in_stock_dph: raw historical value, no lag shift")
-    print("Future context excludes in_stock_dph")
-    print("Future context includes distance_* calendar features")
-    print("External exposure safe mode: demand uses external predicted DPH hats only")
-    print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
-    print("History encoder includes DPH funnel features")
-    print(f"DPH cap q: {dph_cap_q} | cap value: {dph_cap}")
-    print(f"Context dim: {len(context_cols)}")
-    return data, len(context_cols), context_cols
-
-
-# =====================================================
-# 2. Dataset
-# =====================================================
-
-class DemandDataset(Dataset):
-    def __init__(self, data, history=52, horizon=20, mode="train", val_weeks=20):
-        self.samples = []
-        for asin, d in data.items():
-            T = len(d["demand"])
-            if mode == "train":
-                starts = range(max(0, T - val_weeks - horizon - history + 1))
-            else:
-                s = T - history - horizon
-                starts = [s] if s >= 0 else []
-
-            for start in starts:
-                self.samples.append({
-                    "x": torch.tensor(d["features"][start:start+history], dtype=torch.float32),
-                    "future_context": torch.tensor(
-                        self._make_future_context_with_dph_proxies(
-                            d=d,
-                            start=start,
-                            history=history,
-                            horizon=horizon,
-                        ),
-                        dtype=torch.float32),
-                    "y": torch.tensor(d["demand"][start+history:start+history+horizon], dtype=torch.float32),
-                    "asin": asin,
-                    "target_week": [str(w)[:10] for w in d["week"][start+history:start+history+horizon]],
-                    "oos": torch.tensor(d["oos"][start+history:start+history+horizon], dtype=torch.float32),
-                    "our_price": torch.tensor(
-                        d["price_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "pkg_volume": torch.tensor(
-                        d["pkg_volume_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_instock": torch.tensor(
-                        d["instock_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_total_dph": torch.tensor(
-                        d["total_dph_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                    "future_buy_box_dph": torch.tensor(
-                        d["buy_box_dph_raw"][start+history:start+history+horizon],
-                        dtype=torch.float32),
-                })
-
-    def _safe_hist_mean(self, arr, start, history, window):
-        hist = arr[start:start+history]
-        if len(hist) == 0:
-            return 0.0
-        hist = hist[-min(window, len(hist)):]
-        return float(np.mean(hist))
-
-    def _make_future_context_with_dph_proxies(self, d, start, history, horizon):
-        """
-        Fill historical DPH summary proxy features using only values up to forecast origin.
-        These are repeated across the horizon and do not use future true DPH.
-        """
-        fc = d["future_context"][start+history:start+history+horizon].copy()
-        idx = d.get("dph_proxy_context_idx", {})
-
-        total_hist = d.get("total_dph_raw", None)
-        buy_hist = d.get("buy_box_dph_raw", None)
-        instock_hist = d.get("instock_raw", None)
-
-        def fill(col, val):
-            if col in idx:
-                fc[:, idx[col]] = np.log1p(max(float(val), 0.0))
-
-        if total_hist is not None:
-            total_last = total_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_total_dph_last_log", total_last)
-            fill("hist_total_dph_mean4_log", self._safe_hist_mean(total_hist, start, history, 4))
-            fill("hist_total_dph_mean13_log", self._safe_hist_mean(total_hist, start, history, 13))
-
-        if buy_hist is not None:
-            buy_last = buy_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_buy_box_dph_last_log", buy_last)
-            fill("hist_buy_box_dph_mean4_log", self._safe_hist_mean(buy_hist, start, history, 4))
-            fill("hist_buy_box_dph_mean13_log", self._safe_hist_mean(buy_hist, start, history, 13))
-
-        if instock_hist is not None:
-            instock_last = instock_hist[start+history-1] if history > 0 else 0.0
-            fill("hist_instock_dph_last_log", instock_last)
-            fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
-            fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
-
-        return fc
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, i): return self.samples[i]
-
-
-# =====================================================
-# 3. Model
-# =====================================================
-
-class CausalConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+    def __init__(self, input_dim, context_dim,
+                 d_model=64, horizon=20, n_heads=4, dropout=0.10,
+                 context_cols=None, use_encoder_self_attn=True,
+                 use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
+                 use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
+                 use_graph_head=False, graph_head_scale=0.05, use_graph_gate=True):
         super().__init__()
-        self.padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation)
+        self.use_enn = use_enn
+        self.z_dim = int(z_dim)
+        print(f"Exposure ENN regime enabled: {use_enn} | z_dim={z_dim}")
 
-    def forward(self, x):
-        return self.conv(F.pad(x, (self.padding, 0)))
-
-
-class SparsePeakAttention(nn.Module):
-    def __init__(self, d_model=32, n_heads=4, beta_peak=1.0, soft_mask_scale=3.0):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head  = d_model // n_heads
-        self.beta_peak = beta_peak
-        self.soft_mask_scale = soft_mask_scale
-
-        self.q_proj   = nn.Linear(d_model, d_model)
-        self.k_proj   = nn.Linear(d_model, d_model)
-        self.v_proj   = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout  = nn.Dropout(0.1)
-        self.norm     = nn.LayerNorm(d_model)
-
-    def forward(self, x, b_t, peak_score):
-        B, T, D = x.shape
-        q = self.q_proj(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
-        k = self.k_proj(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
-        v = self.v_proj(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
-
-        scores = torch.matmul(q, k.transpose(-2,-1)) / np.sqrt(self.d_head)
-
-        # Softly down-weight zero-demand weeks.
-        sparse_mask = (b_t == 0) & ~(b_t == 0).all(dim=1, keepdim=True)
-        scores = scores - self.soft_mask_scale * sparse_mask.float()[:, None, None, :]
-
-        peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
-        scores = scores + self.beta_peak * peak_norm[:, None, None, :]
-
-        attn = torch.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        out  = torch.matmul(attn, v)
-        out  = out.transpose(1,2).contiguous().view(B,T,D)
-        out  = self.out_proj(out)
-        return self.norm(x + out)
-
-
-class TCNSparseAttnEncoder(nn.Module):
-    def __init__(self, input_dim=34, d_model=32, horizon=20):
-        super().__init__()
-        self.horizon = horizon
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        # Dilations include quarterly and annual scales.
-        dilations = [1, 2, 4, 8, 13, 26, 52]
-        self.convs = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
-        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
-
-        self.sparse_attn = SparsePeakAttention(d_model, n_heads=4, beta_peak=1.0)
-        self.final_norm  = nn.LayerNorm(d_model)
-
-        self.base_head  = nn.Sequential(nn.Linear(d_model,64), nn.ReLU(), nn.Linear(64,horizon))
-        self.alpha_head = nn.Sequential(nn.Linear(d_model,64), nn.ReLU(), nn.Linear(64,horizon))
-
-    def forward(self, x):
-        b_t        = x[:, :, 1]
-        peak_score = torch.sqrt(torch.expm1(x[:,:,0]).clamp(min=0) + 1e-6)
-
-        h = self.input_proj(x).permute(0,2,1)
-        for conv, norm in zip(self.convs, self.norms):
-            h = conv(h) + h
-            h = h.permute(0,2,1)
-            h = norm(h)
-            h = F.gelu(h)
-            h = h.permute(0,2,1)
-
-        h   = self.sparse_attn(h.permute(0,2,1), b_t, peak_score)
-        h_t = self.final_norm(h[:,-1,:])
-
-        mu    = F.softplus(self.base_head(h_t))
-        alpha = F.softplus(self.alpha_head(h_t)) + 1e-4
-        return mu, alpha, h_t
-
-
-class ContextZGenerator(nn.Module):
-    def __init__(self, d_phi=32, context_dim=2, d_z=16, horizon=20):
-        super().__init__()
-        self.d_z = d_z
-        self.net = nn.Sequential(
-            nn.Linear(d_phi + horizon * context_dim, 64),
-            nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(64, 2 * d_z)
-        )
-
-    def forward(self, phi, future_context):
-        B   = phi.shape[0]
-        ctx = future_context.reshape(B, -1)
-        out = self.net(torch.cat([phi, ctx], dim=-1))
-        z_mean, z_logstd = out.chunk(2, dim=-1)
-        z_std = F.softplus(z_logstd) + 1e-4
-        return z_mean, z_std
-
-
-class Epinet(nn.Module):
-    def __init__(self, d_phi=32, d_z=16, horizon=20, prior_scale=0.3):
-        super().__init__()
-        self.d_z = d_z; self.horizon = horizon; self.prior_scale = prior_scale
-        self.learnable = nn.Sequential(
-            nn.Linear(d_z+d_phi,64), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(64, 2*horizon*d_z)
-        )
-        self.prior = nn.Sequential(
-            nn.Linear(d_z+d_phi,64), nn.ReLU(),
-            nn.Linear(64, 2*horizon*d_z)
-        )
-        for p in self.prior.parameters(): p.requires_grad = False
-
-    def forward(self, phi, z):
-        inp = torch.cat([z, phi], dim=-1)
-        sl  = self.learnable(inp).view(-1, 2*self.horizon, self.d_z)
-        sl  = torch.einsum("bhd,bd->bh", sl, z)
-        sp  = self.prior(inp).view(-1, 2*self.horizon, self.d_z)
-        sp  = torch.einsum("bhd,bd->bh", sp, z) * self.prior_scale
-        out = sl + sp
-        return out[:,:self.horizon], out[:,self.horizon:]
-
-
-
-
-
-
-class TCN_ENN(nn.Module):
-    """
-    Demand model that consumes external predicted exposure-3 hats.
-
-    There is NO internal exposure decoder in this version.
-    The three external hats are appended by load_real_data as the last 3
-    future_context columns:
-      external_total_dph_hat_log
-      external_buy_box_dph_hat_log
-      external_instock_dph_hat_log
-    """
-    def __init__(self, input_dim=34, context_dim=2, d_model=32,
-                 d_z=16, horizon=20, prior_scale=0.3,
-                 use_stock_decoder=False):
-        super().__init__()
-        self.d_z = d_z
-        self.horizon = horizon
-        self.context_dim = context_dim
-        self.use_stock_decoder = False
-        self.stock_decoder = None
-
-        self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon)
-        self.z_generator = ContextZGenerator(d_model, context_dim, d_z, horizon)
-        self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
-
-    def _external_exposure_log_hat(self, future_context):
-        if future_context.shape[-1] >= 3:
-            return future_context[:, :, -3:].clamp(min=0.0)
-        B, H, _ = future_context.shape
-        return torch.zeros(B, H, 3, device=future_context.device, dtype=future_context.dtype)
-
-    def _augment_context_with_stock_hat(self, h_t, future_context, *args, **kwargs):
-        # Compatibility shim for older diagnostics. Do not augment anything.
-        return future_context, self._external_exposure_log_hat(future_context)
-
-    def forward(self, x, future_context, nZ=8, *args, **kwargs):
-        mu_base, alpha_base, h_t = self.encoder(x)
-        phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
-
-        z_reg = 0.001 * (z_mean**2 + z_std**2).mean()
-
-        preds = []
-        for _ in range(nZ):
-            eps = torch.randn_like(z_mean)
-            z = z_mean + z_std * eps
-            mu_e, al_e = self.epinet(phi, z)
-            mu = F.softplus(mu_base + mu_e)
-            alpha = F.softplus(alpha_base + al_e) + 1e-4
-            preds.append((mu, alpha))
-
-        stock_log_hat = self._external_exposure_log_hat(future_context)
-        return preds, z_reg, stock_log_hat
-
-    def predict(self, x, future_context, M=50, return_stock=False, *args, **kwargs):
-        self.eval()
-        with torch.no_grad():
-            mu_base, alpha_base, h_t = self.encoder(x)
-            phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context)
-
-            samples = []
-            for _ in range(M):
-                eps = torch.randn_like(z_mean)
-                z = z_mean + z_std * eps
-                mu_e, al_e = self.epinet(phi, z)
-                mu = F.softplus(mu_base + mu_e)
-                alpha = F.softplus(alpha_base + al_e) + 1e-4
-                dist = torch.distributions.NegativeBinomial(
-                    total_count=(1.0 / alpha).clamp(min=1e-4),
-                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
-                )
-                samples.append(dist.sample().float())
-
-            samples = torch.stack(samples, dim=1)
-            p50 = samples.quantile(0.5, dim=1)
-            p70 = samples.quantile(0.7, dim=1)
-            p70 = torch.maximum(p70, p50)
-            stock_log_hat = self._external_exposure_log_hat(future_context)
-
-        if return_stock:
-            return p50, p70, stock_log_hat
-        return p50, p70
-
-
-# =====================================================
-# 4. Loss
-# =====================================================
-
-def negbin_nll_elementwise(y, mu, alpha):
-    eps = 1e-6
-    r   = (1.0/alpha).clamp(min=eps)
-    p   = (mu*alpha/(1+mu*alpha)).clamp(eps, 1-eps)
-    return -(
-        torch.lgamma(y+r) - torch.lgamma(r) - torch.lgamma(y+1)
-        + r*torch.log(1-p) + y*torch.log(p)
-    )
-
-
-def tail_weighted_negbin_nll(y, mu, alpha, beta_tail=0.5):
-    nll    = negbin_nll_elementwise(y, mu, alpha)
-    weight = 1.0 + beta_tail * torch.log1p(y)
-    return (nll * weight).sum() / weight.sum().clamp(min=1.0)
-
-
-def pinball(y, pred, q):
-    d = y - pred
-    return torch.mean(torch.max(q*d, (q-1)*d))
-
-
-# =====================================================
-# 5. Diagnostics
-# =====================================================
-
-def occurrence_probe_linear_nonlinear(h_ts, ys):
-    """
-    Probe whether future occurrence is linearly or nonlinearly readable from h_t.
-    Targets:
-      any_active: at least one positive demand in horizon
-      next4_active: at least one positive demand in first 4 weeks
-      active_rate_high: horizon active rate above median
-    """
-    targets = {
-        "any_active": (ys > 0).any(axis=1),
-        "next4_active": (ys[:, :min(4, ys.shape[1])] > 0).any(axis=1),
-    }
-
-    active_rate = (ys > 0).mean(axis=1)
-    median_rate = np.median(active_rate)
-    targets["active_rate_high"] = active_rate > median_rate
-
-    rows = []
-
-    for target_name, y_bin in targets.items():
-        y_bin = y_bin.astype(int)
-
-        if y_bin.sum() < 10 or (len(y_bin) - y_bin.sum()) < 10:
-            rows.append({
-                "target": target_name,
-                "positive_rate": y_bin.mean(),
-                "linear_auc": np.nan,
-                "nonlinear_auc": np.nan,
-                "nonlinear_gain": np.nan,
-                "note": "skip: class imbalance",
-            })
-            continue
-
-        try:
-            linear_clf = LogisticRegression(max_iter=500, C=1.0)
-            linear_clf.fit(h_ts, y_bin)
-            linear_auc = roc_auc_score(y_bin, linear_clf.predict_proba(h_ts)[:, 1])
-        except Exception:
-            linear_auc = np.nan
-
-        try:
-            nonlinear_clf = RandomForestClassifier(
-                n_estimators=200,
-                max_depth=4,
-                min_samples_leaf=10,
-                random_state=42,
-                n_jobs=-1,
+        self.use_graphsage = bool(use_graphsage and graph_assets is not None)
+        self.graph_dim = int(graph_dim) if self.use_graphsage else 0
+        self.graph_context_cols = []
+        self.graph_message_scale = float(graph_message_scale)
+        # V7: optional graph-delta head. This is NOT a standalone exposure head.
+        # It applies a small multiplicative correction on the decoder MU path:
+        #     mu_final = mu_base * exp(graph_head_scale * tanh(delta_g))
+        # Default is off for maximum stability; turn on only for ablation.
+        self.use_graph_head = bool(use_graph_head and self.use_graphsage)
+        self.graph_head_scale = float(graph_head_scale)
+        self.use_graph_gate = bool(use_graph_gate and self.use_graphsage)
+        if self.use_graphsage:
+            node_np = graph_assets["node_features"].astype(np.float32)
+            neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
+            comp_np = graph_assets.get("competitive_neighbor_idx", graph_assets["neighbor_idx"]).astype(np.int64)
+            self.register_buffer("graph_node_features", torch.tensor(node_np, dtype=torch.float32))
+            self.register_buffer("graph_neighbor_idx", torch.tensor(neigh_np, dtype=torch.long))
+            self.register_buffer("graph_competitive_neighbor_idx", torch.tensor(comp_np, dtype=torch.long))
+            pos_score_np = graph_assets.get("positive_edge_score", np.zeros_like(neigh_np, dtype=np.float32)).astype(np.float32)
+            comp_score_np = graph_assets.get("competitive_edge_score", np.zeros_like(comp_np, dtype=np.float32)).astype(np.float32)
+            self.register_buffer("graph_positive_edge_score", torch.tensor(pos_score_np, dtype=torch.float32))
+            self.register_buffer("graph_competitive_edge_score", torch.tensor(comp_score_np, dtype=torch.float32))
+            self.graph_encoder = DualRelationalGATEncoder(
+                node_feat_dim=node_np.shape[1],
+                graph_dim=self.graph_dim,
+                dropout=dropout,
+                neighbor_message_scale=graph_message_scale,
+                n_heads=4,
             )
-            nonlinear_clf.fit(h_ts, y_bin)
-            nonlinear_auc = roc_auc_score(y_bin, nonlinear_clf.predict_proba(h_ts)[:, 1])
-        except Exception:
-            nonlinear_auc = np.nan
-
-        rows.append({
-            "target": target_name,
-            "positive_rate": y_bin.mean(),
-            "linear_auc": linear_auc,
-            "nonlinear_auc": nonlinear_auc,
-            "nonlinear_gain": nonlinear_auc - linear_auc
-                if np.isfinite(linear_auc) and np.isfinite(nonlinear_auc)
-                else np.nan,
-            "note": "",
-        })
-
-    out = pd.DataFrame(rows)
-
-    print("\n" + "=" * 60)
-    print("OCCURRENCE PROBE: LINEAR VS NONLINEAR")
-    print("=" * 60)
-    print(out)
-
-    print("\nHow to read:")
-    print("  high linear AUC: occurrence signal is linearly readable from h_t")
-    print("  nonlinear AUC >> linear AUC: h_t contains occurrence signal, but in nonlinear form")
-    print("  both low: encoder may not capture occurrence well")
-
-    return out
-
-
-
-def diagnose_encoder(model, va_ld):
-    """
-    诊断 encoder（h_t）的质量：
-    1. h_t 能区分活跃/非活跃样本的能力（AUC）
-    2. h_t 对 magnitude 的预测力（R²）
-    3. mu_base 和真实需求的对比
-    """
-    print("\n" + "="*60)
-    print("ENCODER DIAGNOSIS")
-    print("="*60)
-
-    model.eval()
-    h_ts, ys, mu_bases = [], [], []
-
-    with torch.no_grad():
-        for b in va_ld:
-            mu_base, alpha_base, h_t = model.encoder(b["x"])
-            h_ts.append(h_t.numpy())
-            ys.append(b["y"].numpy())
-            mu_bases.append(mu_base.numpy())
-
-    h_ts     = np.concatenate(h_ts)      # [N, d_model]
-    ys       = np.concatenate(ys)        # [N, horizon]
-    mu_bases = np.concatenate(mu_bases)  # [N, horizon]
-
-    occurrence_probe_df = occurrence_probe_linear_nonlinear(h_ts, ys)
-
-    # 1. occurrence 判别能力
-    has_active = (ys > 0).any(axis=1)
-    if has_active.sum() > 10 and (~has_active).sum() > 10:
-        try:
-            clf = LogisticRegression(max_iter=500, C=1.0)
-            clf.fit(h_ts, has_active.astype(int))
-            auc = roc_auc_score(has_active, clf.predict_proba(h_ts)[:,1])
-            print(f"h_t → occurrence AUC: {auc:.3f}")
-            if auc < 0.6:
-                print("  ← 差：encoder 对 occurrence 判别能力不足")
-            elif auc < 0.75:
-                print("  ← 一般：有改进空间")
-            else:
-                print("  ← 好：encoder 对 occurrence 有判别能力")
-        except Exception as e:
-            print(f"AUC 计算失败: {e}")
-
-    # 2. magnitude 预测力
-    active_mask  = (ys > 0).any(axis=1)
-    y_mean_active = ys[active_mask].mean(axis=1)
-    h_active      = h_ts[active_mask]
-
-    if len(h_active) > 20:
-        try:
-            reg = Ridge()
-            reg.fit(h_active, np.log1p(y_mean_active))
-            r2  = r2_score(np.log1p(y_mean_active), reg.predict(h_active))
-            print(f"h_t → log(magnitude) R²: {r2:.3f}")
-            if r2 < 0.1:
-                print("  ← 差：encoder 对 magnitude 几乎没有预测力")
-            elif r2 < 0.3:
-                print("  ← 一般：有改进空间")
-            else:
-                print("  ← 好：encoder 对 magnitude 有预测力")
-        except Exception as e:
-            print(f"R² 计算失败: {e}")
-
-    # 3. mu_base vs 真实需求
-    active_weeks_mask = ys > 0
-    if active_weeks_mask.sum() > 0:
-        true_mean  = ys[active_weeks_mask].mean()
-        mu_mean    = mu_bases[active_weeks_mask].mean()
-        print(f"\nActive weeks comparison:")
-        print(f"  true demand mean : {true_mean:.2f}")
-        print(f"  mu_base mean     : {mu_mean:.2f}")
-        print(f"  ratio (mu/true)  : {mu_mean/max(true_mean,1e-8):.3f}")
-        if mu_mean / max(true_mean, 1e-8) < 0.3:
-            print("  ← mu_base 严重低估，magnitude 学习有问题")
-        elif mu_mean / max(true_mean, 1e-8) < 0.7:
-            print("  ← mu_base 偏低，有改进空间")
+            # IMPORTANT v4: expose graph embedding as named future-context columns so the
+            # magnitude patch heads can directly consume it, not only through the TCN/cross-attn path.
+            self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
+            if context_cols is not None:
+                context_cols = list(context_cols) + self.graph_context_cols
+            print(f"DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
+            print(f"Category-only graph v9: GL is static only; DualGAT positive/competitive messages are horizon-gated. Optional graph-delta head={self.use_graph_head}, scale={self.graph_head_scale}, graph_gate={self.use_graph_gate}.")
         else:
-            print("  ← mu_base 合理")
+            self.graph_encoder = None
+            print("DualRelationalGAT disabled")
 
-    # 4. z 的质量
-    z_means, z_stds = [], []
-    with torch.no_grad():
-        for b in va_ld:
-            _, _, h_t = model.encoder(b["x"])
-            phi = h_t.detach()
+        if self.use_graph_head:
+            self.graph_delta_head = nn.Sequential(
+                nn.Linear(self.graph_dim, max(32, self.graph_dim * 2)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, self.graph_dim * 2), 3),
+                nn.Tanh(),
+            )
+        else:
+            self.graph_delta_head = None
 
-            # Stock-decoder version:
-            # z_generator expects future_context augmented with predicted stock_hat.
-            if hasattr(model, "_augment_context_with_stock_hat"):
-                fc_for_z, _ = model._augment_context_with_stock_hat(h_t, b["future_context"])
+        if self.use_graphsage:
+            # Horizon-level graph gates. These learn how much positive and competitive
+            # graph message to use for each ASIN and each future week.
+            gate_in_dim = context_dim + self.graph_dim * 3
+            self.graph_gate_net = nn.Sequential(
+                nn.Linear(gate_in_dim, max(32, self.graph_dim * 4)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, self.graph_dim * 4), 2),
+            )
+            self.graph_fusion_norm = nn.LayerNorm(self.graph_dim)
+        else:
+            self.graph_gate_net = None
+            self.graph_fusion_norm = None
+
+        self.encoder = HistoryEncoderFull(
+            input_dim=input_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            use_self_attn=use_encoder_self_attn,
+        )
+        print(f"Encoder exposure-aware self-attn: {use_encoder_self_attn}")
+
+        col_idx = {c: i for i, c in enumerate(context_cols)} if context_cols else {}
+
+        # anchor indices（mean13）
+        anchor_indices = None
+        try:
+            anchor_indices = [
+                col_idx["hist_total_dph_mean13_log"],
+                col_idx["hist_buy_box_dph_mean13_log"],
+                col_idx["hist_instock_dph_mean13_log"],
+            ]
+            print(f"Anchor indices (mean13): {anchor_indices}")
+        except KeyError as e:
+            print(f"Warning: anchor column not found: {e}")
+
+        # active head专属特征索引
+        active_feat_indices = []
+        for c in self.ACTIVE_FEAT_COLS:
+            if c in col_idx:
+                active_feat_indices.append(col_idx[c])
+        # 加入所有holiday/distance/event列
+        if context_cols:
+            for i, c in enumerate(context_cols):
+                if (c.startswith("holiday_indicator_") or
+                    c.startswith("distance_") or
+                    c.startswith("event_")):
+                    if i not in active_feat_indices:
+                        active_feat_indices.append(i)
+
+        # mag head专属特征索引
+        mag_feat_indices = []
+        for c in self.MAG_FEAT_COLS:
+            if c in col_idx:
+                mag_feat_indices.append(col_idx[c])
+
+        # v6: graph_emb_* columns are appended to future_context so the decoder TCN/cross-attn
+        # can use them as light context, but they are NOT added to mag_feat_indices.
+        # This avoids the previous graph-fusion failure mode where direct-to-head graph features
+        # improved global ratio but worsened WAPE / ASIN-tail error.
+        graph_direct_indices = []
+
+        print(f"Active head feat dim: {len(active_feat_indices)}")
+        print(f"Mag head feat dim:    {len(mag_feat_indices)}")
+        print("Graph direct-to-mag-head feat dim: 0 (v7 keeps graph out of mag features)")
+        print(f"Graph delta head: {self.use_graph_head} | graph_head_scale={self.graph_head_scale}")
+
+        self.decoder = TCNDecoderWithCrossAttn(
+            d_model=d_model,
+            context_dim=context_dim + self.graph_dim,
+            horizon=horizon,
+            hidden=max(96, d_model * 2),
+            n_heads=n_heads,
+            dropout=dropout,
+            anchor_indices=anchor_indices,
+            active_feat_indices=active_feat_indices,
+            mag_feat_indices=mag_feat_indices,
+            active_feat_dim=len(active_feat_indices),
+            mag_feat_dim=len(mag_feat_indices),
+            use_enn=use_enn,
+            z_dim=z_dim,
+            residual_scale=residual_scale,
+            gate_temperature=gate_temperature,
+        )
+
+    def _apply_graph_delta_head(self, dec_out, g):
+        """
+        V7 optional graph head.
+        This is a small multiplicative correction, not an additive standalone head:
+            level_final = level_base * exp(scale * tanh(delta_g))
+        It lets category graph adjust ASIN-level magnitude without taking over the forecast.
+        """
+        if (not self.use_graph_head) or (self.graph_delta_head is None) or (g is None):
+            return dec_out
+
+        delta = self.graph_delta_head(g)  # [B,3], already tanh-bounded
+        log_mult = self.graph_head_scale * delta[:, None, :]  # [B,1,3]
+
+        def _adjust_log_hat(base_log_hat):
+            base_level = torch.expm1(base_log_hat).clamp(min=0.0)
+            final_level = base_level * torch.exp(log_mult)
+            return torch.log1p(final_level.clamp(min=0.0))
+
+        if isinstance(dec_out, dict):
+            base_log_hat = dec_out["log_hat"]
+            final_log_hat = _adjust_log_hat(base_log_hat)
+            final_level = torch.expm1(final_log_hat).clamp(min=0.0)
+            dec_out = dict(dec_out)
+            dec_out["base_log_hat_before_graph_head"] = base_log_hat
+            dec_out["graph_delta"] = delta
+            dec_out["graph_log_multiplier"] = log_mult.expand_as(base_log_hat)
+            dec_out["graph_head_scale"] = torch.tensor(self.graph_head_scale, dtype=base_log_hat.dtype, device=base_log_hat.device)
+            dec_out["log_hat"] = final_log_hat
+            dec_out["log_mag"] = final_log_hat
+            dec_out["mag_level"] = final_level
+            dec_out["pred_level"] = final_level
+            dec_out["mu_level"] = final_level
+            return dec_out
+
+        return _adjust_log_hat(dec_out)
+
+    def forward(self, x, future_context, return_aux=False, z=None, asin_idx=None):
+        enc_out = self.encoder(x)
+        g = None
+
+        graph_aux = None
+        if self.use_graphsage:
+            if asin_idx is None:
+                raise ValueError("asin_idx is required when use_graphsage=True")
+            graph_all = self.graph_encoder(
+                self.graph_node_features,
+                self.graph_neighbor_idx,
+                self.graph_competitive_neighbor_idx,
+                return_aux=True,
+                positive_edge_score=self.graph_positive_edge_score,
+                competitive_edge_score=self.graph_competitive_edge_score,
+            )
+            idx = asin_idx.long()
+            g = graph_all["graph_emb"][idx]       # [B,G]
+            g_self = graph_all["self_msg"][idx]   # [B,G]
+            g_pos = graph_all["pos_msg"][idx]     # [B,G]
+            g_comp = graph_all["comp_msg"][idx]   # [B,G]
+
+            B, H, _ = future_context.shape
+            if self.use_graph_gate and self.graph_gate_net is not None:
+                g_self_rep = g_self[:, None, :].expand(B, H, -1)
+                g_pos_rep = g_pos[:, None, :].expand(B, H, -1)
+                g_comp_rep = g_comp[:, None, :].expand(B, H, -1)
+                gate_in = torch.cat([future_context, g_self_rep, g_pos_rep, g_comp_rep], dim=-1)
+                gate_logits = self.graph_gate_net(gate_in)
+                gates = torch.sigmoid(gate_logits)
+                pos_gate = gates[..., 0:1]
+                comp_gate = gates[..., 1:2]
+                g_rep = self.graph_fusion_norm(g_self_rep + pos_gate * g_pos_rep + comp_gate * g_comp_rep)
             else:
-                fc_for_z = b["future_context"]
+                pos_gate = torch.ones(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+                comp_gate = torch.ones(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+                g_rep = g[:, None, :].expand(B, H, -1)
 
-            zm, zs = model.z_generator(phi, fc_for_z)
-            z_means.append(zm.numpy())
-            z_stds.append(zs.numpy())
+            future_context = torch.cat([future_context, g_rep], dim=-1)
+            if return_aux:
+                graph_aux = {
+                    "graph_pos_gate": pos_gate.squeeze(-1),
+                    "graph_comp_gate": comp_gate.squeeze(-1),
+                    "graph_gate": 0.5 * (pos_gate.squeeze(-1) + comp_gate.squeeze(-1)),
+                    "graph_pos_minus_comp_gate": (pos_gate.squeeze(-1) - comp_gate.squeeze(-1)),
+                    "graph_pos_norm": graph_all["pos_norm"][idx],
+                    "graph_comp_norm": graph_all["comp_norm"][idx],
+                    "graph_emb_norm": graph_all["graph_norm"][idx],
+                    "graph_pos_attn_entropy": graph_all.get("pos_attn_entropy", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_comp_attn_entropy": graph_all.get("comp_attn_entropy", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_pos_attn_max": graph_all.get("pos_attn_max", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                    "graph_comp_attn_max": graph_all.get("comp_attn_max", torch.full((self.graph_node_features.shape[0],), float("nan"), device=future_context.device))[idx],
+                }
 
-    z_means = np.concatenate(z_means)
-    z_stds  = np.concatenate(z_stds)
-    print(f"\nz quality:")
-    print(f"  z_mean abs mean : {np.abs(z_means).mean():.3f} (should be small)")
-    print(f"  z_std mean      : {z_stds.mean():.3f} (should be ~1)")
-    if z_stds.mean() > 3.0:
-        print("  ← z_std 过大，后验扩张，joint prediction 不稳定")
-    elif z_stds.mean() < 0.1:
-        print("  ← z_std 过小，z 失去不确定性表达能力")
-    else:
-        print("  ← z_std 合理")
-
-    print("="*60)
+        dec_out = self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
+        dec_out = self._apply_graph_delta_head(dec_out, g)
+        if return_aux and isinstance(dec_out, dict) and graph_aux is not None:
+            dec_out.update(graph_aux)
+        return dec_out
 
 
-def diagnose_training_batch(b, preds, epoch, bi, n_diag_batches=3):
-    """Print diagnostics for the first few batches."""
-    if bi >= n_diag_batches:
-        return
-    y = b["y"]
-    active_cnt = (y > 0).sum().item()
-    total_cnt  = y.numel()
-    mu_mean    = torch.stack([mu for mu, _ in preds], dim=0).mean().item()
-    y_active_mean = y[y > 0].mean().item() if active_cnt > 0 else 0.0
-    print(
-        f"  [batch {bi}] active={active_cnt}/{total_cnt} "
-        f"({100*active_cnt/total_cnt:.1f}%) "
-        f"mu_mean={mu_mean:.2f} "
-        f"y_active_mean={y_active_mean:.2f}"
+# ============================================================
+# Loss：Distributional NB + Hurdle BCE + Magnitude Huber + Mean Penalty
+# ============================================================
+
+def exposure_negbin_nll_elementwise(y, mu, alpha):
+    """
+    Negative-binomial NLL for nonnegative exposure counts.
+    y can be float-valued DPH; lgamma form is stable and works as a quasi-likelihood.
+    mu is the expected exposure level and alpha is over-dispersion.
+    """
+    eps = 1e-6
+    y = y.clamp(min=0.0)
+    mu = mu.clamp(min=eps)
+    alpha = alpha.clamp(min=1e-4, max=100.0)
+    r = (1.0 / alpha).clamp(min=eps, max=1e6)
+    p = (mu * alpha / (1.0 + mu * alpha)).clamp(eps, 1.0 - eps)
+    return -(
+        torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1.0)
+        + r * torch.log1p(-p) + y * torch.log(p)
     )
 
 
-# =====================================================
-# 6. Training
-# =====================================================
+def exposure_tail_weighted_nb_nll(true, mu, alpha, channel_weights, high_weight_alpha=0.25):
+    """Tail-weighted NB quasi-NLL for exposure distribution learning."""
+    nll = exposure_negbin_nll_elementwise(true, mu, alpha)
+    denom = torch.log1p(true).detach().mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+    high_w = 1.0 + high_weight_alpha * torch.log1p(true).detach() / denom
+    w = channel_weights.view(1, 1, 3) * high_w
+    return (nll * w).sum() / w.sum().clamp_min(1.0)
 
-def train(
-    model,
-    tr_ld,
-    va_ld,
-    epochs=60,
-    nZ=8,
-    lr=1e-3,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.0,
-    lambda_stock_mean_weight=0.0,
+def exposure_hurdle_loss(
+    log_hat,        # [B,H,3] direct log1p prediction
+    true_total,     # [B,H]
+    true_buy,       # [B,H]
+    true_instock,   # [B,H]
+    active_logit,   # [B,H,3] auxiliary occurrence logits only
+    log_mag=None,   # unused; kept for interface compatibility
+    alpha=None,      # [B,H,3] NB over-dispersion for distributional exposure head
+    nb_weight=0.25,
+    w_total=0.30,
+    w_buy=0.60,
+    w_instock=1.00,
+    bce_weight=0.20,
+    mag_weight=1.00,
+    mean_weight=0.25,
+    active_calib_weight=0.05,
+    # Zero-aware weights. Zero mainly happens in buy_box / in_stock, not total.
+    zero_weight=0.00,  # kept for backward compatibility; not used as the main zero term
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.15,
+    high_weight_alpha=0.35,
+    short_horizon_weight=0.8,
+    mid_horizon_weight=1.2,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.30,
+    # ENN/path-regime terms
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    # Peak/path-high regime terms. These prevent zero losses from making the model too conservative.
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
 ):
     """
-    Train demand model with external predicted exposure hats already in future_context.
-    No internal exposure decoder and no true future DPH are passed into the model.
-    lambda_stock arguments are kept only for API compatibility and are ignored.
-    """
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    Single-head direct exposure loss with channel-specific zero awareness.
 
-    best_val = float("inf")
-    best_sd = None
-    no_improve = 0
+    Why this version:
+      - total_dph is almost never zero in the data, so total-zero consistency alone
+        does not teach the model to capture in_stock zeros.
+      - buy_box_dph / in_stock_dph have meaningful zero rates that vary by GL/month.
+      - The final prediction is still single-head direct; p_active is auxiliary only.
+
+    Main terms:
+      1. direct log1p Huber regression
+      2. light mean scale penalty
+      3. auxiliary active BCE/calibration
+      4. channel-specific zero losses for buy_box and in_stock
+      5. hierarchy zero consistency:
+           true_total == 0   => total/buy_box/in_stock should be near 0
+           true_buy_box == 0 => buy_box/in_stock should be near 0
+    """
+    true = torch.stack([
+        true_total.clamp(min=0.0),
+        true_buy.clamp(min=0.0),
+        true_instock.clamp(min=0.0),
+    ], dim=-1)   # [B,H,3]
+
+    target_log = torch.log1p(true)
+    tw = torch.tensor([w_total, w_buy, w_instock],
+                      dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+
+    denom = target_log.detach().mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+    high_w = 1.0 + high_weight_alpha * target_log.detach() / denom
+
+    H = true.shape[1]
+    h = torch.arange(1, H + 1, device=true.device, dtype=true.dtype).view(1, H, 1)
+    # Horizon block weighting. Short horizons already perform well; we upweight
+    # h14-h20 to fight long-horizon magnitude collapse.
+    base_h_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
+    block_h_w = torch.where(
+        h <= 5,
+        torch.full_like(h, float(short_horizon_weight)),
+        torch.where(
+            h <= 13,
+            torch.full_like(h, float(mid_horizon_weight)),
+            torch.full_like(h, float(long_horizon_weight)),
+        ),
+    )
+    horizon_w = base_h_w * block_h_w
+    sample_w = high_w * horizon_w
+
+    # 1) Main direct log loss.
+    log_err = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
+    direct_loss = (log_err * sample_w * tw).mean()
+
+    # Distributional NB quasi-likelihood. This teaches over-dispersion so that
+    # sparse exposure paths can produce exact-zero sample quantiles, similar to
+    # the demand model's NB sampling mechanism. The mean path is still controlled
+    # by log_hat / pred_level, so we do not hard-threshold or gate predictions.
+    if alpha is not None and nb_weight > 0:
+        mu_for_nb = torch.expm1(log_hat).clamp(min=1e-6)
+        nb_loss = exposure_tail_weighted_nb_nll(
+            true=true,
+            mu=mu_for_nb,
+            alpha=alpha,
+            channel_weights=tw.view(3),
+            high_weight_alpha=high_weight_alpha,
+        )
+    else:
+        nb_loss = torch.zeros((), dtype=log_hat.dtype, device=log_hat.device)
+
+    # Shared zero error: target log is zero when target exposure is zero.
+    zero_err = F.huber_loss(log_hat, torch.zeros_like(log_hat), delta=0.5, reduction="none")
+
+    def _masked_channel_loss(mask_2d, channel_idx, channel_weight=1.0):
+        """Mask shape [B,H]. Penalize one output channel when the matching true channel is zero."""
+        m = mask_2d.float().unsqueeze(-1)  # [B,H,1]
+        ch = torch.zeros_like(true)
+        ch[..., channel_idx] = 1.0
+        weight = m * ch * sample_w * tw
+        denom = weight.sum().clamp_min(1.0)
+        return channel_weight * (zero_err * weight).sum() / denom
+
+    # 2) Channel-specific zero losses.
+    # total is rare-zero, keep small; buy_box/in_stock are the important channels.
+    total_zero_loss = _masked_channel_loss(true_total <= 0, 0)
+    buy_zero_loss = _masked_channel_loss(true_buy <= 0, 1)
+    instock_zero_loss = _masked_channel_loss(true_instock <= 0, 2)
+
+    # 3) Hierarchy zero consistency.
+    # If total is zero, all channels should be near zero. This is correct but rare.
+    total_zero_mask = (true_total <= 0).float().unsqueeze(-1)
+    total_zero_weight_mat = total_zero_mask * sample_w * tw
+    total_zero_consistency = (zero_err * total_zero_weight_mat).sum() / total_zero_weight_mat.sum().clamp_min(1.0)
+
+    # If buy_box is zero, buy_box and in_stock should be near zero.
+    # This matters more than total-zero consistency in this dataset.
+    buy_zero_mask = (true_buy <= 0).float().unsqueeze(-1)
+    buy_instock_selector = torch.tensor([0.0, 1.0, 1.0], dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+    buy_zero_weight_mat = buy_zero_mask * buy_instock_selector * sample_w * tw
+    buy_zero_consistency = (zero_err * buy_zero_weight_mat).sum() / buy_zero_weight_mat.sum().clamp_min(1.0)
+
+    zero_loss = (
+        total_zero_weight * total_zero_loss
+        + buy_zero_weight * buy_zero_loss
+        + instock_zero_weight * instock_zero_loss
+        + total_zero_consistency_weight * total_zero_consistency
+        + buy_zero_consistency_weight * buy_zero_consistency
+    )
+
+    # 4) Mean scale penalty on level space, used lightly to avoid systematic over/under.
+    pred_level = torch.expm1(log_hat).clamp(min=0.0)
+    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)).clamp_min(1e-6))
+    mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
+    mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
+
+    # 5) Auxiliary occurrence loss. This is deliberately small and does not gate final predictions.
+    active_label = (true > 0).float()
+    pos_w = torch.tensor([0.5, 0.5, 0.5],
+                         dtype=log_hat.dtype,
+                         device=log_hat.device).view(1, 1, 3)
+    bce_raw = F.binary_cross_entropy_with_logits(
+        active_logit, active_label, reduction="none"
+    )
+    bce = bce_raw * (1.0 - active_label) + bce_raw * active_label * pos_w
+    bce_loss = (bce * sample_w * tw).mean()
+
+    p_active = torch.sigmoid(active_logit)
+    active_rate_pred = p_active.mean(dim=(0, 1))
+    active_rate_true = active_label.mean(dim=(0, 1))
+    active_calib_loss = (torch.abs(active_rate_pred - active_rate_true) * tw.view(3)).mean()
+
+    # 6) Path/regime losses for ENN.
+    # These target the observed failure mode: true future is zero or active->zero,
+    # but the model keeps a positive floor every week.
+    pred_instock = pred_level[..., 2]
+    true_instock_y = true[..., 2]
+
+    true_path_zero = (true_instock_y.sum(dim=1) <= 0).float()
+    pred_path_sum = pred_instock.sum(dim=1)
+    path_zero_loss = (true_path_zero * torch.log1p(pred_path_sum)).mean()
+
+    true_zero_instock = (true_instock_y <= 0).float()
+    pred_positive_soft = torch.sigmoid((pred_instock - zero_fp_threshold) / max(zero_fp_temperature, 1e-6))
+    zero_fp_loss = (true_zero_instock * pred_positive_soft * horizon_w.squeeze(-1)).mean()
+
+    true_active_count = (true_instock_y > 0).float().sum(dim=1)
+    pred_active_count = pred_positive_soft.sum(dim=1)
+    active_count_loss = F.smooth_l1_loss(pred_active_count, true_active_count)
+
+    true_path_sum_log = torch.log1p(true_instock_y.sum(dim=1).clamp_min(0.0))
+    pred_path_sum_log = torch.log1p(pred_path_sum.clamp_min(0.0))
+    path_sum_loss = F.smooth_l1_loss(pred_path_sum_log, true_path_sum_log)
+
+    # ASIN/window 20-week sum loss across all three exposure channels.
+    # This is the main magnitude prior: it asks the single-head decoder to get
+    # each ASIN's total future exposure level right, instead of only matching
+    # pointwise weekly errors. This is NOT a two-head or active-gated term.
+    true_sum_all_log = torch.log1p(true.sum(dim=1).clamp_min(0.0))      # [B,3]
+    pred_sum_all_log = torch.log1p(pred_level.sum(dim=1).clamp_min(0.0)) # [B,3]
+    asin_sum_loss = (F.smooth_l1_loss(pred_sum_all_log, true_sum_all_log, reduction="none") * tw.view(1,3)).mean()
+
+    # Long-block sum loss: explicitly protect h14-h20 total in_stock exposure.
+    # This is more stable than only increasing pointwise weights, because the
+    # key failure mode is long-block level underprediction.
+    long_start = 13 if H > 13 else max(H - 1, 0)  # zero-based index: h14
+    true_long_sum_log = torch.log1p(true_instock_y[:, long_start:].sum(dim=1).clamp_min(0.0))
+    pred_long_sum_log = torch.log1p(pred_instock[:, long_start:].sum(dim=1).clamp_min(0.0))
+    long_block_sum_loss = F.smooth_l1_loss(pred_long_sum_log, true_long_sum_log)
+
+    # 7) Peak/path-high losses for ENN.
+    # These target the opposite failure mode of zero losses: peak compression.
+    # Use in_stock as the main business-critical exposure channel.
+    true_peak = true_instock_y.max(dim=1).values
+    pred_peak = pred_instock.max(dim=1).values
+    peak_loss = F.smooth_l1_loss(torch.log1p(pred_peak), torch.log1p(true_peak))
+
+    k = int(max(1, min(int(peak_topk), true_instock_y.shape[1])))
+    true_topk = torch.topk(true_instock_y, k=k, dim=1).values
+    pred_topk = torch.topk(pred_instock, k=k, dim=1).values
+    topk_peak_loss = F.smooth_l1_loss(torch.log1p(pred_topk), torch.log1p(true_topk))
+
+    # High under-loss: if the target is in the high tail, underpredicting is especially costly.
+    # Detach threshold so it is a data-dependent weighting, not a learned target.
+    flat_true = true_instock_y.detach().reshape(-1)
+    if flat_true.numel() > 0 and torch.max(flat_true) > 0:
+        high_th = torch.quantile(flat_true, float(peak_quantile))
+    else:
+        high_th = torch.tensor(0.0, dtype=true_instock_y.dtype, device=true_instock_y.device)
+    high_mask = (true_instock_y >= high_th).float() * (true_instock_y > 0).float()
+    peak_under = F.relu(torch.log1p(true_instock_y) - torch.log1p(pred_instock))
+    peak_under_loss = (peak_under * high_mask).sum() / high_mask.sum().clamp_min(1.0)
+
+    return (
+        nb_weight * nb_loss
+        + mag_weight * direct_loss
+        + mean_weight * mean_loss
+        + bce_weight * bce_loss
+        + active_calib_weight * active_calib_loss
+        + zero_loss
+        + path_zero_weight * path_zero_loss
+        + zero_fp_weight * zero_fp_loss
+        + active_count_weight * active_count_loss
+        + path_sum_weight * path_sum_loss
+        + asin_sum_weight * asin_sum_loss
+        + long_block_sum_weight * long_block_sum_loss
+        + peak_weight * peak_loss
+        + topk_peak_weight * topk_peak_loss
+        + peak_under_weight * peak_under_loss
+    )
+
+# ============================================================
+# 训练
+# ============================================================
+
+def train_exposure_model_v2(
+    model, tr_ld, va_ld,
+    epochs=60, lr=1e-3, patience=8,
+    w_total=0.30, w_buy=0.60, w_instock=1.00,
+    bce_weight=0.00, mag_weight=1.00, mean_weight=0.40,
+    active_calib_weight=0.00,
+    nb_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.15, high_weight_alpha=0.35,
+    short_horizon_weight=0.8,
+    mid_horizon_weight=1.2,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.30,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
+    device=None,
+):
+    device = get_device(device)
+    model = model.to(device)
+    print(f"Training on device: {device}")
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+
+    best_val, best_sd, no_improve = float("inf"), None, 0
 
     for epoch in range(epochs):
         model.train()
-        tr_loss = 0.0
+        tr_sum, tr_n = 0.0, 0
 
-        for bi, b in enumerate(tr_ld):
-            x = b["x"]
-            fc = b["future_context"]
-            y = b["y"]
-
-            preds, z_reg, _ = model(x, fc, nZ=nZ)
-
-            nll_loss = sum(
-                tail_weighted_negbin_nll(y, mu, alpha, beta_tail=beta_tail)
-                for mu, alpha in preds
-            ) / nZ
-
-            mu_stack = torch.stack([mu for mu, _ in preds], dim=1)
-            p50_train = mu_stack.quantile(0.5, dim=1)
-            p70_train = mu_stack.quantile(0.7, dim=1)
-            p70_train = torch.maximum(p70_train, p50_train)
-            q_loss = pinball(y, p50_train, 0.5) + pinball(y, p70_train, 0.7)
-
-            loss = nll_loss + lambda_q * q_loss + lambda_z_reg * z_reg
-
+        for b in tr_ld:
+            b = batch_to_device(b, device)
+            aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
+            loss = exposure_hurdle_loss(
+                log_hat=aux["log_hat"],
+                true_total=b["future_total_dph"],
+                true_buy=b["future_buy_box_dph"],
+                true_instock=b["future_instock_dph"],
+                active_logit=aux["active_logit"],
+                log_mag=aux["log_mag"],
+                alpha=aux.get("alpha", None),
+                nb_weight=nb_weight,
+                w_total=w_total, w_buy=w_buy, w_instock=w_instock,
+                bce_weight=bce_weight, mag_weight=mag_weight,
+                mean_weight=mean_weight,
+                active_calib_weight=active_calib_weight,
+                zero_weight=zero_weight,
+                total_zero_weight=total_zero_weight,
+                buy_zero_weight=buy_zero_weight,
+                instock_zero_weight=instock_zero_weight,
+                total_zero_consistency_weight=total_zero_consistency_weight,
+                buy_zero_consistency_weight=buy_zero_consistency_weight,
+                horizon_weight_alpha=horizon_weight_alpha,
+                high_weight_alpha=high_weight_alpha,
+                path_zero_weight=path_zero_weight,
+                zero_fp_weight=zero_fp_weight,
+                active_count_weight=active_count_weight,
+                path_sum_weight=path_sum_weight,
+                asin_sum_weight=asin_sum_weight,
+                short_horizon_weight=short_horizon_weight,
+                mid_horizon_weight=mid_horizon_weight,
+                long_horizon_weight=long_horizon_weight,
+                long_block_sum_weight=long_block_sum_weight,
+                peak_weight=peak_weight,
+                topk_peak_weight=topk_peak_weight,
+                peak_under_weight=peak_under_weight,
+                peak_topk=peak_topk,
+                peak_quantile=peak_quantile,
+                zero_fp_threshold=zero_fp_threshold,
+                zero_fp_temperature=zero_fp_temperature,
+            )
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            tr_loss += loss.item()
-
-            if epoch == 0:
-                diagnose_training_batch(b, preds, epoch, bi)
+            tr_sum += loss.item() * b["x"].shape[0]
+            tr_n   += b["x"].shape[0]
 
         sch.step()
 
         model.eval()
-        vl = 0.0
+        va_sum, va_n = 0.0, 0
         with torch.no_grad():
             for b in va_ld:
-                p50, p70 = model.predict(b["x"], b["future_context"], M=50)
-                vl += (pinball(b["y"], p50, 0.5) + pinball(b["y"], p70, 0.7)).item()
-        vl /= max(1, len(va_ld))
+                b = batch_to_device(b, device)
+                aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
+                loss = exposure_hurdle_loss(
+                    log_hat=aux["log_hat"],
+                    true_total=b["future_total_dph"],
+                    true_buy=b["future_buy_box_dph"],
+                    true_instock=b["future_instock_dph"],
+                    active_logit=aux["active_logit"],
+                    log_mag=aux["log_mag"],
+                    alpha=aux.get("alpha", None),
+                    nb_weight=nb_weight,
+                    w_total=w_total, w_buy=w_buy, w_instock=w_instock,
+                    bce_weight=bce_weight, mag_weight=mag_weight,
+                    mean_weight=mean_weight,
+                    active_calib_weight=active_calib_weight,
+                    zero_weight=zero_weight,
+                    total_zero_weight=total_zero_weight,
+                    buy_zero_weight=buy_zero_weight,
+                    instock_zero_weight=instock_zero_weight,
+                    total_zero_consistency_weight=total_zero_consistency_weight,
+                    buy_zero_consistency_weight=buy_zero_consistency_weight,
+                    horizon_weight_alpha=horizon_weight_alpha,
+                    high_weight_alpha=high_weight_alpha,
+                    path_zero_weight=path_zero_weight,
+                    zero_fp_weight=zero_fp_weight,
+                    active_count_weight=active_count_weight,
+                    path_sum_weight=path_sum_weight,
+                    peak_weight=peak_weight,
+                    topk_peak_weight=topk_peak_weight,
+                    peak_under_weight=peak_under_weight,
+                    peak_topk=peak_topk,
+                    peak_quantile=peak_quantile,
+                    zero_fp_threshold=zero_fp_threshold,
+                    zero_fp_temperature=zero_fp_temperature,
+                )
+                va_sum += loss.item() * b["x"].shape[0]
+                va_n   += b["x"].shape[0]
 
-        improved = vl < best_val
-        if improved:
-            best_val = vl
-            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        tr_loss = tr_sum / max(tr_n, 1)
+        va_loss = va_sum / max(va_n, 1)
+        print(f"Epoch {epoch+1:03d} | train={tr_loss:.5f} | val={va_loss:.5f}")
+
+        if va_loss < best_val - 1e-6:
+            best_val   = va_loss
+            best_sd    = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
         else:
             no_improve += 1
 
-        print(
-            f"Epoch {epoch+1:3d} | "
-            f"train={tr_loss/max(1,len(tr_ld)):.4f} | "
-            f"val={vl:.4f} | "
-            f"beta_tail={beta_tail}"
-            + (" *" if improved else "")
-        )
-
         if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch+1} (patience={patience})")
+            print(f"Early stop at epoch {epoch+1}. Best val={best_val:.5f}")
             break
 
-    if best_sd:
+    if best_sd is not None:
         model.load_state_dict(best_sd)
-    print(f"Best val: {best_val:.4f}")
+    return model
 
 
-# =====================================================
-# 7. Evaluation and forecast generation
-# =====================================================
+# ============================================================
+# 预测（输出格式与原版完全相同，多了p_active诊断列）
+# ============================================================
 
-def evaluate(model, va_ld, M=100):
-    all_y, all_p50, all_p70 = [], [], []
-    model.eval()
-    with torch.no_grad():
-        for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
-            all_y.append(b["y"].numpy())
-            all_p50.append(p50.numpy())
-            all_p70.append(p70.numpy())
-    y = np.concatenate(all_y)
-    p50 = np.concatenate(all_p50)
-    p70 = np.concatenate(all_p70)
-    yt = torch.tensor(y)
-    return {
-        "pinball50": pinball(yt, torch.tensor(p50), 0.5).item(),
-        "pinball70": pinball(yt, torch.tensor(p70), 0.7).item(),
-    }
+def _nb_sample_from_mu_alpha(mu, alpha):
+    """Sample from NB parameterized by mean mu and over-dispersion alpha."""
+    eps = 1e-6
+    mu = mu.clamp(min=eps)
+    alpha = alpha.clamp(min=1e-4, max=100.0)
+    total_count = (1.0 / alpha).clamp(min=1e-4, max=1e6)
+    probs = (mu * alpha / (1.0 + mu * alpha)).clamp(eps, 1.0 - eps)
+    dist = torch.distributions.NegativeBinomial(total_count=total_count, probs=probs)
+    return dist.sample().float()
 
 
-def generate_forecast_df(model, va_ld, M=50):
+def predict_exposure_v2(
+    model,
+    va_ld,
+    apply_funnel_constraint=True,
+    device=None,
+    mc_samples=50,
+    mc_reduce="mu",
+    use_distributional_samples=True,
+):
+    """
+    Predict exposure paths.
+
+    Default mc_reduce="mu": the main pred_*_dph columns use the direct expected level
+    expm1(log_hat). This is the recommended exposure covariate for the demand model.
+
+    NB sampling is still explicit and available via mc_reduce="p50"/"nb_sample" or
+    mc_reduce="nb_mean". The sampled p50 is kept as a zero/active diagnostic, but is
+    usually too conservative to pass directly into demand.
+
+    Extra diagnostics:
+      pred_*_dph_mu: direct mean path expm1(log_hat)
+      pred_*_dph_dist_mean: MC mean of sampled distribution
+      pred_*_dph_dist_p50: MC median of sampled distribution
+    """
+    device = get_device(device)
+    model = model.to(device)
     rows = []
     model.eval()
     with torch.no_grad():
         for b in va_ld:
-            p50, p70, stock_log_hat = model.predict(
-                b["x"],
-                b["future_context"],
-                M=M,
-                return_stock=True,
-            )
-            hist_mean = (b["x"][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
-            hm50 = hist_mean.expand_as(b["y"])
-            hm70 = hm50 * 1.25
-            for i in range(b["y"].shape[0]):
-                for h in range(b["y"].shape[1]):
+            b = batch_to_device(b, device)
+            sample_preds, mu_preds, pacts, gates = [], [], [], []
+            last_aux = None
+            K = max(int(mc_samples), 1)
+            for _ in range(K):
+                aux = model(b["x"], b["future_context"], return_aux=True, asin_idx=b.get("asin_idx"))
+                last_aux = aux
+                mu_level = torch.expm1(aux["log_hat"]).clamp(min=0.0)
+                mu_preds.append(mu_level)
+
+                if use_distributional_samples and aux.get("alpha", None) is not None:
+                    sample_level = _nb_sample_from_mu_alpha(mu_level, aux["alpha"])
+                else:
+                    sample_level = mu_level
+                sample_preds.append(sample_level)
+                pacts.append(aux["p_active"])
+                gates.append(aux.get("gate", torch.full_like(aux["p_active"], float("nan"))))
+
+            sample_stack = torch.stack(sample_preds, dim=0)  # [K,B,H,3]
+            mu_stack = torch.stack(mu_preds, dim=0)
+            pact_stack = torch.stack(pacts, dim=0)
+            gate_stack = torch.stack(gates, dim=0)
+
+            # ------------------------------------------------------------
+            # IMPORTANT: inference reduction path
+            # ------------------------------------------------------------
+            # mu / direct / expected:
+            #   use direct mean path expm1(log_hat); alpha is NOT used here.
+            # mean / nb_mean / dist_mean:
+            #   use Monte Carlo mean from NegativeBinomial samples.
+            # median / p50 / nb_sample:
+            #   use Monte Carlo median/p50 from NegativeBinomial samples.
+            #
+            # This makes the NB sampling path explicit; alpha_head is only
+            # activated for mean/median/p50/nb_sample reductions when
+            # use_distributional_samples=True.
+            mu_t = mu_stack.mean(dim=0)
+            dist_mean_t = sample_stack.mean(dim=0)
+            dist_p50_t = sample_stack.median(dim=0).values
+
+            reduce_key = str(mc_reduce).lower()
+            if reduce_key in ["mu", "direct", "expected"]:
+                pred_t = mu_t
+            elif reduce_key in ["mean", "nb_mean", "dist_mean"]:
+                pred_t = dist_mean_t
+            elif reduce_key in ["median", "p50", "nb_sample", "sample_median"]:
+                pred_t = dist_p50_t
+            else:
+                raise ValueError(
+                    f"Unknown mc_reduce={mc_reduce}. Use one of: "
+                    "'mu', 'mean'/'nb_mean', 'median'/'p50'/'nb_sample'."
+                )
+            pact_t = pact_stack.mean(dim=0)
+            gate_t = gate_stack.median(dim=0).values
+
+            pred = pred_t.cpu().numpy()
+            mu_np = mu_t.cpu().numpy()
+            dist_mean_np = dist_mean_t.cpu().numpy()
+            dist_p50_np = dist_p50_t.cpu().numpy()
+            pact = pact_t.cpu().numpy()
+            gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
+            gate_np = gate_t.cpu().numpy()
+
+            def _aux_horizon_np(name):
+                v = last_aux.get(name, None)
+                if v is None:
+                    return np.full((b["future_instock_dph"].shape[0], b["future_instock_dph"].shape[1]), np.nan)
+                return v.detach().cpu().numpy()
+
+            def _aux_asin_np(name):
+                v = last_aux.get(name, None)
+                if v is None:
+                    return np.full((b["future_instock_dph"].shape[0],), np.nan)
+                return v.detach().cpu().numpy()
+
+            graph_pos_gate_np = _aux_horizon_np("graph_pos_gate")
+            graph_comp_gate_np = _aux_horizon_np("graph_comp_gate")
+            graph_gate_np = _aux_horizon_np("graph_gate")
+            graph_pos_minus_comp_gate_np = _aux_horizon_np("graph_pos_minus_comp_gate")
+            graph_pos_norm_np = _aux_asin_np("graph_pos_norm")
+            graph_comp_norm_np = _aux_asin_np("graph_comp_norm")
+            graph_emb_norm_np = _aux_asin_np("graph_emb_norm")
+            graph_pos_attn_entropy_np = _aux_asin_np("graph_pos_attn_entropy")
+            graph_comp_attn_entropy_np = _aux_asin_np("graph_comp_attn_entropy")
+            graph_pos_attn_max_np = _aux_asin_np("graph_pos_attn_max")
+            graph_comp_attn_max_np = _aux_asin_np("graph_comp_attn_max")
+
+            if apply_funnel_constraint:
+                # apply funnel to all prediction views
+                for arr in (pred, mu_np, dist_mean_np, dist_p50_np):
+                    arr[:, :, 1] = np.minimum(arr[:, :, 1], arr[:, :, 0])
+                    arr[:, :, 2] = np.minimum(arr[:, :, 2], arr[:, :, 1])
+
+            B, H = b["future_instock_dph"].shape
+            for i in range(B):
+                for h in range(H):
                     rows.append({
-                        "asin": b["asin"][i],
-                        "order_week": pd.to_datetime(b["target_week"][h][i]),
-                        "fcst_week_index": h + 1,
-                        "fbi_demand": b["y"][i, h].item(),
-                        "our_price": b["our_price"][i, h].item(),
-                        "true_amt": b["y"][i, h].item() * b["our_price"][i, h].item(),
-                        "pkg_volume": b["pkg_volume"][i, h].item(),
-                        "true_size": b["y"][i, h].item() * b["pkg_volume"][i, h].item(),
+                        "asin":              b["asin"][i],
+                        "order_week":        pd.to_datetime(b["target_week"][i][h]),
+                        "horizon":           h + 1,
+                        "true_total_dph":    b["future_total_dph"][i, h].item(),
+                        "pred_total_dph":    pred[i, h, 0],
+                        "true_buy_box_dph":  b["future_buy_box_dph"][i, h].item(),
+                        "pred_buy_box_dph":  pred[i, h, 1],
+                        "true_instock_dph":  b["future_instock_dph"][i, h].item(),
+                        "pred_instock_dph":  pred[i, h, 2],
+                        "true_demand":       b["future_demand"][i, h].item(),
 
-                        # True DPH values below are output-only diagnostics, never model inputs.
-                        "true_future_total_dph": b["future_total_dph"][i, h].item() if "future_total_dph" in b else np.nan,
-                        "true_future_buy_box_dph": b["future_buy_box_dph"][i, h].item() if "future_buy_box_dph" in b else np.nan,
-                        "true_future_instock": b["future_instock"][i, h].item() if "future_instock" in b else np.nan,
+                        "pred_total_dph_mu":       mu_np[i, h, 0],
+                        "pred_buy_box_dph_mu":     mu_np[i, h, 1],
+                        "pred_instock_dph_mu":     mu_np[i, h, 2],
+                        "pred_total_dph_dist_mean":   dist_mean_np[i, h, 0],
+                        "pred_buy_box_dph_dist_mean": dist_mean_np[i, h, 1],
+                        "pred_instock_dph_dist_mean": dist_mean_np[i, h, 2],
+                        "pred_total_dph_dist_p50":    dist_p50_np[i, h, 0],
+                        "pred_buy_box_dph_dist_p50":  dist_p50_np[i, h, 1],
+                        "pred_instock_dph_dist_p50":  dist_p50_np[i, h, 2],
 
-                        # These are the external predicted exposure hats appended to future_context.
-                        "pred_total_dph_hat": torch.expm1(stock_log_hat[i, h, 0]).item() if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_hat": torch.expm1(stock_log_hat[i, h, 1]).item() if stock_log_hat is not None else np.nan,
-                        "pred_instock_dph_hat": torch.expm1(stock_log_hat[i, h, 2]).item() if stock_log_hat is not None else np.nan,
-                        "pred_total_dph_log_hat": stock_log_hat[i, h, 0].item() if stock_log_hat is not None else np.nan,
-                        "pred_buy_box_dph_log_hat": stock_log_hat[i, h, 1].item() if stock_log_hat is not None else np.nan,
-                        "pred_instock_log_hat": stock_log_hat[i, h, 2].item() if stock_log_hat is not None else np.nan,
+                        "p_active_total":    pact[i, h, 0],
+                        "p_active_buy_box":  pact[i, h, 1],
+                        "p_active_instock":  pact[i, h, 2],
+                        "gamma_total":       gamma_np[i, h, 0],
+                        "gamma_buy_box":     gamma_np[i, h, 1],
+                        "gamma_instock":     gamma_np[i, h, 2],
+                        "gate_total":        gate_np[i, h, 0],
+                        "gate_buy_box":      gate_np[i, h, 1],
+                        "gate_instock":      gate_np[i, h, 2],
 
-                        "scot_oos": b["oos"][i, h].item(),
-                        "oos": b["oos"][i, h].item(),
-                        "oos_status": b["oos"][i, h].item(),
-                        "p50_amxl": p50[i, h].item(),
-                        "p70_amxl": p70[i, h].item(),
-                        "p50_scot": hm50[i, h].item(),
-                        "p70_scot": hm70[i, h].item(),
+                        # DualGAT gating diagnostics. These are model-learned horizon-level
+                        # weights for positive vs competitive graph messages.
+                        "graph_pos_gate": graph_pos_gate_np[i, h],
+                        "graph_comp_gate": graph_comp_gate_np[i, h],
+                        "graph_gate": graph_gate_np[i, h],
+                        "graph_pos_minus_comp_gate": graph_pos_minus_comp_gate_np[i, h],
+                        "graph_pos_norm": graph_pos_norm_np[i],
+                        "graph_comp_norm": graph_comp_norm_np[i],
+                        "graph_emb_norm": graph_emb_norm_np[i],
+                        "graph_pos_attn_entropy": graph_pos_attn_entropy_np[i],
+                        "graph_comp_attn_entropy": graph_comp_attn_entropy_np[i],
+                        "graph_pos_attn_max": graph_pos_attn_max_np[i],
+                        "graph_comp_attn_max": graph_comp_attn_max_np[i],
                     })
     return pd.DataFrame(rows)
 
 
-def generate_diagnostic_df(model, va_ld, M=100, threshold=0.5):
-    rows = []
-    model.eval()
-    with torch.no_grad():
-        for b in va_ld:
-            p50, p70 = model.predict(b["x"], b["future_context"], M=M)
-            for i in range(b["y"].shape[0]):
-                for h in range(b["y"].shape[1]):
-                    y_val = b["y"][i, h].item()
-                    p50_val = p50[i, h].item()
-                    p70_val = p70[i, h].item()
-                    rows.append({
-                        "asin": b["asin"][i],
-                        "order_week": pd.to_datetime(b["target_week"][h][i]),
-                        "horizon": h + 1,
-                        "y": y_val,
-                        "p50": p50_val,
-                        "p70": p70_val,
-                        "true_active": int(y_val > 0),
-                        "pred_active_p50": int(p50_val > threshold),
-                        "pred_active_p70": int(p70_val > threshold),
-                    })
-    return pd.DataFrame(rows)
+# ============================================================
+# 评估（完全复用原版函数）
+# ============================================================
 
-
-def underbias_diagnosis(diag_df, pred_col="p70", threshold=0.5):
-    y    = diag_df["y"].values
-    pred = diag_df[pred_col].values
-    ta   = y > 0
-    pa   = pred > threshold
-    tp = np.sum(ta & pa); fp = np.sum(~ta & pa)
-    fn = np.sum(ta & ~pa); tn = np.sum(~ta & ~pa)
-    recall    = tp / max(1, tp+fn)
-    precision = tp / max(1, tp+fp)
-    f1        = 2*precision*recall / max(1e-8, precision+recall)
-    total_under = np.maximum(y-pred, 0).sum()
-    missed_under    = np.maximum(y[ta & ~pa] - pred[ta & ~pa], 0).sum()
-    magnitude_under = np.maximum(y[ta & pa]  - pred[ta & pa],  0).sum()
-    ratio = pred[ta & pa] / np.maximum(y[ta & pa], 1e-8) if (ta & pa).sum() > 0 else np.array([np.nan])
-    return pd.DataFrame([{
-        "pred_col": pred_col, "threshold": threshold,
-        "TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn),
-        "occurrence_recall": recall, "occurrence_precision": precision, "occurrence_f1": f1,
-        "total_underbias": total_under,
-        "underbias_rate": total_under / max(1e-8, y.sum()),
-        "missed_active_share": missed_under / max(1e-8, total_under),
-        "magnitude_under_share": magnitude_under / max(1e-8, total_under),
-        "avg_pred_over_true_when_active_predicted": np.nanmean(ratio),
-        "median_pred_over_true_when_active_predicted": np.nanmedian(ratio),
-    }])
-
-
-def magnitude_gap(diag_df):
-    df = diag_df[diag_df["true_active"]==1].copy()
-    if len(df) == 0: return pd.DataFrame()
-    y, p50, p70 = df["y"].values, df["p50"].values, df["p70"].values
-    out = pd.DataFrame([{
-        "true_active_mean": y.mean(),
-        "p50_active_mean": p50.mean(),
-        "p70_active_mean": p70.mean(),
-        "p50_pct_of_true": p50.mean()/max(y.mean(),1e-8),
-        "p70_pct_of_true": p70.mean()/max(y.mean(),1e-8),
-        "p50_gap": y.mean()-p50.mean(),
-        "p70_gap": y.mean()-p70.mean(),
-    }])
-    print("\n[Magnitude Gap - Active weeks only]")
-    print(out.T)
-    return out
-
-
-# =====================================================
-# 8. Run
-# =====================================================
-
-def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
-    df = data_high.copy()
-    df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce").fillna(0).clip(lower=0)
-    pos = df.loc[df[demand_col]>0, demand_col]
-    if len(pos) == 0: return df, pd.DataFrame(), np.nan
-    cap = float(pos.quantile(q))
-    asin_peak = df.groupby(asin_col)[demand_col].max().reset_index(name="asin_max")
-    bad_asins = asin_peak.loc[asin_peak["asin_max"]>cap, asin_col]
-    clean = df[~df[asin_col].isin(bad_asins)].copy()
-    print(f"\nExtreme ASIN filter (p{int(q*100)}={cap:.1f}): removed {bad_asins.nunique()} ASINs")
-    print(f"Clean ASINs: {clean[asin_col].nunique()} | Clean rows: {len(clean)}")
-    return clean, asin_peak[asin_peak[asin_col].isin(bad_asins)], cap
-
-
-def run_nb_high_sparse(
-    data_raw1,
-    n_asins=5000,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.05,
-    lambda_stock_mean_weight=0.30,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-):
-    print("="*70)
-    print("NB-v2 HIGH-SPARSE | leak-fix + soft-mask + dilation13 + early-stop + z-reg")
-    print("="*70)
-
-    data_small, _ = add_zero_rate_group(
-        prepare_data_sample(data_raw1, n_asins), zero_thresholds
-    )
-    data_high = data_small[data_small["zero_group"]=="high_sparse"].copy()
-
-    if remove_extreme:
-        data_high, _, _ = filter_extreme_asins(data_high, q=extreme_q)
-
-    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
-    all_demand = np.concatenate([d["demand"] for d in data.values()])
-    print(f"ASINs: {len(data)} | Zero rate: {(all_demand==0).mean():.1%}")
-
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val",   horizon)
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
-    print(f"Train: {len(tr_ds)} | Val: {len(va_ds)}")
-
-    model = TCN_ENN(25, context_dim, d_model, d_z, horizon, prior_scale)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_params:,} | d_model={d_model} | d_z={d_z}")
-    print(f"beta_tail={beta_tail} | lambda_q={lambda_q} | patience={patience}")
-
-    train(model, tr_ld, va_ld,
-          epochs=epochs, nZ=8, lr=1e-3,
-          lambda_q=lambda_q, beta_tail=beta_tail,
-          patience=patience, lambda_z_reg=lambda_z_reg, lambda_stock=lambda_stock, lambda_stock_mean_weight=lambda_stock_mean_weight)
-
-    # Encoder diagnostics.
-    diagnose_encoder(model, va_ld)
-
-    metrics = evaluate(model, va_ld, M=M_eval)
-    print(f"\nPinball50={metrics['pinball50']:.4f} | Pinball70={metrics['pinball70']:.4f}")
-
-    forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
-    forecast_df["zero_group_run"] = "high_sparse_nb_v2"
-
-    diag_df  = generate_diagnostic_df(model, va_ld, M=M_eval)
-    diag_p50 = underbias_diagnosis(diag_df, "p50")
-    diag_p70 = underbias_diagnosis(diag_df, "p70")
-    mag_gap_df = magnitude_gap(diag_df)
-
-    print("\nUnderbias P50:"); print(diag_p50.T)
-    print("\nUnderbias P70:"); print(diag_p70.T)
-
-    return {
-        "model": model,
-        "forecast_df": forecast_df,
-        "diag_df": diag_df,
-        "diag_p50": diag_p50,
-        "diag_p70": diag_p70,
-        "mag_gap": mag_gap_df,
-        "tr_ld": tr_ld,
-        "va_ld": va_ld,
-    }
-
-
-
-# =====================================================
-# 9. Final WAPE summary
-# =====================================================
-
-def run_final_wape(result, remove_oos_dp=True, source="lp"):
-    """
-    Compute final boss-style WAPE from result["forecast_df"].
-
-    This function expects these notebook functions to already exist:
-      - calculate_wape_using_lp_oos2
-      - quick_error_check
-    """
-    if "forecast_df" not in result:
-        raise KeyError('result must contain "forecast_df".')
-
-    if "calculate_wape_using_lp_oos2" not in globals():
-        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
-
-    if "quick_error_check" not in globals():
-        raise RuntimeError("quick_error_check is not defined.")
-
-    forecast_df = result["forecast_df"]
-
-    wape_df = calculate_wape_using_lp_oos2(
-        forecast_df,
-        [0.5, 0.7],
-        remove_oos_dp=remove_oos_dp,
-        source=source,
-    )
-
-    cols_p50 = [
-        "p50_amxl_penalty",
-        "p50_scot_penalty",
-        "p50_amxl_overbias",
-        "p50_scot_overbias",
-        "p50_amxl_underbias",
-        "p50_scot_underbias",
-        "fbi_demand",
+def exposure_metrics(pred_df, prefix="pred"):
+    specs = [
+        ("total_dph",   "true_total_dph",   f"{prefix}_total_dph"),
+        ("buy_box_dph", "true_buy_box_dph",  f"{prefix}_buy_box_dph"),
+        ("in_stock_dph","true_instock_dph",  f"{prefix}_instock_dph"),
     ]
-
-    cols_p70 = [
-        "p70_amxl_penalty",
-        "p70_scot_penalty",
-        "p70_amxl_overbias",
-        "p70_scot_overbias",
-        "p70_amxl_underbias",
-        "p70_scot_underbias",
-        "fbi_demand",
-    ]
-
-    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
-    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
-
-    print("\n" + "=" * 80)
-    print("FINAL WAPE SUMMARY")
-    print("=" * 80)
-
-    print("\nP50 WAPE")
-    print(p50_wape)
-    print("P50 penalty diff:", p50_penalty_diff)
-
-    print("\nP70 WAPE")
-    print(p70_wape)
-    print("P70 penalty diff:", p70_penalty_diff)
-
-    return {
-        "wape_df": wape_df,
-        "p50_wape": p50_wape,
-        "p70_wape": p70_wape,
-        "p50_penalty_diff": p50_penalty_diff,
-        "p70_penalty_diff": p70_penalty_diff,
-    }
-
-
-def run_nb_high_sparse_with_wape(
-    data_raw1,
-    n_asins=5000,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.05,
-    lambda_stock_mean_weight=0.30,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    remove_oos_dp=True,
-):
-    """
-    Run the full experiment and print final WAPE.
-    """
-    result = run_nb_high_sparse(
-        data_raw1=data_raw1,
-        n_asins=n_asins,
-        zero_thresholds=zero_thresholds,
-        prior_scale=prior_scale,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        remove_extreme=remove_extreme,
-        extreme_q=extreme_q,
-    )
-
-    wape_outputs = run_final_wape(
-        result,
-        remove_oos_dp=remove_oos_dp,
-        source="lp",
-    )
-
-    result["wape_outputs"] = wape_outputs
-
-    return result
-
-
-
-# =====================================================
-# 10. Sparse-group WAPE diagnostics
-# =====================================================
-
-def attach_zero_group_to_joined_df(joined_df, asin_stats):
-    """
-    Attach zero_rate and zero_group to the joined AMXL-SCOT forecast dataframe.
-    """
-    if asin_stats is None or len(asin_stats) == 0:
-        return joined_df.copy()
-
-    out = joined_df.copy()
-    stats = asin_stats.copy()
-
-    out["asin"] = out["asin"].astype(str)
-    stats["asin"] = stats["asin"].astype(str)
-
-    keep = [c for c in ["asin", "zero_rate", "zero_group"] if c in stats.columns]
-
-    if "zero_group" not in keep:
-        return out
-
-    out = out.merge(
-        stats[keep].drop_duplicates("asin"),
-        on="asin",
-        how="left",
-    )
-
-    return out
-
-
-def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
-    """
-    Summarize boss-style WAPE by zero_group using the already-generated wape_df.
-    This is diagnostic only; the main result remains the overall WAPE.
-    """
-    if "zero_group" not in joined_df_with_group.columns:
-        print("zero_group not found. Skip sparse-group WAPE diagnostics.")
-        return pd.DataFrame()
-
-    key_cols = ["asin", "order_week", "zero_rate", "zero_group"]
-    group_map = joined_df_with_group[key_cols].drop_duplicates(["asin", "order_week"]).copy()
-
-    work = wape_df.copy()
-    work["asin"] = work["asin"].astype(str)
-    work["order_week"] = pd.to_datetime(work["order_week"])
-    group_map["asin"] = group_map["asin"].astype(str)
-    group_map["order_week"] = pd.to_datetime(group_map["order_week"])
-
-    work = work.merge(group_map, on=["asin", "order_week"], how="left")
-
-    total_demand_all = work["fbi_demand"].sum()
-    total_rows_all = len(work)
-    total_asins_all = work["asin"].nunique()
-
     rows = []
-
-    for group_name, g in work.groupby("zero_group", dropna=False):
-        denom = g["fbi_demand"].sum()
-
+    for name, true_col, pred_col in specs:
+        y = pred_df[true_col].values
+        p = pred_df[pred_col].values
         rows.append({
-            "zero_group": group_name,
-            "n_rows": len(g),
-            "n_asins": g["asin"].nunique(),
-            "total_fbi_demand": denom,
-            "true_mean": g["fbi_demand"].mean(),
-            "p50_amxl_penalty": g["p50_amxl_penalty"].sum() / denom if denom > 0 else np.nan,
-            "p50_scot_penalty": g["p50_scot_penalty"].sum() / denom if denom > 0 else np.nan,
-            "p50_bps_improvement": (
-                (g["p50_scot_penalty"].sum() - g["p50_amxl_penalty"].sum()) / denom * 10000
-                if denom > 0 else np.nan
-            ),
-            "p70_amxl_penalty": g["p70_amxl_penalty"].sum() / denom if denom > 0 else np.nan,
-            "p70_scot_penalty": g["p70_scot_penalty"].sum() / denom if denom > 0 else np.nan,
-            "p70_bps_improvement": (
-                (g["p70_scot_penalty"].sum() - g["p70_amxl_penalty"].sum()) / denom * 10000
-                if denom > 0 else np.nan
-            ),
-            "p50_amxl_underbias": g["p50_amxl_underbias"].sum() / denom if denom > 0 else np.nan,
-            "p50_scot_underbias": g["p50_scot_underbias"].sum() / denom if denom > 0 else np.nan,
-            "p50_amxl_overbias": g["p50_amxl_overbias"].sum() / denom if denom > 0 else np.nan,
-            "p50_scot_overbias": g["p50_scot_overbias"].sum() / denom if denom > 0 else np.nan,
-            "p70_amxl_underbias": g["p70_amxl_underbias"].sum() / denom if denom > 0 else np.nan,
-            "p70_scot_underbias": g["p70_scot_underbias"].sum() / denom if denom > 0 else np.nan,
-            "p70_amxl_overbias": g["p70_amxl_overbias"].sum() / denom if denom > 0 else np.nan,
-            "p70_scot_overbias": g["p70_scot_overbias"].sum() / denom if denom > 0 else np.nan,
+            "target": name,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "pred_true_ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+            "zero_rate_true": np.mean(y <= 0),
+        })
+    return pd.DataFrame(rows)
+
+
+
+
+def make_p50_diagnostic_view(pred_df):
+    """Return a copy where main pred_* columns are replaced by NB sampled p50.
+    Use only for zero/active diagnostics, not for demand handoff.
+    """
+    out = pred_df.copy()
+    mapping = {
+        "pred_total_dph": "pred_total_dph_dist_p50",
+        "pred_buy_box_dph": "pred_buy_box_dph_dist_p50",
+        "pred_instock_dph": "pred_instock_dph_dist_p50",
+    }
+    for dst, src in mapping.items():
+        if src in out.columns:
+            out[dst] = out[src]
+    return out
+
+
+def print_mu_vs_p50_quick_diagnostics(pred_df):
+    print("\n" + "=" * 100)
+    print("MU vs NB-P50 QUICK DIAGNOSTICS")
+    print("=" * 100)
+    print("\n[MU / expected level as main pred_* columns]  <-- use for demand hat")
+    print(exposure_metrics(pred_df, prefix="pred").round(5).to_string(index=False))
+    p50_df = make_p50_diagnostic_view(pred_df)
+    print("\n[NB sampled P50 diagnostic]  <-- zero/active diagnostic only")
+    print(exposure_metrics(p50_df, prefix="pred").round(5).to_string(index=False))
+    cols = ["pred_total_dph_dist_p50", "pred_buy_box_dph_dist_p50", "pred_instock_dph_dist_p50"]
+    cols = [c for c in cols if c in pred_df.columns]
+    if cols:
+        print("\nNB-P50 exact-zero share:")
+        print((pred_df[cols] == 0).mean().round(5).to_string())
+    return {
+        "mu_metrics": exposure_metrics(pred_df, prefix="pred"),
+        "p50_metrics": exposure_metrics(p50_df, prefix="pred"),
+    }
+
+def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
+    idx   = {c: i for i, c in enumerate(context_cols)}
+    modes = {
+        "last":   {"total": "hist_total_dph_last_log",   "buy": "hist_buy_box_dph_last_log",   "instock": "hist_instock_dph_last_log"},
+        "mean4":  {"total": "hist_total_dph_mean4_log",  "buy": "hist_buy_box_dph_mean4_log",  "instock": "hist_instock_dph_mean4_log"},
+        "mean13": {"total": "hist_total_dph_mean13_log", "buy": "hist_buy_box_dph_mean13_log", "instock": "hist_instock_dph_mean13_log"},
+    }
+    rows = []
+    for b in va_ld:
+        fc = b["future_context"].numpy()
+        B, H, _ = fc.shape
+        for i in range(B):
+            for h in range(H):
+                row = {"asin": b["asin"][i], "order_week": pd.to_datetime(b["target_week"][i][h]), "horizon": h + 1}
+                for mode, cols in modes.items():
+                    row[f"pred_total_dph_{mode}"]   = np.expm1(fc[i, h, idx[cols["total"]]])
+                    row[f"pred_buy_box_dph_{mode}"] = np.expm1(fc[i, h, idx[cols["buy"]]])
+                    row[f"pred_instock_dph_{mode}"] = np.expm1(fc[i, h, idx[cols["instock"]]])
+                rows.append(row)
+    return pred_df.merge(pd.DataFrame(rows), on=["asin", "order_week", "horizon"], how="left")
+
+
+def print_exposure_diagnostics(pred_df):
+    print("\n" + "=" * 100)
+    print("MODEL EXPOSURE METRICS")
+    print("=" * 100)
+    model_tbl = exposure_metrics(pred_df, prefix="pred")
+    print(model_tbl.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("BY HORIZON: IN_STOCK_DPH")
+    print("=" * 100)
+    rows = []
+    for h, g in pred_df.groupby("horizon"):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows.append({
+            "horizon":    h,
+            "true_mean":  np.mean(y),
+            "pred_mean":  np.mean(p),
+            "ratio":      np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE":       _wape(y, p),
+            "underbias":  np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias":   np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr":       _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_h = pd.DataFrame(rows)
+    print(by_h.round(4).to_string(index=False))
+
+    # ── naive baseline 对比 ───────────────────────────────────
+    naive_cols = {
+        "naive_last":   "pred_instock_dph_last",
+        "naive_mean4":  "pred_instock_dph_mean4",
+        "naive_mean13": "pred_instock_dph_mean13",
+    }
+    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+
+    if available_naive:
+        print("\n" + "=" * 100)
+        print("MODEL VS NAIVE: IN_STOCK_DPH (overall)")
+        print("=" * 100)
+        comp_rows = []
+        y_all = pred_df["true_instock_dph"].values
+        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+            if col not in pred_df.columns:
+                continue
+            p_all = pred_df[col].values
+            comp_rows.append({
+                "method":     name,
+                "ratio":      np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE":       _wape(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "corr":       _corr(y_all, p_all),
+            })
+        print(pd.DataFrame(comp_rows).round(4).to_string(index=False))
+
+        print("\n" + "=" * 100)
+        print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
+        print("=" * 100)
+        pred_df["_block"] = pd.cut(
+            pred_df["horizon"],
+            bins=[0, 5, 12, 20],
+            labels=["short_1_5", "mid_6_12", "long_13_20"],
+        )
+        block_rows = []
+        for block, g in pred_df.groupby("_block", observed=True):
+            y_b = g["true_instock_dph"].values
+            for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+                if col not in g.columns:
+                    continue
+                p_b = g[col].values
+                block_rows.append({
+                    "block":      block,
+                    "method":     name,
+                    "ratio":      np.mean(p_b) / (np.mean(y_b) + 1e-8),
+                    "WAPE":       _wape(y_b, p_b),
+                    "active_AUC": _auc((y_b > 0).astype(int), p_b),
+                    "corr":       _corr(y_b, p_b),
+                })
+        print(pd.DataFrame(block_rows).round(4).to_string(index=False))
+        pred_df.drop(columns=["_block"], inplace=True, errors="ignore")
+
+    # ── p_active诊断 ─────────────────────────────────────────
+    p_active_cols = [c for c in ["p_active_total", "p_active_buy_box", "p_active_instock"]
+                     if c in pred_df.columns]
+    if p_active_cols:
+        print("\n" + "=" * 100)
+        print("P_ACTIVE BY HORIZON (should NOT be monotonically increasing)")
+        print("=" * 100)
+        pa_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            for c in p_active_cols:
+                row[c] = g[c].mean()
+            # 和真实active rate对比
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            pa_rows.append(row)
+        pa_df = pd.DataFrame(pa_rows)
+        print(pa_df.round(4).to_string(index=False))
+
+        # 快速判断
+        pa_instock = pa_df["p_active_instock"].values if "p_active_instock" in pa_df.columns else None
+        if pa_instock is not None:
+            is_monotone = all(pa_instock[i] <= pa_instock[i+1] for i in range(len(pa_instock)-1))
+            print(f"\np_active_instock monotonically increasing: {is_monotone}")
+            if is_monotone:
+                print("  ⚠️  Still monotone — BCE may still be too strong")
+            else:
+                print("  ✅  Not monotone — BCE is calibrated correctly")
+
+    # ── gamma / gate诊断 ─────────────────────────────────────
+    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock"] if c in pred_df.columns]
+    if gamma_gate_cols:
+        print("\n" + "=" * 100)
+        print("GAMMA / GATE BY HORIZON: IN_STOCK")
+        print("=" * 100)
+        gg_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            if "gamma_instock" in g.columns:
+                row["gamma_instock_mean"] = g["gamma_instock"].mean()
+            if "gate_instock" in g.columns:
+                row["gate_instock_mean"] = g["gate_instock"].mean()
+            if "p_active_instock" in g.columns:
+                row["p_active_instock_mean"] = g["p_active_instock"].mean()
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            gg_rows.append(row)
+        print(pd.DataFrame(gg_rows).round(4).to_string(index=False))
+
+    # ── ASIN级别诊断 ─────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("ASIN-LEVEL 20-WEEK SUM")
+    print("=" * 100)
+    asin_sum = pred_df.groupby("asin").agg(
+        true_sum=("true_instock_dph", "sum"),
+        pred_sum=("pred_instock_dph", "sum"),
+    ).reset_index()
+    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
+    asin_sum["wape"]  = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
+    print(f"ASIN-sum Spearman: {_safe_spearman(asin_sum['true_sum'], asin_sum['pred_sum']):.4f}")
+    print(f"Median ASIN ratio: {asin_sum['ratio'].median():.4f}")
+    print(f"Median ASIN WAPE:  {asin_sum['wape'].median():.4f}")
+    print(f"p90 ASIN WAPE:     {asin_sum['wape'].quantile(0.90):.4f}")
+
+    # ── 快速判断总结 ──────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("QUICK JUDGMENT")
+    print("=" * 100)
+    h1  = by_h[by_h["horizon"] == 1].iloc[0]
+    h20 = by_h[by_h["horizon"] == 20].iloc[0]
+    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
+    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
+    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
+    ratio_ok  = 0.85 <= h20["ratio"] <= 1.15
+    auc_ok    = h20["active_AUC"] >= 0.70
+    drop_ok   = (h1["active_AUC"] - h20["active_AUC"]) < 0.20
+    print(f"\nh=20 ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
+    print(f"h=20 AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
+    print(f"AUC drop < 0.20:           {'✅' if drop_ok else '❌'}")
+
+    # ── Final compact summary table ─────────────────────────
+    print("\n" + "=" * 100)
+    print("FINAL SUMMARY TABLE")
+    print("=" * 100)
+    final_rows = []
+    model_overall = model_tbl[model_tbl["target"] == "in_stock_dph"].iloc[0]
+    final_rows.append({
+        "section": "overall_instock",
+        "ratio": model_overall["pred_true_ratio"],
+        "WAPE": model_overall["WAPE"],
+        "corr": model_overall["corr"],
+        "active_AUC": model_overall["active_AUC"],
+        "note": "model overall",
+    })
+    if available_naive:
+        for name, col in available_naive.items():
+            p_all = pred_df[col].values
+            final_rows.append({
+                "section": name,
+                "ratio": np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE": _wape(y_all, p_all),
+                "corr": _corr(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "note": "baseline",
+            })
+    final_rows.append({
+        "section": "h1_instock",
+        "ratio": h1["ratio"],
+        "WAPE": h1["WAPE"],
+        "corr": h1["corr"],
+        "active_AUC": h1["active_AUC"],
+        "note": "short horizon",
+    })
+    final_rows.append({
+        "section": "h20_instock",
+        "ratio": h20["ratio"],
+        "WAPE": h20["WAPE"],
+        "corr": h20["corr"],
+        "active_AUC": h20["active_AUC"],
+        "note": "long horizon",
+    })
+    if "p_active_instock" in pred_df.columns:
+        final_rows.append({
+            "section": "p_active_gap",
+            "ratio": np.nan,
+            "WAPE": np.nan,
+            "corr": np.nan,
+            "active_AUC": np.nan,
+            "note": f"mean p_active - true_active = {((pred_df['p_active_instock'].mean()) - ((pred_df['true_instock_dph'] > 0).mean())):.4f}",
+        })
+    final_summary = pd.DataFrame(final_rows)
+    print(final_summary.round(4).to_string(index=False))
+
+    return {"model": model_tbl, "by_horizon": by_h, "final_summary": final_summary}
+
+
+
+# ============================================================
+# Encoder / Decoder diagnostics
+# ============================================================
+
+def _diagnose_encoder_decoder_performance_impl(model, va_ld, pred_df=None, max_batches=None, device=None):
+    """
+    Quick diagnostic for whether encoder and decoder learned useful signals.
+
+    Encoder checks:
+      - Can h_last classify future active / inactive?
+      - Can h_last predict future 20-week magnitude?
+
+    Decoder checks:
+      - p_active AUC and calibration
+      - active-only magnitude ratio / WAPE
+      - cross-attention entropy / concentration
+    """
+    device = get_device(device)
+    model = model.to(device)
+    model.eval()
+
+    h_list = []
+    y_total_list, y_buy_list, y_instock_list = [], [], []
+    p_active_list, log_mag_list, pred_list = [], [], []
+    attn_rows = []
+
+    with torch.no_grad():
+        for bi, b in enumerate(va_ld):
+            if max_batches is not None and bi >= max_batches:
+                break
+            b = batch_to_device(b, device)
+
+            x = b["x"]
+            fc = b["future_context"]
+            enc_out = model.encoder(x)
+            h_last = enc_out[:, -1, :]
+            # Important: call the full model instead of model.decoder(...) so graph context
+            # (asin_idx -> graph embedding -> augmented future_context) is included.
+            aux = model(x, fc, return_aux=True, asin_idx=b.get("asin_idx"))
+
+            pred_level = torch.expm1(aux["log_hat"]).clamp(min=0.0)
+            y_stack = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock_dph"],
+            ], dim=-1)
+
+            h_list.append(h_last.detach().cpu().numpy())
+            y_total_list.append(y_stack[:, :, 0].detach().cpu().numpy())
+            y_buy_list.append(y_stack[:, :, 1].detach().cpu().numpy())
+            y_instock_list.append(y_stack[:, :, 2].detach().cpu().numpy())
+            p_active_list.append(aux["p_active"].detach().cpu().numpy())
+            log_mag_list.append(aux["log_mag"].detach().cpu().numpy())
+            pred_list.append(pred_level.detach().cpu().numpy())
+
+            attn = aux.get("attn_weights", None)
+            if attn is not None:
+                a = attn.detach().cpu().numpy()
+                if a.ndim == 4:
+                    a = a.mean(axis=1)  # [B,H,T]
+                entropy = -(a * np.log(a + 1e-8)).sum(axis=-1)
+                max_w = a.max(axis=-1)
+                argmax_pos = a.argmax(axis=-1)
+                attn_rows.append({
+                    "batch": bi,
+                    "attn_entropy_mean": float(np.mean(entropy)),
+                    "attn_max_weight_mean": float(np.mean(max_w)),
+                    "attn_argmax_mean_pos": float(np.mean(argmax_pos)),
+                    "attn_argmax_p90_pos": float(np.quantile(argmax_pos, 0.90)),
+                })
+
+    h = np.concatenate(h_list, axis=0)
+    y_total = np.concatenate(y_total_list, axis=0)
+    y_buy = np.concatenate(y_buy_list, axis=0)
+    y_instock = np.concatenate(y_instock_list, axis=0)
+    p_active = np.concatenate(p_active_list, axis=0)
+    log_mag = np.concatenate(log_mag_list, axis=0)
+    pred = np.concatenate(pred_list, axis=0)
+
+    target_map = {
+        "total": (y_total, pred[:, :, 0], p_active[:, :, 0], log_mag[:, :, 0]),
+        "buy_box": (y_buy, pred[:, :, 1], p_active[:, :, 1], log_mag[:, :, 1]),
+        "in_stock": (y_instock, pred[:, :, 2], p_active[:, :, 2], log_mag[:, :, 2]),
+    }
+
+    encoder_rows = []
+    try:
+        from sklearn.linear_model import LogisticRegression, Ridge
+        from sklearn.metrics import roc_auc_score, r2_score
+    except Exception:
+        LogisticRegression = None
+        Ridge = None
+        roc_auc_score = None
+        r2_score = None
+
+    for name, (y, _, _, _) in target_map.items():
+        active_any = (y.sum(axis=1) > 0).astype(int)
+        y_sum_log = np.log1p(y.sum(axis=1))
+
+        enc_auc = np.nan
+        enc_r2 = np.nan
+        enc_spearman = np.nan
+
+        if LogisticRegression is not None and len(np.unique(active_any)) == 2:
+            try:
+                clf = LogisticRegression(max_iter=500, C=1.0)
+                clf.fit(h, active_any)
+                enc_auc = roc_auc_score(active_any, clf.predict_proba(h)[:, 1])
+            except Exception:
+                enc_auc = np.nan
+
+        active_mask = y.sum(axis=1) > 0
+        if Ridge is not None and active_mask.sum() >= 20:
+            try:
+                reg = Ridge(alpha=1.0)
+                reg.fit(h[active_mask], y_sum_log[active_mask])
+                pred_sum_log = reg.predict(h[active_mask])
+                enc_r2 = r2_score(y_sum_log[active_mask], pred_sum_log)
+                enc_spearman = _safe_spearman(y_sum_log[active_mask], pred_sum_log)
+            except Exception:
+                enc_r2 = np.nan
+                enc_spearman = np.nan
+
+        encoder_rows.append({
+            "target": name,
+            "future_active_rate": float(active_any.mean()),
+            "encoder_active_AUC_same_val": enc_auc,
+            "encoder_active_sum_R2_same_val": enc_r2,
+            "encoder_active_sum_spearman_same_val": enc_spearman,
         })
 
-    out = pd.DataFrame(rows)
+    encoder_diag = pd.DataFrame(encoder_rows)
 
-    print("\n" + "=" * 80)
-    print("SPARSE-GROUP WAPE DIAGNOSTICS")
-    print("=" * 80)
+    decoder_rows = []
+    by_h_rows = []
 
-    display_cols = [
-        "zero_group",
-        "n_asins",
-        "n_rows",
-        "total_fbi_demand",
-        "total_amt",
-        "total_size",
-        "demand_share",
-        "avg_total_demand_per_asin",
-        "true_mean",
-        "true_zero_rate",
-        "p50_amxl_penalty",
-        "p50_scot_penalty",
-        "p50_bps_improvement",
-        "p70_amxl_penalty",
-        "p70_scot_penalty",
-        "p70_bps_improvement",
-        "p50_amxl_underbias",
-        "p50_scot_underbias",
-        "p50_amxl_overbias",
-        "p50_scot_overbias",
-        "p70_amxl_underbias",
-        "p70_scot_underbias",
-        "p70_amxl_overbias",
-        "p70_scot_overbias",
-    ]
-    display_cols = [c for c in display_cols if c in out.columns]
-    print(out[display_cols])
+    for name, (y, p, pa, lm) in target_map.items():
+        y_flat = y.reshape(-1)
+        p_flat = p.reshape(-1)
+        pa_flat = pa.reshape(-1)
+        active_flat = (y_flat > 0).astype(int)
 
+        active_auc = _auc(active_flat, pa_flat)
+        active_mask = y_flat > 0
+
+        decoder_rows.append({
+            "target": name,
+            "true_mean": float(np.mean(y_flat)),
+            "pred_mean": float(np.mean(p_flat)),
+            "pred_true_ratio": float(np.mean(p_flat) / (np.mean(y_flat) + 1e-8)),
+            "p_active_mean": float(np.mean(pa_flat)),
+            "true_active_rate": float(np.mean(active_flat)),
+            "p_active_AUC": active_auc,
+            "active_only_true_mean": float(np.mean(y_flat[active_mask])) if active_mask.sum() else np.nan,
+            "active_only_pred_mean": float(np.mean(p_flat[active_mask])) if active_mask.sum() else np.nan,
+            "active_only_ratio": float(np.mean(p_flat[active_mask]) / (np.mean(y_flat[active_mask]) + 1e-8)) if active_mask.sum() else np.nan,
+            "active_only_WAPE": _wape(y_flat[active_mask], p_flat[active_mask]) if active_mask.sum() else np.nan,
+        })
+
+        H = y.shape[1]
+        for hh in range(H):
+            yh = y[:, hh]
+            ph = p[:, hh]
+            pah = pa[:, hh]
+            active_h = yh > 0
+            by_h_rows.append({
+                "target": name,
+                "horizon": hh + 1,
+                "true_mean": float(np.mean(yh)),
+                "pred_mean": float(np.mean(ph)),
+                "ratio": float(np.mean(ph) / (np.mean(yh) + 1e-8)),
+                "true_active_rate": float(np.mean(active_h)),
+                "p_active_mean": float(np.mean(pah)),
+                "p_active_AUC": _auc(active_h.astype(int), pah),
+                "active_only_ratio": float(np.mean(ph[active_h]) / (np.mean(yh[active_h]) + 1e-8)) if active_h.sum() else np.nan,
+                "active_only_WAPE": _wape(yh[active_h], ph[active_h]) if active_h.sum() else np.nan,
+            })
+
+    decoder_diag = pd.DataFrame(decoder_rows)
+    decoder_by_horizon = pd.DataFrame(by_h_rows)
+    attn_diag = pd.DataFrame(attn_rows)
+
+    print("\n" + "=" * 100)
+    print("ENCODER DIAGNOSTICS: can h_last read occurrence / magnitude?")
+    print("=" * 100)
+    print(encoder_diag.round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("DECODER DIAGNOSTICS: active head + magnitude head")
+    print("=" * 100)
+    print(decoder_diag.round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("DECODER BY HORIZON: IN_STOCK only")
+    print("=" * 100)
+    in_h = decoder_by_horizon[decoder_by_horizon["target"] == "in_stock"]
+    print(in_h.round(4).to_string(index=False))
+
+    if len(attn_diag) > 0:
+        print("\n" + "=" * 100)
+        print("CROSS-ATTENTION DIAGNOSTICS")
+        print("=" * 100)
+        print(attn_diag.round(4).to_string(index=False))
+
+    return {
+        "encoder_diag": encoder_diag,
+        "decoder_diag": decoder_diag,
+        "decoder_by_horizon": decoder_by_horizon,
+        "attn_diag": attn_diag,
+    }
+
+def make_external_hat_df(pred_df, hat_source="mu"):
+    """
+    Build external exposure hat for the downstream demand model.
+
+    IMPORTANT:
+    In the NB-distribution exposure version, pred_*_dph is the sampled distribution
+    median / p50 by default. That is useful for zero diagnostics, but it is often too
+    conservative as a demand covariate.
+
+    Default hat_source="mu" therefore uses pred_*_dph_mu as the demand covariate:
+      - mu = expected exposure level / intensity
+      - p50 = conservative median, useful for zero-risk diagnostics
+
+    Options:
+      hat_source="mu"        -> use pred_*_dph_mu for demand input, recommended
+      hat_source="p50"       -> use pred_*_dph / sampled median
+      hat_source="dist_mean" -> use pred_*_dph_dist_mean
+    """
+    df = pred_df.copy()
+
+    if hat_source == "mu":
+        source_cols = {
+            "pred_total_dph_mu": "pred_total_dph",
+            "pred_buy_box_dph_mu": "pred_buy_box_dph",
+            "pred_instock_dph_mu": "pred_instock_dph",
+        }
+    elif hat_source == "dist_mean":
+        source_cols = {
+            "pred_total_dph_dist_mean": "pred_total_dph",
+            "pred_buy_box_dph_dist_mean": "pred_buy_box_dph",
+            "pred_instock_dph_dist_mean": "pred_instock_dph",
+        }
+    elif hat_source == "p50":
+        source_cols = {
+            "pred_total_dph": "pred_total_dph",
+            "pred_buy_box_dph": "pred_buy_box_dph",
+            "pred_instock_dph": "pred_instock_dph",
+        }
+    else:
+        raise ValueError(f"Unknown hat_source={hat_source}. Use 'mu', 'p50', or 'dist_mean'.")
+
+    missing = [c for c in source_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns for hat_source={hat_source}: {missing}")
+
+    out = df[["asin", "order_week"] + list(source_cols.keys())].copy()
+    out = out.rename(columns=source_cols)
+
+    # Safety cleanup only; normally model outputs should already be finite and nonnegative.
+    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    out[pred_cols] = (
+        out[pred_cols]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    # Enforce funnel for demand input: total >= buy_box >= instock.
+    out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
+    out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
+
+    out["external_total_dph_hat_log"]    = np.log1p(out["pred_total_dph"].clip(lower=0.0))
+    out["external_buy_box_dph_hat_log"]  = np.log1p(out["pred_buy_box_dph"].clip(lower=0.0))
+    out["external_instock_dph_hat_log"]  = np.log1p(out["pred_instock_dph"].clip(lower=0.0))
+    out["hat_source"] = hat_source
     return out
 
 
-# =====================================================
-# 10. Real SCOT alignment and WAPE
-# =====================================================
+def summarize_hat_for_demand(hat, title="EXPOSURE HAT FOR DEMAND"):
+    pred_cols = ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    pred_cols = [c for c in pred_cols if c in hat.columns]
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+    print("shape:", hat.shape)
+    if "hat_source" in hat.columns:
+        print("hat_source:", hat["hat_source"].iloc[0])
+    print("\ndescribe:")
+    print(hat[pred_cols].describe())
+    print("\nzero share:")
+    print((hat[pred_cols] == 0).mean())
+    print("\nnegative count:")
+    print((hat[pred_cols] < 0).sum())
+    print("\nNaN count:")
+    print(hat[pred_cols].isna().sum())
+    return None
 
-def run_high_sparse_scot_alignment_wape(
-    result,
-    scot_df,
-    data_raw1=None,
-    asin_stats=None,
-    remove_oos_dp=True,
-    source="lp",
-):
+
+# ============================================================
+# 主入口
+# ============================================================
+
+
+# Exposure-only public alias. Use this name to avoid confusion with demand utilities.
+def summarize_exposure_hat_for_demand(hat, title="EXPOSURE HAT FOR DEMAND"):
+    return summarize_hat_for_demand(hat, title=title)
+
+
+
+
+# ============================================================
+# Compact diagnostics override for patch model
+# ============================================================
+def print_exposure_diagnostics(pred_df):
+    """Compact diagnostics only: overall, horizon blocks, h1/h20, ASIN sum.
+    Removed verbose GL/category tables and detailed p_active/gamma tables to keep
+    iteration fast and easy to read.
     """
-    Align real SCOT forecasts to result["forecast_df"] and compute WAPE.
-    """
-    if "calculate_wape_using_lp_oos2" not in globals():
-        raise RuntimeError("calculate_wape_using_lp_oos2 is not defined.")
+    print("\n" + "=" * 100)
+    print("COMPACT EXPOSURE DIAGNOSTICS")
+    print("=" * 100)
 
-    if "quick_error_check" not in globals():
-        raise RuntimeError("quick_error_check is not defined.")
+    model_tbl = exposure_metrics(pred_df, prefix="pred")
+    print("\n[Overall three-hat metrics]")
+    print(model_tbl.round(5).to_string(index=False))
 
-    forecast_df = result["forecast_df"].copy()
-    forecast_df.columns = [c.strip() for c in forecast_df.columns]
-    forecast_df["asin"] = forecast_df["asin"].astype(str)
-    forecast_df["order_week"] = pd.to_datetime(forecast_df["order_week"])
+    # Horizon blocks aligned with patch decoder.
+    block_defs = [("short_h1_5", 1, 5), ("mid_h6_13", 6, 13), ("long_h14_20", 14, 20)]
+    block_rows = []
+    for name, lo, hi in block_defs:
+        g = pred_df[(pred_df["horizon"] >= lo) & (pred_df["horizon"] <= hi)]
+        if len(g) == 0:
+            continue
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        block_rows.append({
+            "block": name,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    block_df = pd.DataFrame(block_rows)
+    print("\n[In-stock metrics by patch block]")
+    print(block_df.round(4).to_string(index=False))
 
-    scot = scot_df.copy()
-    scot.columns = [c.strip() for c in scot.columns]
+    # h1/h20 only, not all 20 rows.
+    edge_rows = []
+    for hh in [1, 20]:
+        g = pred_df[pred_df["horizon"] == hh]
+        if len(g) == 0:
+            continue
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        edge_rows.append({
+            "horizon": hh,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    edge_df = pd.DataFrame(edge_rows)
+    print("\n[Edge horizons]")
+    print(edge_df.round(4).to_string(index=False))
 
-    for c in ["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]:
-        if c not in scot.columns:
-            raise ValueError(f"Missing SCOT column: {c}")
-
-    scot["asin"] = scot["asin"].astype(str)
-    scot["order_week"] = pd.to_datetime(scot["order_week"])
-    scot["forecast_qty_p50"] = pd.to_numeric(scot["forecast_qty_p50"], errors="coerce")
-    scot["forecast_qty_p70"] = pd.to_numeric(scot["forecast_qty_p70"], errors="coerce")
-
-    if "fcst_start_week" in scot.columns:
-        scot["fcst_start_week"] = pd.to_datetime(scot["fcst_start_week"])
-
-    print("\n" + "=" * 80)
-    print("NB FORECAST WINDOW")
-    print("=" * 80)
-    print("NB rows:", len(forecast_df))
-    print("NB ASINs:", forecast_df["asin"].nunique())
-    print("NB weeks:", forecast_df["order_week"].min(), "to", forecast_df["order_week"].max())
-    print("NB week count:", forecast_df["order_week"].nunique())
-
-    print("\n" + "=" * 80)
-    print("REAL SCOT FORECAST FILE")
-    print("=" * 80)
-    print("SCOT rows:", len(scot))
-    print("SCOT ASINs:", scot["asin"].nunique())
-    print("SCOT weeks:", scot["order_week"].min(), "to", scot["order_week"].max())
-    print("SCOT week count:", scot["order_week"].nunique())
-
-    if "fcst_start_week" in scot.columns:
-        print("\nSCOT fcst_start_week counts:")
-        print(scot["fcst_start_week"].value_counts().sort_index())
-
-    scot_keep = (
-        scot[["asin", "order_week", "forecast_qty_p50", "forecast_qty_p70"]]
-        .groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            forecast_qty_p50=("forecast_qty_p50", "mean"),
-            forecast_qty_p70=("forecast_qty_p70", "mean"),
-        )
-    )
-
-    forecast_df_scot_real = forecast_df.merge(
-        scot_keep,
-        on=["asin", "order_week"],
-        how="inner",
-    )
-
-    row_match_rate = len(forecast_df_scot_real) / max(len(forecast_df), 1)
-    asin_match_rate = (
-        forecast_df_scot_real["asin"].nunique()
-        / max(forecast_df["asin"].nunique(), 1)
-    )
-
-    print("\n" + "=" * 80)
-    print("ALIGNMENT CHECK")
-    print("=" * 80)
-    print("NB forecast rows:", len(forecast_df))
-    print("After SCOT merge rows:", len(forecast_df_scot_real))
-    print("Matched ASINs:", forecast_df_scot_real["asin"].nunique())
-    print("Matched weeks:", forecast_df_scot_real["order_week"].min(), "to",
-          forecast_df_scot_real["order_week"].max())
-    print("Matched week count:", forecast_df_scot_real["order_week"].nunique())
-    print("Row match rate:", row_match_rate)
-    print("ASIN match rate:", asin_match_rate)
-
-    print("\n" + "=" * 80)
-    print("ASIN SELECTION CHECK")
-    print("=" * 80)
-    print("Selected NB ASINs:", forecast_df["asin"].nunique())
-    print("Matched ASINs with SCOT:", forecast_df_scot_real["asin"].nunique())
-    print(
-        "Missing ASINs after SCOT merge:",
-        forecast_df["asin"].nunique() - forecast_df_scot_real["asin"].nunique(),
-    )
-
-    forecast_df_scot_real["p50_scot"] = forecast_df_scot_real["forecast_qty_p50"]
-    forecast_df_scot_real["p70_scot"] = np.maximum(
-        forecast_df_scot_real["forecast_qty_p70"],
-        forecast_df_scot_real["forecast_qty_p50"],
-    )
-
-    mean_check = pd.DataFrame([{
-        "n_rows": len(forecast_df_scot_real),
-        "n_asins": forecast_df_scot_real["asin"].nunique(),
-        "true_mean": forecast_df_scot_real["fbi_demand"].mean(),
-        "total_amt": (
-            forecast_df_scot_real["true_amt"].sum()
-            if "true_amt" in forecast_df_scot_real.columns
-            else np.nan
-        ),
-        "total_size": (
-            forecast_df_scot_real["true_size"].sum()
-            if "true_size" in forecast_df_scot_real.columns
-            else np.nan
-        ),
-        "amxl_p50_mean": forecast_df_scot_real["p50_amxl"].mean(),
-        "amxl_p70_mean": forecast_df_scot_real["p70_amxl"].mean(),
-        "real_scot_p50_mean": forecast_df_scot_real["p50_scot"].mean(),
-        "real_scot_p70_mean": forecast_df_scot_real["p70_scot"].mean(),
-        "true_zero_rate": (forecast_df_scot_real["fbi_demand"] == 0).mean(),
-        "true_active_ratio": (forecast_df_scot_real["fbi_demand"] > 0).mean(),
+    asin_sum = pred_df.groupby("asin").agg(
+        true_sum=("true_instock_dph", "sum"),
+        pred_sum=("pred_instock_dph", "sum"),
+    ).reset_index()
+    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
+    asin_sum["wape"] = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
+    asin_summary = pd.DataFrame([{
+        "ASIN_sum_spearman": _safe_spearman(asin_sum["true_sum"], asin_sum["pred_sum"]),
+        "median_ASIN_ratio": asin_sum["ratio"].median(),
+        "median_ASIN_WAPE": asin_sum["wape"].median(),
+        "p90_ASIN_WAPE": asin_sum["wape"].quantile(0.90),
     }])
+    print("\n[ASIN 20-week sum]")
+    print(asin_summary.round(4).to_string(index=False))
 
-    print("\n" + "=" * 80)
-    print("FORECAST MEAN CHECK")
-    print("=" * 80)
-    print(mean_check.T)
+    # Final compact judgment.
+    final_rows = []
+    overall = model_tbl[model_tbl["target"] == "in_stock_dph"].iloc[0]
+    final_rows.append({"section":"overall_instock", "ratio":overall["pred_true_ratio"], "WAPE":overall["WAPE"], "corr":overall["corr"], "active_AUC":overall["active_AUC"]})
+    for _, r in block_df.iterrows():
+        final_rows.append({"section":str(r["block"]), "ratio":r["ratio"], "WAPE":r["WAPE"], "corr":r["corr"], "active_AUC":r["active_AUC"]})
+    final_summary = pd.DataFrame(final_rows)
+    print("\n[Final compact summary]")
+    print(final_summary.round(4).to_string(index=False))
 
-    wape_df = calculate_wape_using_lp_oos2(
-        forecast_df_scot_real,
-        [0.5, 0.7],
-        remove_oos_dp=remove_oos_dp,
-        source=source,
+    return {"model": model_tbl, "blocks": block_df, "edge_horizons": edge_df, "asin_summary": asin_summary, "final_summary": final_summary}
+
+def run_exposure_v2(
+    data_raw1,
+    scot_df=None,    # 不再使用，保留接口兼容
+    n_asins=5000,
+    seed=42,
+    history=13,
+    horizon=20,
+    d_model=48,      # 64→48，减少参数防过拟合
+    n_heads=4,
+    batch_size=64,
+    epochs=80,       # 60→80，给模型更多时间
+    lr=5e-4,         # 1e-3→5e-4，更稳定
+    patience=15,     # 8→15，避免过早停止
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.20,
+    mag_weight=1.00,
+    mean_weight=0.25,
+    active_calib_weight=0.05,
+    nb_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.15,
+    high_weight_alpha=0.35,
+    short_horizon_weight=0.8,
+    mid_horizon_weight=1.2,
+    long_horizon_weight=2.0,
+    long_block_sum_weight=0.30,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
+    dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
+    use_graph_gate=True,
+    graph_zero_weight=0.03,
+    graph_level_peak_weight=2.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.3,
+    use_encoder_self_attn=True,
+):
+    print("\n" + "=" * 100)
+    print("EXPOSURE MODEL V3: SINGLE-HEAD PATCH + MAGNITUDE-AWARE GRAPH + ASIN-SUM LOSS")
+    print("Preset: no two-head/gate; magnitude-aware positive/competitive graph; ASIN 20w sum loss; MU hats for demand")
+    print("=" * 100)
+
+    df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
+
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
     )
 
-    if asin_stats is None and "asin_stats" in result:
-        asin_stats = result["asin_stats"]
+    tr_ds = ExposureDataset(data, history=history, horizon=horizon,
+                            mode="train", val_weeks=horizon, anchor_decay=anchor_decay)
+    va_ds = ExposureDataset(data, history=history, horizon=horizon,
+                            mode="val",   val_weeks=horizon, anchor_decay=anchor_decay)
 
-    forecast_df_scot_real_with_group = attach_zero_group_to_joined_df(
-        forecast_df_scot_real,
-        asin_stats,
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, collate_fn=exposure_collate, pin_memory=dataloader_pin_memory())
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=exposure_collate, pin_memory=dataloader_pin_memory())
+
+    print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
+
+    input_dim = next(iter(tr_ld))["x"].shape[-1]
+
+    model = ExposureForecastModelV2(
+        input_dim=input_dim,
+        context_dim=context_dim,
+        d_model=d_model,
+        horizon=horizon,
+        n_heads=n_heads,
+        dropout=dropout,
+        context_cols=context_cols,
+        use_encoder_self_attn=use_encoder_self_attn,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
+    )
+    print(f"Input dim: {input_dim} | Context dim: {context_dim}")
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    train_exposure_model_v2(
+        model=model, tr_ld=tr_ld, va_ld=va_ld,
+        epochs=epochs, lr=lr, patience=patience,
+        bce_weight=bce_weight, mag_weight=mag_weight, mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
+        horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
+        short_horizon_weight=short_horizon_weight,
+        mid_horizon_weight=mid_horizon_weight,
+        long_horizon_weight=long_horizon_weight,
+        long_block_sum_weight=long_block_sum_weight,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
+        zero_fp_threshold=zero_fp_threshold,
+        zero_fp_temperature=zero_fp_temperature,
     )
 
-    sparse_group_wape = summarize_wape_by_sparse_group(
-        wape_df,
-        forecast_df_scot_real_with_group,
-    )
+    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint, mc_reduce="mu")
+    pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
+    diagnostics = print_exposure_diagnostics(pred_df)
+    diagnostics_views = print_mu_vs_p50_quick_diagnostics(pred_df)
+    exposure_hat_for_demand = make_external_hat_df(pred_df, hat_source="mu")
+    exposure_hat_for_demand_p50 = make_external_hat_df(pred_df, hat_source="p50")
+    exposure_hat_for_demand_dist_mean = make_external_hat_df(pred_df, hat_source="dist_mean")
 
-    cols_p50 = [
-        "p50_amxl_penalty", "p50_scot_penalty",
-        "p50_amxl_overbias", "p50_scot_overbias",
-        "p50_amxl_underbias", "p50_scot_underbias",
-        "fbi_demand",
-    ]
-
-    cols_p70 = [
-        "p70_amxl_penalty", "p70_scot_penalty",
-        "p70_amxl_overbias", "p70_scot_overbias",
-        "p70_amxl_underbias", "p70_scot_underbias",
-        "fbi_demand",
-    ]
-
-    p50_wape, p50_penalty_diff = quick_error_check(wape_df, cols_p50)
-    p70_wape, p70_penalty_diff = quick_error_check(wape_df, cols_p70)
-
-    print("\n" + "=" * 80)
-    print("FINAL WAPE WITH REAL SCOT")
-    print("=" * 80)
-    print("\nP50 WAPE:")
-    print(p50_wape)
-    print("P50 penalty diff AMXL - SCOT:", p50_penalty_diff)
-    print("\nP70 WAPE:")
-    print(p70_wape)
-    print("P70 penalty diff AMXL - SCOT:", p70_penalty_diff)
+    summarize_hat_for_demand(exposure_hat_for_demand, title="EXPOSURE HAT FOR DEMAND (MU / EXPECTED LEVEL)")
 
     return {
-        "forecast_df_scot_real": forecast_df_scot_real,
-        "forecast_df_scot_real_with_group": forecast_df_scot_real_with_group,
-        "wape_df": wape_df,
-        "sparse_group_wape": sparse_group_wape,
-        "mean_check": mean_check,
-        "p50_wape": p50_wape,
-        "p70_wape": p70_wape,
-        "p50_penalty_diff": p50_penalty_diff,
-        "p70_penalty_diff": p70_penalty_diff,
-    }
-
-
-# =====================================================
-# 11. Train on sample-SCOT intersection
-# =====================================================
-
-def run_nb_high_sparse_from_sample_scot_intersection(
-    data_raw1,
-    scot_df,
-    n_asins=5000,
-    seed=42,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.05,
-    lambda_stock_mean_weight=0.30,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    run_wape=True,
-    remove_oos_dp=True,
-):
-    """
-    Sample 5000 from data_raw1, keep SCOT intersection, train high_sparse, and compute WAPE.
-    """
-    print("=" * 80)
-    print("LEGACY NB HIGH-SPARSE | SAMPLE 5000 THEN KEEP SCOT INTERSECTION")
-    print("=" * 80)
-
-    data_small_raw, sample_asin_df, intersect_asin_df = (
-        prepare_data_from_sample_scot_intersection(
-            data_raw1=data_raw1,
-            scot_df=scot_df,
-            n_asins=n_asins,
-            seed=seed,
-        )
-    )
-
-    data_small, asin_stats = add_zero_rate_group(data_small_raw, zero_thresholds)
-    data_high = data_small[data_small["zero_group"] == "high_sparse"].copy()
-
-    print("\n" + "=" * 80)
-    print("HIGH-SPARSE AFTER SCOT INTERSECTION")
-    print("=" * 80)
-    print("High-sparse ASINs:", data_high["asin"].nunique())
-    print("High-sparse rows:", len(data_high))
-
-    if remove_extreme:
-        data_high, removed_extreme, extreme_cap = filter_extreme_asins(
-            data_high,
-            q=extreme_q,
-        )
-    else:
-        removed_extreme = pd.DataFrame()
-        extreme_cap = np.nan
-
-    data, context_dim, context_cols = load_real_data(data_high, dph_cap_q=dph_cap_q)
-
-    all_demand = np.concatenate([d["demand"] for d in data.values()])
-    print(f"ASINs used for training: {len(data)}")
-    print(f"Zero rate: {(all_demand == 0).mean():.1%}")
-
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val", horizon)
-
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
-
-    print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
-
-    model = TCN_ENN(
-        input_dim=34,
-        context_dim=context_dim,
-        d_model=d_model,
-        d_z=d_z,
-        horizon=horizon,
-        prior_scale=prior_scale,
-    )
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_params:,} | d_model={d_model} | d_z={d_z}")
-    print(f"beta_tail={beta_tail} | lambda_q={lambda_q} | patience={patience}")
-
-    train(
-        model,
-        tr_ld,
-        va_ld,
-        epochs=epochs,
-        nZ=8,
-        lr=1e-3,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        lambda_stock=lambda_stock,
-        lambda_stock_mean_weight=lambda_stock_mean_weight,
-    )
-
-    diagnose_encoder(model, va_ld)
-
-    metrics = evaluate(model, va_ld, M=M_eval)
-    print(f"\nPinball50={metrics['pinball50']:.4f} | Pinball70={metrics['pinball70']:.4f}")
-
-    forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
-    forecast_df["zero_group_run"] = "high_sparse_sample_scot_intersection"
-
-    diag_df = generate_diagnostic_df(model, va_ld, M=M_eval)
-    diag_p50 = underbias_diagnosis(diag_df, "p50")
-    diag_p70 = underbias_diagnosis(diag_df, "p70")
-    mag_gap_df = magnitude_gap(diag_df)
-
-    print("\nUnderbias P50:")
-    print(diag_p50.T)
-    print("\nUnderbias P70:")
-    print(diag_p70.T)
-
-    result = {
         "model": model,
-        "forecast_df": forecast_df,
-        "diag_df": diag_df,
-        "diag_p50": diag_p50,
-        "diag_p70": diag_p70,
-        "mag_gap": mag_gap_df,
+        "forecast_df": pred_df,
+        "diagnostics": diagnostics,
+        "diagnostics_views": diagnostics_views,
+        "exposure_hat_for_demand": exposure_hat_for_demand,
+        "exposure_hat_for_demand_mu": exposure_hat_for_demand,
+        "exposure_hat_for_demand_p50": exposure_hat_for_demand_p50,
+        "exposure_hat_for_demand_dist_mean": exposure_hat_for_demand_dist_mean,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
-        "data_small": data_small,
-        "data_high": data_high,
-        "asin_stats": asin_stats,
-        "sample_asin_df": sample_asin_df,
-        "intersect_asin_df": intersect_asin_df,
-        "removed_extreme": removed_extreme,
-        "extreme_cap": extreme_cap,
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "graph_assets": graph_assets,
     }
 
-    if run_wape:
-        result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
-            result=result,
-            scot_df=scot_df,
-            data_raw1=data_raw1,
-            asin_stats=asin_stats,
-            remove_oos_dp=remove_oos_dp,
-            source="lp",
-        )
 
-    return result
+# ============================================================
+# ============================================================
+# Rolling Backtest + SCOT Intersection Add-on
+# Added after original definitions; these functions override/use the fixed ABC model above.
+# ============================================================
 
-
-
-# =====================================================
-# 12. Train on all sample-SCOT intersection ASINs
-# =====================================================
-
-def run_nb_all_sample_scot_intersection(
+def prepare_exposure_data_from_sample_scot_intersection(
     data_raw1,
-    scot_df,
+    scot_df=None,
     n_asins=5000,
     seed=42,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.05,
-    lambda_stock_mean_weight=0.30,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    run_wape=True,
-    remove_oos_dp=True,
 ):
-    """
-    Main experiment:
-      1. sample 5000 ASINs from data_raw1
-      2. keep ASINs also present in scot_df
-      3. assign sparse labels for diagnostics only
-      4. train one model on all intersection ASINs
-      5. align with real SCOT and compute overall + sparse-group WAPE
-    """
-    print("=" * 80)
-    print("NB ALL-ASIN | SAMPLE 5000 THEN KEEP SCOT INTERSECTION")
-    print("=" * 80)
-
-    data_intersection_raw, sample_asin_df, intersect_asin_df = (
-        prepare_data_from_sample_scot_intersection(
-            data_raw1=data_raw1,
-            scot_df=scot_df,
-            n_asins=n_asins,
-            seed=seed,
-        )
-    )
-
-    # Sparse labels are for diagnostics only. No filtering by group.
-    data_labeled, asin_stats = add_zero_rate_group(
-        data_intersection_raw,
-        zero_thresholds,
-    )
-
-    print("\n" + "=" * 80)
-    print("TRAINING SET AFTER SCOT INTERSECTION")
-    print("=" * 80)
-    print("Training ASINs:", data_labeled["asin"].nunique())
-    print("Training rows:", len(data_labeled))
-
-    print("\nSparse-group labels for diagnostics only:")
-    print(
-        data_labeled
-        .groupby("zero_group")["asin"]
-        .nunique()
-        .reset_index(name="n_asins")
-    )
-
-    data_train = data_labeled.copy()
-
-    if remove_extreme:
-        data_train, removed_extreme, extreme_cap = filter_extreme_asins(
-            data_train,
-            q=extreme_q,
-        )
-    else:
-        removed_extreme = pd.DataFrame()
-        extreme_cap = np.nan
-
-    data, context_dim, context_cols = load_real_data(data_train)
-
-    all_demand = np.concatenate([d["demand"] for d in data.values()])
-    print(f"ASINs used for training: {len(data)}")
-    print(f"Overall zero rate: {(all_demand == 0).mean():.1%}")
-
-    tr_ds = DemandDataset(data, history, horizon, "train", horizon)
-    va_ds = DemandDataset(data, history, horizon, "val", horizon)
-
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
-
-    print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
-
-    model = TCN_ENN(
-        input_dim=34,
-        context_dim=context_dim,
-        d_model=d_model,
-        d_z=d_z,
-        horizon=horizon,
-        prior_scale=prior_scale,
-    )
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_params:,} | d_model={d_model} | d_z={d_z}")
-    print(f"beta_tail={beta_tail} | lambda_q={lambda_q} | patience={patience}")
-
-    train(
-        model,
-        tr_ld,
-        va_ld,
-        epochs=epochs,
-        nZ=8,
-        lr=1e-3,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        lambda_stock=lambda_stock,
-        lambda_stock_mean_weight=lambda_stock_mean_weight,
-    )
-
-    diagnose_encoder(model, va_ld)
-
-    metrics = evaluate(model, va_ld, M=M_eval)
-    print(f"\nPinball50={metrics['pinball50']:.4f} | Pinball70={metrics['pinball70']:.4f}")
-
-    forecast_df = generate_forecast_df(model, va_ld, M=M_eval)
-    forecast_df["zero_group_run"] = "all_sample_scot_intersection"
-
-    diag_df = generate_diagnostic_df(model, va_ld, M=M_eval)
-    diag_p50 = underbias_diagnosis(diag_df, "p50")
-    diag_p70 = underbias_diagnosis(diag_df, "p70")
-    mag_gap_df = magnitude_gap(diag_df)
-
-    print("\nUnderbias P50:")
-    print(diag_p50.T)
-
-    print("\nUnderbias P70:")
-    print(diag_p70.T)
-
-    result = {
-        "model": model,
-        "forecast_df": forecast_df,
-        "diag_df": diag_df,
-        "diag_p50": diag_p50,
-        "diag_p70": diag_p70,
-        "mag_gap": mag_gap_df,
-        "tr_ld": tr_ld,
-        "va_ld": va_ld,
-        "data_intersection_raw": data_intersection_raw,
-        "data_labeled": data_labeled,
-        "data_train": data_train,
-        "asin_stats": asin_stats,
-        "sample_asin_df": sample_asin_df,
-        "intersect_asin_df": intersect_asin_df,
-        "removed_extreme": removed_extreme,
-        "extreme_cap": extreme_cap,
-    }
-
-    if run_wape:
-        result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
-            result=result,
-            scot_df=scot_df,
-            data_raw1=data_raw1,
-            asin_stats=asin_stats,
-            remove_oos_dp=remove_oos_dp,
-            source="lp",
-        )
-
-    return result
-
-
-
-# =====================================================
-
-# ============================================================
-# External exposure-3 injection into demand future_context
-# ============================================================
-
-_ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3 = load_real_data
-
-def _extract_external_exposure3_hat(result_or_hat):
-    """
-    Extract a clean dataframe containing external predicted exposure hats.
-
-    This version is duplicate-column safe.
-
-    Priority:
-      1. calibrated level columns:
-           pred_total_dph_calib
-           pred_buy_box_dph_calib
-           pred_in_stock_dph_calib / pred_instock_dph_calib
-      2. normal level columns:
-           pred_total_dph
-           pred_buy_box_dph
-           pred_instock_dph / pred_in_stock_dph
-      3. attention level columns:
-           attn_total_dph
-           attn_buy_box_dph
-           attn_instock_dph / attn_in_stock_dph
-      4. log columns:
-           external_total_dph_hat_log
-           external_buy_box_dph_hat_log
-           external_instock_dph_hat_log
-    """
-    source = None
-
-    if isinstance(result_or_hat, dict):
-        if "exposure_hat_for_demand_calib" in result_or_hat:
-            hat = result_or_hat["exposure_hat_for_demand_calib"].copy()
-            source = "dict['exposure_hat_for_demand_calib']"
-
-        elif "exposure_hat_for_demand_mu" in result_or_hat:
-            hat = result_or_hat["exposure_hat_for_demand_mu"].copy()
-            source = "dict['exposure_hat_for_demand_mu']"
-
-        elif "exposure_hat_for_demand" in result_or_hat:
-            hat = result_or_hat["exposure_hat_for_demand"].copy()
-            source = "dict['exposure_hat_for_demand']"
-
-        elif "result_focus" in result_or_hat and isinstance(result_or_hat["result_focus"], dict):
-            rf = result_or_hat["result_focus"]
-
-            if "exposure_hat_for_demand_calib" in rf:
-                hat = rf["exposure_hat_for_demand_calib"].copy()
-                source = "dict['result_focus']['exposure_hat_for_demand_calib']"
-            elif "exposure_hat_for_demand_mu" in rf:
-                hat = rf["exposure_hat_for_demand_mu"].copy()
-                source = "dict['result_focus']['exposure_hat_for_demand_mu']"
-            elif "exposure_hat_for_demand" in rf:
-                hat = rf["exposure_hat_for_demand"].copy()
-                source = "dict['result_focus']['exposure_hat_for_demand']"
-            elif "attn_df" in rf:
-                hat = rf["attn_df"].copy()
-                source = "dict['result_focus']['attn_df']"
-            else:
-                raise ValueError("result_focus has no exposure_hat_for_demand / exposure_hat_for_demand_calib / attn_df.")
-
-        elif "attn_df" in result_or_hat:
-            hat = result_or_hat["attn_df"].copy()
-            source = "dict['attn_df']"
-
-        else:
-            raise ValueError(
-                "Cannot find exposure hat dataframe in dict. "
-                "Expected exposure_hat_for_demand_calib, exposure_hat_for_demand, result_focus, or attn_df."
-            )
-    else:
-        hat = result_or_hat.copy()
-        source = "direct dataframe input"
-
-    hat = hat.copy()
-
-    if "asin" not in hat.columns or "order_week" not in hat.columns:
-        raise ValueError("External exposure hat must contain asin and order_week.")
-
-    def _first_existing_col(df, cols):
-        for c in cols:
-            if c in df.columns:
-                x = df[c]
-                # If duplicate column names still exist for any reason, take the first one.
-                if isinstance(x, pd.DataFrame):
-                    x = x.iloc[:, 0]
-                return x, c
-        return None, None
-
-    total_s, total_src = _first_existing_col(
-        hat,
-        [
-            "pred_total_dph_calib",
-            "pred_total_dph",
-            "attn_total_dph",
-            "external_total_dph_hat_log",
-        ],
-    )
-
-    buy_s, buy_src = _first_existing_col(
-        hat,
-        [
-            "pred_buy_box_dph_calib",
-            "pred_buy_box_dph",
-            "attn_buy_box_dph",
-            "external_buy_box_dph_hat_log",
-        ],
-    )
-
-    instock_s, instock_src = _first_existing_col(
-        hat,
-        [
-            "pred_in_stock_dph_calib",
-            "pred_instock_dph_calib",
-            "pred_instock_dph",
-            "pred_in_stock_dph",
-            "attn_instock_dph",
-            "attn_in_stock_dph",
-            "external_instock_dph_hat_log",
-        ],
-    )
-
-    missing = []
-    if total_s is None:
-        missing.append("pred_total_dph")
-    if buy_s is None:
-        missing.append("pred_buy_box_dph")
-    if instock_s is None:
-        missing.append("pred_instock_dph")
-
-    if missing:
-        raise ValueError(
-            "External exposure hat is missing required prediction columns: "
-            f"{missing}. Available columns: {hat.columns.tolist()}"
-        )
-
-    clean = pd.DataFrame({
-        "asin": hat["asin"].astype(str),
-        "order_week": pd.to_datetime(hat["order_week"]),
-    })
-
-    # If source is log column, convert back to level.
-    if total_src == "external_total_dph_hat_log":
-        clean["pred_total_dph"] = np.expm1(pd.to_numeric(total_s, errors="coerce").fillna(0.0))
-    else:
-        clean["pred_total_dph"] = pd.to_numeric(total_s, errors="coerce").fillna(0.0)
-
-    if buy_src == "external_buy_box_dph_hat_log":
-        clean["pred_buy_box_dph"] = np.expm1(pd.to_numeric(buy_s, errors="coerce").fillna(0.0))
-    else:
-        clean["pred_buy_box_dph"] = pd.to_numeric(buy_s, errors="coerce").fillna(0.0)
-
-    if instock_src == "external_instock_dph_hat_log":
-        clean["pred_instock_dph"] = np.expm1(pd.to_numeric(instock_s, errors="coerce").fillna(0.0))
-    else:
-        clean["pred_instock_dph"] = pd.to_numeric(instock_s, errors="coerce").fillna(0.0)
-
-    for c in ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]:
-        clean[c] = clean[c].fillna(0.0).clip(lower=0.0)
-
-    # Safety: one ASIN-week row.
-    clean = (
-        clean.groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            pred_total_dph=("pred_total_dph", "mean"),
-            pred_buy_box_dph=("pred_buy_box_dph", "mean"),
-            pred_instock_dph=("pred_instock_dph", "mean"),
-        )
-    )
-
-    print("\nExternal exposure hat source:", source)
-    print("Selected total column:", total_src)
-    print("Selected buy_box column:", buy_src)
-    print("Selected instock column:", instock_src)
-
-    return clean, source
-
-
-def attach_external_exposure3_to_raw_data(
-    data_raw1,
-    exposure3_hat=None,
-    exposure_mode="all3",
-):
-    """
-    Attach external predicted exposure funnel to data_raw1.
-
-    exposure_mode:
-      "instock_only":
-          use only predicted in_stock DPH hat; total/buy_box hats are set to 0
-
-      "buybox_only":
-          use only predicted buy_box DPH hat; total/in_stock hats are set to 0
-
-      "all3":
-          use predicted total + buy_box + in_stock hats
-
-    Output columns:
-      attn_pred_total_dph
-      attn_pred_buy_box_dph
-      attn_pred_instock_dph
-
-    These columns are then picked up by the overridden load_real_data and DemandDataset.
-    """
-    valid_modes = {"instock_only", "buybox_only", "all3"}
-    if exposure_mode not in valid_modes:
-        raise ValueError(f"exposure_mode must be one of {sorted(valid_modes)}, got {exposure_mode}")
-
     df = data_raw1.copy()
     df["asin"] = df["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
 
-    if exposure3_hat is None:
-        raise ValueError(
-            f"exposure3_hat cannot be None when exposure_mode='{exposure_mode}'. "
-            "This clean version only supports predicted external exposure hats."
-        )
-
-    hat, source = _extract_external_exposure3_hat(exposure3_hat)
-
-    # Select which external hats are allowed to enter demand model.
-    use_total = exposure_mode == "all3"
-    use_buy = exposure_mode in {"all3", "buybox_only"}
-    use_instock = exposure_mode in {"all3", "instock_only"}
-    uses_true_future_exposure = False
-
-    if not use_total:
-        hat["pred_total_dph"] = 0.0
-    if not use_buy:
-        hat["pred_buy_box_dph"] = 0.0
-    if not use_instock:
-        hat["pred_instock_dph"] = 0.0
-
-    out = df.merge(
-        hat.rename(
-            columns={
-                "pred_total_dph": "attn_pred_total_dph",
-                "pred_buy_box_dph": "attn_pred_buy_box_dph",
-                "pred_instock_dph": "attn_pred_instock_dph",
-            }
-        ),
-        on=["asin", "order_week"],
-        how="left",
+    rng = np.random.default_rng(seed)
+    unique_asins = df["asin"].dropna().unique()
+    sample_asins = rng.choice(
+        unique_asins,
+        size=min(n_asins, len(unique_asins)),
+        replace=False,
     )
+    sample_asin_set = set(sample_asins)
 
-    for c in [
-        "attn_pred_total_dph",
-        "attn_pred_buy_box_dph",
-        "attn_pred_instock_dph",
-    ]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if scot_df is None:
+        out = df[df["asin"].isin(sample_asin_set)].copy()
+        out = fill_missing_dph_after_scot_merge(out, verbose=True)
+        print(f"Sampled ASINs: {len(sample_asin_set)} | Rows: {len(out)}")
+        return out
 
-    out["attn_pred_total_log"] = np.log1p(out["attn_pred_total_dph"])
-    out["attn_pred_buy_box_log"] = np.log1p(out["attn_pred_buy_box_dph"])
-    out["attn_pred_instock_log"] = np.log1p(out["attn_pred_instock_dph"])
+    scot = scot_df.copy()
+    scot["asin"] = scot["asin"].astype(str)
+    scot_asin_set = set(scot["asin"].dropna().unique())
+    intersect_asins = sorted(sample_asin_set & scot_asin_set)
 
+    out = df[df["asin"].isin(intersect_asins)].copy()
+    out = fill_missing_dph_after_scot_merge(out, verbose=True)
     print("\n" + "=" * 100)
-    print("EXTERNAL EXPOSURE HATS ATTACHED TO DEMAND DATA")
+    print("SAMPLE + SCOT INTERSECTION")
     print("=" * 100)
-    print("Source:", source)
-    print("exposure_mode:", exposure_mode)
-    print("Using total hat:", use_total)
-    print("Using buy_box hat:", use_buy)
-    print("Using instock hat:", use_instock)
-
-    print("\nDemand model receives:")
-    if use_total:
-        print("  log1p(attn_pred_total_dph)")
-    if use_buy:
-        print("  log1p(attn_pred_buy_box_dph)")
-    if use_instock:
-        print("  log1p(attn_pred_instock_dph)")
-
-    if uses_true_future_exposure:
-        print("WARNING: This mode uses TRUE future in_stock_dph. Use only as oracle upper-bound test.")
-    else:
-        print("No true future exposure is used as input.")
-
-    print("\nHat summaries after mode selection:")
-    print(
-        out[
-            [
-                "attn_pred_total_dph",
-                "attn_pred_buy_box_dph",
-                "attn_pred_instock_dph",
-            ]
-        ].describe().round(4).to_string()
-    )
-
+    print(f"Sample ASINs: {len(sample_asin_set)}")
+    print(f"SCOT ASINs: {len(scot_asin_set)}")
+    print(f"Intersection ASINs: {len(intersect_asins)}")
+    print(f"Rows after intersection: {len(out)}")
+    print("=" * 100)
     return out
 
 
+class ExposureDatasetRolling(Dataset):
+    def __init__(
+        self,
+        data,
+        history=13,
+        horizon=20,
+        mode="train",
+        val_start_offset=0,
+        anchor_decay=0.08,
+    ):
+        self.samples = []
+        self.data = data
+        self.history = history
+        self.horizon = horizon
+        self.anchor_decay = anchor_decay
+        self.val_start_offset = int(val_start_offset)
 
-def run_external_exposure3_in_old_decoder_style(
+        for asin, d in data.items():
+            T = len(d["features"])
+            val_start = T - history - horizon - self.val_start_offset
+
+            if mode == "train":
+                starts = range(max(0, val_start))
+            else:
+                starts = [val_start] if val_start >= 0 and (val_start + history + horizon) <= T else []
+
+            for start in starts:
+                self.samples.append((asin, start))
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _hist_mean(arr, end, window):
+        x = arr[max(0, end - window):end]
+        return float(np.mean(x)) if len(x) > 0 else 0.0
+
+    def _make_future_context(self, d, start):
+        h = self.history
+        H = self.horizon
+        fc = d["future_context"][start + h:start + h + H].copy()
+        cols = d["context_cols"]
+        idx = {c: i for i, c in enumerate(cols)}
+        end = start + h
+
+        total = d["total_dph"]
+        buy = d["buy_box_dph"]
+        instock = d["in_stock_dph"]
+        demand = d["demand"]
+
+        post_event_col = "post_event_decay"
+        current_post_decay = float(fc[0, idx[post_event_col]]) if post_event_col in idx and len(fc) > 0 else 0.0
+        post_strength = 0.5
+        effective_post_decay = post_strength * current_post_decay
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            for prefix, arr in [("total", total), ("buy_box", buy), ("instock", instock)]:
+                mean13_val = np.log1p(self._hist_mean(arr, end, 13))
+                mean4_val = np.log1p(self._hist_mean(arr, end, 4))
+                raw_last = np.log1p(arr[end - 1]) if end > 0 else 0.0
+                last_val = raw_last * (1.0 - effective_post_decay) + mean13_val * effective_post_decay
+
+                for col, val in [
+                    (f"hist_{prefix}_dph_last_log", h_decay * last_val + (1 - h_decay) * mean13_val),
+                    (f"hist_{prefix}_dph_mean4_log", h_decay * mean4_val + (1 - h_decay) * mean13_val),
+                    (f"hist_{prefix}_dph_mean13_log", mean13_val),
+                ]:
+                    if col in idx:
+                        fc[step_h, idx[col]] = val
+
+        demand_last = np.log1p(demand[end - 1]) if end > 0 else 0.0
+        demand_mean4 = np.log1p(self._hist_mean(demand, end, 4))
+        demand_mean13 = np.log1p(self._hist_mean(demand, end, 13))
+        demand_active_rate = float(np.mean(demand[max(0, end - 13):end] > 0)) if end > 0 else 0.0
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            for col, val in [
+                ("hist_demand_last_log", h_decay * demand_last + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean4_log", h_decay * demand_mean4 + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean13_log", demand_mean13),
+                ("hist_demand_active_rate", demand_active_rate),
+            ]:
+                if col in idx:
+                    fc[step_h, idx[col]] = val
+
+        return fc
+
+    def __getitem__(self, i):
+        asin, start = self.samples[i]
+        d = self.data[asin]
+        h = self.history
+        H = self.horizon
+
+        return {
+            "asin": asin,
+            "target_week": [str(w)[:10] for w in d["week"][start + h:start + h + H]],
+            "x": torch.tensor(d["features"][start:start + h], dtype=torch.float32),
+            "future_context": torch.tensor(self._make_future_context(d, start), dtype=torch.float32),
+            "future_total_dph": torch.tensor(d["total_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_buy_box_dph": torch.tensor(d["buy_box_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_instock_dph": torch.tensor(d["in_stock_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_demand": torch.tensor(d["demand"][start + h:start + h + H], dtype=torch.float32),
+            "asin_idx": torch.tensor(int(d.get("asin_idx", 0)), dtype=torch.long),
+        }
+
+
+def summarize_rolling_exposure(pred_df, label="ROLLING"):
+    print("\n" + "=" * 100)
+    print(f"{label}: OVERALL METRICS")
+    print("=" * 100)
+    tbl = exposure_metrics(pred_df, prefix="pred")
+    print(tbl.round(5).to_string(index=False))
+
+    rows = []
+    for (offset, h), g in pred_df.groupby(["backtest_offset", "horizon"]):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows.append({
+            "backtest_offset": offset,
+            "horizon": h,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_offset_horizon = pd.DataFrame(rows)
+
+    rows2 = []
+    for offset, g in pred_df.groupby("backtest_offset"):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows2.append({
+            "backtest_offset": offset,
+            "n_rows": len(g),
+            "n_asins": g["asin"].nunique(),
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_offset = pd.DataFrame(rows2)
+
+    print("\n" + "=" * 100)
+    print(f"{label}: BY BACKTEST OFFSET")
+    print("=" * 100)
+    print(by_offset.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print(f"{label}: BY OFFSET + HORIZON")
+    print("=" * 100)
+    print(by_offset_horizon.round(4).to_string(index=False))
+
+    return {"overall": tbl, "by_offset": by_offset, "by_offset_horizon": by_offset_horizon}
+
+
+def _train_one_exposure_window(
+    data,
+    context_dim,
+    context_cols,
+    history=13,
+    horizon=20,
+    val_start_offset=0,
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=20,
+    lr=5e-4,
+    patience=5,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.20,
+    mag_weight=1.00,
+    mean_weight=0.25,
+    active_calib_weight=0.05,
+    nb_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.25,
+    high_weight_alpha=0.35,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
+    dropout=0.20,
+    use_graphsage=False,
+    graph_assets=None,
+    graph_dim=16,
+    graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
+    use_graph_gate=True,
+    use_encoder_self_attn=True,
+):
+    tr_ds = ExposureDatasetRolling(
+        data,
+        history=history,
+        horizon=horizon,
+        mode="train",
+        val_start_offset=val_start_offset,
+        anchor_decay=anchor_decay,
+    )
+    va_ds = ExposureDatasetRolling(
+        data,
+        history=history,
+        horizon=horizon,
+        mode="val",
+        val_start_offset=val_start_offset,
+        anchor_decay=anchor_decay,
+    )
+
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, collate_fn=exposure_collate, pin_memory=dataloader_pin_memory())
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=exposure_collate, pin_memory=dataloader_pin_memory())
+
+    print("\n" + "=" * 100)
+    print(f"BACKTEST OFFSET = {val_start_offset}")
+    print("=" * 100)
+    print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
+
+    if len(tr_ds) == 0 or len(va_ds) == 0:
+        raise ValueError(f"Empty train/val set for val_start_offset={val_start_offset}")
+
+    input_dim = next(iter(tr_ld))["x"].shape[-1]
+    model = ExposureForecastModelV2(
+        input_dim=input_dim,
+        context_dim=context_dim,
+        d_model=d_model,
+        horizon=horizon,
+        n_heads=n_heads,
+        dropout=dropout,
+        context_cols=context_cols,
+        use_encoder_self_attn=use_encoder_self_attn,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
+    )
+    print(f"Input dim: {input_dim} | Context dim: {context_dim}")
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    train_exposure_model_v2(
+        model=model,
+        tr_ld=tr_ld,
+        va_ld=va_ld,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
+        bce_weight=bce_weight,
+        mag_weight=mag_weight,
+        mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
+        horizon_weight_alpha=horizon_weight_alpha,
+        high_weight_alpha=high_weight_alpha,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
+        zero_fp_threshold=zero_fp_threshold,
+        zero_fp_temperature=zero_fp_temperature,
+    )
+
+    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint, mc_reduce="mu")
+    pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
+    pred_df["backtest_offset"] = int(val_start_offset)
+
+    diagnostics = print_exposure_diagnostics(pred_df)
+    return {
+        "model": model,
+        "forecast_df": pred_df,
+        "diagnostics": diagnostics,
+        "tr_ld": tr_ld,
+        "va_ld": va_ld,
+        "tr_ds": tr_ds,
+        "va_ds": va_ds,
+    }
+
+
+
+
+# ============================================================
+# DualRelationalGAT diagnostics: is graph embedding useful, and for what?
+# ============================================================
+
+def diagnose_dualgraph_signal(model, graph_assets, pred_df, target="instock", verbose=True):
+    """
+    Probe whether DualRelationalGAT embedding carries useful information.
+
+    Prints/returns:
+      1. neighbor homophily: does KNN graph actually connect similar GL/category/brand nodes?
+      2. graph embedding probes: can graph embedding alone explain ASIN-level true 20w sum?
+      3. graph norm quartiles: are high/low graph regimes associated with different true/pred levels?
+
+    This is diagnostic only; it does not affect predictions.
+    """
+    if graph_assets is None or model is None or not getattr(model, "use_graphsage", False):
+        if verbose:
+            print("DualRelationalGAT diagnostics skipped: graph is disabled.")
+        return {}
+
+    diag = {}
+    try:
+        with torch.no_grad():
+            node_feat = model.graph_node_features
+            neigh_idx = model.graph_neighbor_idx
+            comp_idx = getattr(model, "graph_competitive_neighbor_idx", neigh_idx)
+            emb = model.graph_encoder(node_feat, neigh_idx, comp_idx).detach().cpu().numpy()
+        idx_to_asin = graph_assets.get("idx_to_asin", [str(i) for i in range(emb.shape[0])])
+        emb_cols = [f"g{i}" for i in range(emb.shape[1])]
+        emb_df = pd.DataFrame(emb, columns=emb_cols)
+        emb_df["asin"] = [str(a) for a in idx_to_asin]
+        emb_df["graph_norm"] = np.linalg.norm(emb, axis=1)
+        diag["graph_embedding_df"] = emb_df
+    except Exception as e:
+        if verbose:
+            print(f"Graph embedding extraction failed: {e}")
+        return {"error": str(e)}
+
+    # Homophily over constructed neighbors.
+    try:
+        meta = graph_assets.get("meta_df", pd.DataFrame()).copy()
+        nb = graph_assets["neighbor_idx"]
+        gl = meta["gl_product_group"].astype(str).values if "gl_product_group" in meta.columns else None
+        cat = meta["category_code"].astype(str).values if "category_code" in meta.columns else None
+        br = meta["ind_top10_brand"].astype(float).values if "ind_top10_brand" in meta.columns else None
+        hom = {}
+        if gl is not None:
+            hom["same_gl"] = float(np.mean([np.mean(gl[nb[i]] == gl[i]) for i in range(len(nb))]))
+        if cat is not None:
+            hom["same_category"] = float(np.mean([np.mean(cat[nb[i]] == cat[i]) for i in range(len(nb))]))
+        if br is not None:
+            hom["same_top10_brand_state"] = float(np.mean([np.mean(br[nb[i]] == br[i]) for i in range(len(nb))]))
+        diag["neighbor_homophily"] = hom
+    except Exception as e:
+        diag["neighbor_homophily_error"] = str(e)
+
+    # ASIN-level target/pred summary.
+    true_col = f"true_{target}_dph" if f"true_{target}_dph" in pred_df.columns else "true_instock_dph"
+    pred_col = f"pred_{target}_dph" if f"pred_{target}_dph" in pred_df.columns else "pred_instock_dph"
+    if true_col not in pred_df.columns or pred_col not in pred_df.columns:
+        if verbose:
+            print("Graph diagnostics warning: target/pred columns not found in pred_df.")
+        return diag
+
+    asin_sum = (
+        pred_df.groupby("asin")
+        .agg(
+            true_sum=(true_col, "sum"),
+            pred_sum=(pred_col, "sum"),
+            true_mean=(true_col, "mean"),
+            pred_mean=(pred_col, "mean"),
+            active_rate=(true_col, lambda x: np.mean(np.asarray(x) > 0)),
+        )
+        .reset_index()
+    )
+    asin_sum["asin"] = asin_sum["asin"].astype(str)
+    m = emb_df.merge(asin_sum, on="asin", how="inner")
+    if len(m) == 0:
+        return diag
+
+    # Ridge probe: graph embedding alone -> log true 20w sum.
+    probe_rows = []
+    try:
+        from sklearn.linear_model import Ridge, LogisticRegression
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import r2_score, roc_auc_score
+        X = m[emb_cols].values.astype(float)
+        y = np.log1p(m["true_sum"].values.astype(float))
+        if len(m) >= 50 and np.std(y) > 1e-8:
+            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.30, random_state=42)
+            reg = Ridge(alpha=1.0).fit(X_tr, y_tr)
+            y_hat = reg.predict(X_te)
+            probe_rows.append({
+                "probe": "graph_emb_to_log_true_sum_R2",
+                "value": float(r2_score(y_te, y_hat)),
+                "note": "higher means graph embedding carries magnitude/scale information",
+            })
+        # active path probe
+        yb = (m["active_rate"].values.astype(float) > 0.5).astype(int)
+        if len(np.unique(yb)) == 2 and len(m) >= 50:
+            X_tr, X_te, y_tr, y_te = train_test_split(X, yb, test_size=0.30, random_state=42, stratify=yb)
+            clf = LogisticRegression(max_iter=500, C=1.0).fit(X_tr, y_tr)
+            score = clf.predict_proba(X_te)[:, 1]
+            probe_rows.append({
+                "probe": "graph_emb_to_active_path_AUC",
+                "value": float(roc_auc_score(y_te, score)),
+                "note": "higher means graph embedding carries active/zero regime information",
+            })
+    except Exception as e:
+        probe_rows.append({"probe": "graph_probe_error", "value": np.nan, "note": str(e)})
+
+    # Correlation and quartile summary.
+    m["ratio"] = m["pred_sum"] / (m["true_sum"] + 1e-8)
+    try:
+        spearman_norm_true = _safe_spearman(m["graph_norm"], m["true_sum"])
+        spearman_norm_ratio = _safe_spearman(m["graph_norm"], m["ratio"])
+        probe_rows.append({"probe": "spearman_graph_norm_true_sum", "value": float(spearman_norm_true), "note": "graph norm vs true 20w level"})
+        probe_rows.append({"probe": "spearman_graph_norm_pred_true_ratio", "value": float(spearman_norm_ratio), "note": "positive/negative indicates graph norm is linked to bias"})
+    except Exception:
+        pass
+
+    probe_df = pd.DataFrame(probe_rows)
+    diag["graph_probe"] = probe_df
+
+    try:
+        m["graph_norm_bucket"] = pd.qcut(m["graph_norm"], q=4, duplicates="drop")
+        bucket = (
+            m.groupby("graph_norm_bucket")
+            .agg(
+                n_asins=("asin", "nunique"),
+                true_sum_mean=("true_sum", "mean"),
+                pred_sum_mean=("pred_sum", "mean"),
+                ratio=("ratio", "median"),
+                active_rate=("active_rate", "mean"),
+            )
+            .reset_index()
+        )
+        diag["graph_norm_bucket"] = bucket
+    except Exception as e:
+        diag["graph_norm_bucket_error"] = str(e)
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("DUAL-RELATION GRAPHSAGE EFFECT DIAGNOSTICS")
+        print("=" * 100)
+        if "neighbor_homophily" in diag:
+            print("Neighbor homophily:", {k: round(v, 4) for k, v in diag["neighbor_homophily"].items()})
+        if len(probe_df):
+            print("\nGraph embedding probes:")
+            print(probe_df.round(4).to_string(index=False))
+        if "graph_norm_bucket" in diag:
+            print("\nGraph norm bucket summary:")
+            print(diag["graph_norm_bucket"].round(4).to_string(index=False))
+        print("\nInterpretation:")
+        print("- Good active AUC but low R2 to true_sum => graph mainly learns occurrence/regime, not magnitude.")
+        print("- Low ratio in high graph_norm buckets => graph message may be conservative/smoothing too much.")
+        print("- If same_category/same_brand are very low, edges may be too behavior-only; if too high, graph may be too static/clustered.")
+
+    return diag
+
+
+def run_exposure_v2(
     data_raw1,
-    scot_df,
-    exposure3_hat=None,
-    exposure_mode="all3",
+    scot_df=None,
     n_asins=5000,
     seed=42,
-    zero_thresholds=(0.4, 0.7),
-    prior_scale=0.3,
-    epochs=60,
-    history=52,
+    history=13,
     horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    lambda_q=0.05,
-    beta_tail=0.5,
-    patience=5,
-    lambda_z_reg=1.0,
-    lambda_stock=0.0,
-    lambda_stock_mean_weight=0.0,
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=30,
+    lr=5e-4,
+    patience=6,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
-    run_wape=True,
-    remove_oos_dp=True,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.20,
+    mag_weight=1.00,
+    mean_weight=0.25,
+    active_calib_weight=0.05,
+    nb_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.25,
+    high_weight_alpha=0.35,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
+    dropout=0.20,
+    use_scot_intersection=True,
+    val_start_offset=0,
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
+    use_graph_gate=True,
+    graph_zero_weight=0.03,
+    graph_level_peak_weight=2.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.3,
+    use_encoder_self_attn=True,
 ):
-    """
-    Demand model with external predicted exposure-3.
-
-    Use this when you already have the three DPH hats from another pipeline:
-      exposure_hat_for_demand_calib
-      exposure_hat_for_demand_e2e_attn
-      exposure_hat_for_demand
-      or any dataframe with pred_total_dph / pred_buy_box_dph / pred_instock_dph.
-
-    This function injects the three hats into the demand model's future context.
-    """
     print("\n" + "=" * 100)
-    print("DEMAND MODEL WITH EXTERNAL EXPOSURE HATS")
+    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
     print("=" * 100)
-    print("exposure_mode:", exposure_mode)
 
-    data_with_external_exp3 = attach_external_exposure3_to_raw_data(
-        data_raw1=data_raw1,
-        exposure3_hat=exposure3_hat,
-        exposure_mode=exposure_mode,
-    )
-
-    return run_nb_all_sample_scot_intersection(
-        data_raw1=data_with_external_exp3,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
-        zero_thresholds=zero_thresholds,
-        prior_scale=prior_scale,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=lambda_z_reg,
-        lambda_stock=lambda_stock,
-        lambda_stock_mean_weight=lambda_stock_mean_weight,
-        dph_cap_q=dph_cap_q,
-        remove_extreme=remove_extreme,
-        extreme_q=extreme_q,
-        run_wape=run_wape,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-
-def load_real_data(data_raw, dph_cap_q=0.995):
-    """
-    Override original load_real_data to inject external exposure-3 hats into future_context.
-
-    Added future context columns:
-      external_total_dph_hat_log
-      external_buy_box_dph_hat_log
-      external_instock_dph_hat_log
-
-    These are predicted future covariates, not true future DPH.
-    """
-    data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3(
-        data_raw=data_raw,
-        dph_cap_q=dph_cap_q,
-    )
-
-    required = [
-        "asin",
-        "order_week",
-        "attn_pred_total_log",
-        "attn_pred_buy_box_log",
-        "attn_pred_instock_log",
-    ]
-
-    if not all(c in data_raw.columns for c in required):
-        print("\nExternal exposure-3 columns not found. Using original future_context.")
-        return data, context_dim, context_cols
-
-    ext = data_raw[required].copy()
-    ext["asin"] = ext["asin"].astype(str)
-    ext["order_week"] = pd.to_datetime(ext["order_week"])
-
-    for c in ["attn_pred_total_log", "attn_pred_buy_box_log", "attn_pred_instock_log"]:
-        ext[c] = pd.to_numeric(ext[c], errors="coerce").fillna(0.0).clip(lower=0.0)
-
-    ext = (
-        ext.sort_values(["asin", "order_week"])
-        .groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            attn_pred_total_log=("attn_pred_total_log", "mean"),
-            attn_pred_buy_box_log=("attn_pred_buy_box_log", "mean"),
-            attn_pred_instock_log=("attn_pred_instock_log", "mean"),
-        )
-    )
-
-    new_cols = [
-        "external_total_dph_hat_log",
-        "external_buy_box_dph_hat_log",
-        "external_instock_dph_hat_log",
-    ]
-
-    added_any = False
-
-    for asin, d in data.items():
-        sub = ext[ext["asin"] == str(asin)].sort_values("order_week")
-
-        if len(sub) != len(d["week"]):
-            # Align by week to be safe.
-            week_df = pd.DataFrame({"order_week": pd.to_datetime(d["week"])})
-            sub = week_df.merge(
-                sub.drop(columns=["asin"]),
-                on="order_week",
-                how="left",
-            )
-
-        arr = sub[[
-            "attn_pred_total_log",
-            "attn_pred_buy_box_log",
-            "attn_pred_instock_log",
-        ]].fillna(0.0).values.astype(np.float32)
-
-        old_fc = d["future_context"]
-        d["future_context"] = np.concatenate([old_fc, arr], axis=1)
-        added_any = True
-
-    if added_any:
-        context_cols = context_cols + new_cols
-        context_dim = len(context_cols)
-
-        print("\n" + "=" * 100)
-        print("EXTERNAL EXPOSURE-3 HATS ADDED TO FUTURE_CONTEXT")
-        print("=" * 100)
-        print("Added context cols:", new_cols)
-        print("New context dim:", context_dim)
-
-    return data, context_dim, context_cols
-
-
-# ============================================================
-# Clean usage helpers (NO auto-run)
-# ============================================================
-
-def run_demand_with_predicted_exposure_all3(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-):
-    """
-    Recommended production-style run.
-
-    exposure_result_or_hat can be either:
-      1. exposure_result dict with key 'exposure_hat_for_demand', or
-      2. exposure_hat_for_demand dataframe from the exposure model.
-
-    Uses all three predicted exposure hats:
-      pred_total_dph, pred_buy_box_dph, pred_instock_dph.
-    """
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=exposure_result_or_hat,
-        exposure_mode="all3",
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=0.05,
-        beta_tail=0.5,
-        patience=5,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-def run_demand_with_predicted_exposure_instock_only(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-):
-    """
-    Comparison run: use only predicted in_stock_dph hat.
-    """
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=exposure_result_or_hat,
-        exposure_mode="instock_only",
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=0.05,
-        beta_tail=0.5,
-        patience=5,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-
-def run_demand_with_predicted_exposure_buybox_only(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-):
-    """
-    Comparison run: use only predicted buy_box_dph hat.
-    """
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=exposure_result_or_hat,
-        exposure_mode="buybox_only",
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=0.05,
-        beta_tail=0.5,
-        patience=5,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-"""
-USAGE IN JUPYTER
-----------------
-%run -i demand_external_exposure3_clean_3modes.py
-
-# After running your exposure model:
-# exposure_result = run_exposure_v2_final_scot_5000(...)
-# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand"]
-
-# Mode 1: predicted in-stock only
-demand_result_instock = run_demand_with_predicted_exposure_instock_only(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_hat_for_demand,
-    n_asins=5000,
-    epochs=60,
-    history=52,
-    horizon=20,
-)
-
-# Mode 2: predicted buy-box only
-demand_result_buybox = run_demand_with_predicted_exposure_buybox_only(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_hat_for_demand,
-    n_asins=5000,
-    epochs=60,
-    history=52,
-    horizon=20,
-)
-
-# Mode 3: predicted total + buy-box + in-stock
-demand_result_all3 = run_demand_with_predicted_exposure_all3(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_hat_for_demand,
-    n_asins=5000,
-    epochs=60,
-    history=52,
-    horizon=20,
-)
-"""
-
-
-# ==================================================================================================
-# V8 EXTENSION: DIRECT DEMAND WITH CATEGORY-GRAPH FEATURES + PATCH DECODER ABLATION
-# --------------------------------------------------------------------------------------------------
-# This block intentionally leaves the original forecast_df / run_final_wape / AMXL-vs-SCOT output
-# format unchanged. It only changes model features / head structure through global switches and wrappers.
-#
-# Key switches:
-#   DEMAND_HEAD_TYPE: "direct"  -> old no-decoder horizon head
-#                     "patch"   -> short/mid/long patch horizon head
-#   USE_DEMAND_GRAPH_HEAD: small multiplicative graph-delta head for demand magnitude
-#   USE_CATEGORY_GRAPH_FEATURES: append origin-safe category-level graph profile features to future_context
-#
-# The original run_demand_with_predicted_exposure_* functions still work. Use the new wrappers at the
-# bottom to run direct-vs-patch comparison while keeping the exact old WAPE output structure.
-# ==================================================================================================
-
-DEMAND_HEAD_TYPE = "direct"          # "direct" or "patch"
-USE_CATEGORY_GRAPH_FEATURES = True
-USE_DEMAND_GRAPH_HEAD = True
-DEMAND_GRAPH_HEAD_SCALE = 0.03
-DEMAND_GRAPH_CONTEXT_COLS = []
-DEMAND_GRAPH_CONTEXT_IDX = []
-
-
-def set_demand_model_ablation(
-    demand_head_type="direct",
-    use_category_graph_features=True,
-    use_graph_head=True,
-    graph_head_scale=0.03,
-):
-    """Set global ablation switches used by the redefined TCN_ENN and load_real_data below."""
-    global DEMAND_HEAD_TYPE, USE_CATEGORY_GRAPH_FEATURES, USE_DEMAND_GRAPH_HEAD, DEMAND_GRAPH_HEAD_SCALE
-    demand_head_type = str(demand_head_type).lower()
-    if demand_head_type not in {"direct", "patch"}:
-        raise ValueError("demand_head_type must be either 'direct' or 'patch'.")
-    DEMAND_HEAD_TYPE = demand_head_type
-    USE_CATEGORY_GRAPH_FEATURES = bool(use_category_graph_features)
-    USE_DEMAND_GRAPH_HEAD = bool(use_graph_head)
-    DEMAND_GRAPH_HEAD_SCALE = float(graph_head_scale)
-    print("\n" + "=" * 90)
-    print("DEMAND MODEL ABLATION SETTINGS")
-    print("=" * 90)
-    print("DEMAND_HEAD_TYPE:", DEMAND_HEAD_TYPE)
-    print("USE_CATEGORY_GRAPH_FEATURES:", USE_CATEGORY_GRAPH_FEATURES)
-    print("USE_DEMAND_GRAPH_HEAD:", USE_DEMAND_GRAPH_HEAD)
-    print("DEMAND_GRAPH_HEAD_SCALE:", DEMAND_GRAPH_HEAD_SCALE)
-    print("WAPE / forecast_df format: unchanged")
-
-
-def _lag_rolling_sum(s, window):
-    return s.shift(1).rolling(window, min_periods=1).sum()
-
-
-def _lag_rolling_mean(s, window):
-    return s.shift(1).rolling(window, min_periods=1).mean()
-
-
-def _make_origin_safe_category_graph_feature_frame(data_raw, hist_weeks=13):
-    """
-    Build row-level, origin-safe category graph features.
-
-    For each ASIN-week, first compute ASIN's lagged historical demand/exposure profile.
-    Then aggregate these profiles among ASINs in the same category and week.
-    Finally append own-vs-category relative strength features.
-
-    This is a lightweight category graph profile. It preserves the old DataLoader API because features
-    are appended into future_context and repeated horizon-wise exactly like other known/static context.
-    """
-    df = data_raw.copy()
-    df["asin"] = df["asin"].astype(str)
-    df["order_week"] = pd.to_datetime(df["order_week"], errors="coerce")
-
-    if "category_code" in df.columns:
-        cat = df["category_code"].astype(str).fillna("MISSING")
-    elif "gl_product_group" in df.columns:
-        # fallback only for missing category_code; graph is intended to be category-level
-        cat = df["gl_product_group"].astype(str).fillna("MISSING_GL")
+    if use_scot_intersection:
+        df = prepare_exposure_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
     else:
-        cat = pd.Series("GLOBAL_CAT", index=df.index)
-    df["_graph_category"] = cat
+        df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
-    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph"]:
-        if c not in df.columns:
-            df[c] = 0.0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
 
-    df = df.sort_values(["asin", "order_week"]).reset_index(drop=True)
-    g = df.groupby("asin", sort=False)
-
-    # Own lagged historical profile: no current/future week included.
-    df["own_hist_demand_sum13"] = g["fbi_demand"].transform(lambda s: _lag_rolling_sum(s, hist_weeks))
-    df["own_hist_demand_mean13"] = g["fbi_demand"].transform(lambda s: _lag_rolling_mean(s, hist_weeks))
-    df["own_hist_demand_active13"] = g["fbi_demand"].transform(lambda s: (s.shift(1) > 0).rolling(hist_weeks, min_periods=1).mean())
-
-    df["own_hist_total_sum13"] = g["total_dph"].transform(lambda s: _lag_rolling_sum(s, hist_weeks))
-    df["own_hist_buybox_sum13"] = g["buy_box_dph"].transform(lambda s: _lag_rolling_sum(s, hist_weeks))
-    df["own_hist_instock_sum13"] = g["in_stock_dph"].transform(lambda s: _lag_rolling_sum(s, hist_weeks))
-
-    own_cols = [
-        "own_hist_demand_sum13", "own_hist_demand_mean13", "own_hist_demand_active13",
-        "own_hist_total_sum13", "own_hist_buybox_sum13", "own_hist_instock_sum13",
-    ]
-    for c in own_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0.0)
-
-    # Same-category, same-week aggregate profile. This is the graph neighborhood summary.
-    cat_week = df.groupby(["_graph_category", "order_week"], sort=False)
-    df["cat_n_asins_week"] = cat_week["asin"].transform("nunique").astype(float)
-
-    for c in own_cols:
-        df[f"cat_mean_{c}"] = cat_week[c].transform("mean").fillna(0.0)
-        # p75 is more robust for high-strength neighbor signal; transform quantile is slower but OK for 5k ASIN runs.
-        try:
-            df[f"cat_p75_{c}"] = cat_week[c].transform(lambda x: x.quantile(0.75)).fillna(0.0)
-        except Exception:
-            df[f"cat_p75_{c}"] = df[f"cat_mean_{c}"]
-
-    eps = 1e-6
-    # Log-scaled own graph strength features.
-    df["graph_own_demand_sum13_log"] = np.log1p(df["own_hist_demand_sum13"])
-    df["graph_own_demand_mean13_log"] = np.log1p(df["own_hist_demand_mean13"])
-    df["graph_own_active13"] = df["own_hist_demand_active13"].clip(0.0, 1.0)
-    df["graph_own_total_sum13_log"] = np.log1p(df["own_hist_total_sum13"])
-    df["graph_own_buybox_sum13_log"] = np.log1p(df["own_hist_buybox_sum13"])
-    df["graph_own_instock_sum13_log"] = np.log1p(df["own_hist_instock_sum13"])
-
-    # Category neighborhood features.
-    df["graph_cat_demand_sum13_log"] = np.log1p(df["cat_mean_own_hist_demand_sum13"])
-    df["graph_cat_total_sum13_log"] = np.log1p(df["cat_mean_own_hist_total_sum13"])
-    df["graph_cat_buybox_sum13_log"] = np.log1p(df["cat_mean_own_hist_buybox_sum13"])
-    df["graph_cat_instock_sum13_log"] = np.log1p(df["cat_mean_own_hist_instock_sum13"])
-    df["graph_cat_n_asins_log"] = np.log1p(df["cat_n_asins_week"])
-
-    # Relative position within category graph.
-    df["graph_rel_demand_strength"] = (
-        np.log1p(df["own_hist_demand_sum13"]) - np.log1p(df["cat_mean_own_hist_demand_sum13"] + eps)
-    )
-    df["graph_rel_exposure_strength"] = (
-        np.log1p(df["own_hist_instock_sum13"]) - np.log1p(df["cat_mean_own_hist_instock_sum13"] + eps)
-    )
-    df["graph_demand_per_instock_log"] = np.log1p(
-        df["own_hist_demand_sum13"] / (df["own_hist_instock_sum13"] + 1.0)
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
     )
 
-    graph_cols = [
-        "graph_own_demand_sum13_log",
-        "graph_own_demand_mean13_log",
-        "graph_own_active13",
-        "graph_own_total_sum13_log",
-        "graph_own_buybox_sum13_log",
-        "graph_own_instock_sum13_log",
-        "graph_cat_demand_sum13_log",
-        "graph_cat_total_sum13_log",
-        "graph_cat_buybox_sum13_log",
-        "graph_cat_instock_sum13_log",
-        "graph_cat_n_asins_log",
-        "graph_rel_demand_strength",
-        "graph_rel_exposure_strength",
-        "graph_demand_per_instock_log",
-    ]
-
-    # Robust standardization. Active rate stays in [0,1].
-    for c in graph_cols:
-        val = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        if c not in {"graph_own_active13"}:
-            m = float(val.mean())
-            sd = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-            val = ((val - m) / sd).clip(-5, 5)
-        df[c] = val.astype(np.float32)
-
-    return df[["asin", "order_week"] + graph_cols].copy(), graph_cols
-
-
-# Save current load_real_data (the external-exposure override) and override it once more to append graph features.
-_ORIGINAL_LOAD_REAL_DATA_BEFORE_DEMAND_CAT_GRAPH = load_real_data
-
-
-def load_real_data(data_raw, dph_cap_q=0.995):
-    """
-    V8 override: original demand data loader + optional category-level graph profile features.
-
-    Original external exposure-hat injection remains unchanged. We append extra graph columns at the end
-    of future_context, so forecast_df and WAPE outputs remain exactly the same.
-    """
-    global DEMAND_GRAPH_CONTEXT_COLS, DEMAND_GRAPH_CONTEXT_IDX
-
-    data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_DEMAND_CAT_GRAPH(
-        data_raw=data_raw,
-        dph_cap_q=dph_cap_q,
+    out = _train_one_exposure_window(
+        data=data,
+        context_dim=context_dim,
+        context_cols=context_cols,
+        history=history,
+        horizon=horizon,
+        val_start_offset=val_start_offset,
+        d_model=d_model,
+        n_heads=n_heads,
+        batch_size=batch_size,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
+        apply_funnel_constraint=apply_funnel_constraint,
+        anchor_decay=anchor_decay,
+        bce_weight=bce_weight,
+        mag_weight=mag_weight,
+        mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
+        horizon_weight_alpha=horizon_weight_alpha,
+        high_weight_alpha=high_weight_alpha,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        asin_sum_weight=asin_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
+        dropout=dropout,
+        use_graphsage=use_graphsage,
+        graph_assets=graph_assets,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
+        use_encoder_self_attn=use_encoder_self_attn,
     )
 
-    if not USE_CATEGORY_GRAPH_FEATURES:
-        DEMAND_GRAPH_CONTEXT_COLS = []
-        DEMAND_GRAPH_CONTEXT_IDX = []
-        return data, context_dim, context_cols
+    pred_df = out["forecast_df"]
 
-    graph_df, graph_cols = _make_origin_safe_category_graph_feature_frame(data_raw, hist_weeks=13)
-    graph_df["asin"] = graph_df["asin"].astype(str)
-    graph_df["order_week"] = pd.to_datetime(graph_df["order_week"])
+    # GL-level diagnostics are useful because GL groups have different seasonal/burst patterns.
+    gl_diag = diagnose_by_gl_group(pred_df, df, target="instock", min_asins=30, top_n=30)
+    gl_block_diag = diagnose_by_gl_horizon_block(pred_df, df, target="instock", min_asins=30)
+    gl_summary = summarize_gl_diagnostics(gl_diag, min_asins=30)
+    out["diagnostics"]["gl_group"] = gl_diag
+    out["diagnostics"]["gl_horizon_block"] = gl_block_diag
+    out["diagnostics"]["gl_summary"] = gl_summary
 
-    added_any = False
-    for asin, d in data.items():
-        sub = graph_df[graph_df["asin"] == str(asin)].sort_values("order_week")
-        if len(sub) != len(d["week"]):
-            week_df = pd.DataFrame({"order_week": pd.to_datetime(d["week"])})
-            sub = week_df.merge(sub.drop(columns=["asin"]), on="order_week", how="left")
-        arr = sub[graph_cols].fillna(0.0).values.astype(np.float32)
-        d["future_context"] = np.concatenate([d["future_context"], arr], axis=1)
-        added_any = True
+    graph_diagnostics = diagnose_dualgraph_signal(out.get("model"), graph_assets, pred_df, target="instock", verbose=True) if use_graphsage else {}
+    out["diagnostics"]["graph"] = graph_diagnostics
 
-    if added_any:
-        start_idx = len(context_cols)
-        context_cols = context_cols + graph_cols
-        context_dim = len(context_cols)
-        DEMAND_GRAPH_CONTEXT_COLS = list(graph_cols)
-        DEMAND_GRAPH_CONTEXT_IDX = list(range(start_idx, start_idx + len(graph_cols)))
-        print("\n" + "=" * 100)
-        print("V8 CATEGORY-LEVEL GRAPH FEATURES APPENDED TO DEMAND future_context")
-        print("=" * 100)
-        print("Graph neighborhood: category_code only; GL remains static/context feature if present.")
-        print("Graph feature count:", len(graph_cols))
-        print("Graph cols:", graph_cols)
-        print("Context dim after graph features:", context_dim)
-
-    return data, context_dim, context_cols
+    out.update({
+        "exposure_hat_for_demand": make_external_hat_df(pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_mu": make_external_hat_df(pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_p50": make_external_hat_df(pred_df, hat_source="p50"),
+        "exposure_hat_for_demand_dist_mean": make_external_hat_df(pred_df, hat_source="dist_mean"),
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "source_df": df,
+        "graph_assets": graph_assets,
+        "gl_diagnostics": gl_diag,
+        "gl_horizon_block_diagnostics": gl_block_diag,
+        "gl_summary": gl_summary,
+    })
+    return out
 
 
-class PatchHorizonHead(nn.Module):
-    """Short/mid/long patch horizon head; still direct multi-horizon, not autoregressive."""
-    def __init__(self, d_model=32, horizon=20, hidden=64):
-        super().__init__()
-        self.horizon = horizon
-        self.short_len = min(5, horizon)
-        self.mid_len = max(0, min(13, horizon) - self.short_len)
-        self.long_len = max(0, horizon - self.short_len - self.mid_len)
+def run_exposure_v2_rolling(
+    data_raw1,
+    scot_df=None,
+    n_asins=1000,
+    seed=42,
+    history=13,
+    horizon=20,
+    rolling_offsets=(60, 40, 20, 0),
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=20,
+    lr=5e-4,
+    patience=5,
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.20,
+    mag_weight=1.00,
+    mean_weight=0.25,
+    active_calib_weight=0.05,
+    nb_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.25,
+    high_weight_alpha=0.35,
+    path_zero_weight=0.00,
+    zero_fp_weight=0.00,
+    active_count_weight=0.00,
+    path_sum_weight=0.05,
+    asin_sum_weight=0.40,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
+    dropout=0.20,
+    use_scot_intersection=True,
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
+    use_graph_gate=True,
+    graph_zero_weight=0.03,
+    graph_level_peak_weight=2.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.3,
+    use_encoder_self_attn=True,
+):
+    print("\n" + "=" * 100)
+    print("EXPOSURE MODEL V2: ROLLING BACKTEST + SCOT INTERSECTION")
+    print("=" * 100)
+    print(f"n_asins={n_asins} | history={history} | rolling_offsets={list(rolling_offsets)} | epochs={epochs} | patience={patience} | encoder_attn={use_encoder_self_attn}")
 
-        self.short_head = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU(), nn.Linear(hidden, self.short_len))
-        self.mid_head = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU(), nn.Linear(hidden, self.mid_len)) if self.mid_len > 0 else None
-        self.long_head = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU(), nn.Linear(hidden, self.long_len)) if self.long_len > 0 else None
+    if use_scot_intersection:
+        df = prepare_exposure_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+    else:
+        df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
-    def forward(self, h):
-        outs = [self.short_head(h)]
-        if self.mid_head is not None:
-            outs.append(self.mid_head(h))
-        if self.long_head is not None:
-            outs.append(self.long_head(h))
-        return torch.cat(outs, dim=-1)
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
 
+    data, context_dim, context_cols, graph_assets = load_exposure_data(
+        df, dph_cap_q=dph_cap_q,
+        use_graphsage=use_graphsage, graph_horizon=horizon, neighbor_k=neighbor_k,
+        graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
+    )
 
-class TCNSparseAttnEncoder(nn.Module):
-    """
-    Redefinition with switchable horizon head:
-      DEMAND_HEAD_TYPE='direct' -> original no-decoder MLP horizon head
-      DEMAND_HEAD_TYPE='patch'  -> short/mid/long patch decoder head
-    """
-    def __init__(self, input_dim=34, d_model=32, horizon=20, head_type=None):
-        super().__init__()
-        self.horizon = horizon
-        self.head_type = (head_type or DEMAND_HEAD_TYPE).lower()
-        self.input_proj = nn.Linear(input_dim, d_model)
+    results_by_offset = {}
+    pred_list = []
 
-        dilations = [1, 2, 4, 8, 13, 26, 52]
-        self.convs = nn.ModuleList([CausalConv1d(d_model, d_model, 2, d) for d in dilations])
-        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
-        self.sparse_attn = SparsePeakAttention(d_model, n_heads=4, beta_peak=1.0)
-        self.final_norm = nn.LayerNorm(d_model)
-
-        if self.head_type == "patch":
-            self.base_head = PatchHorizonHead(d_model=d_model, horizon=horizon, hidden=64)
-            self.alpha_head = PatchHorizonHead(d_model=d_model, horizon=horizon, hidden=64)
-        elif self.head_type == "direct":
-            self.base_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
-            self.alpha_head = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, horizon))
-        else:
-            raise ValueError("head_type must be 'direct' or 'patch'.")
-
-    def forward(self, x):
-        b_t = x[:, :, 1]
-        peak_score = torch.sqrt(torch.expm1(x[:, :, 0]).clamp(min=0) + 1e-6)
-        h = self.input_proj(x).permute(0, 2, 1)
-        for conv, norm in zip(self.convs, self.norms):
-            h = conv(h) + h
-            h = h.permute(0, 2, 1)
-            h = norm(h)
-            h = F.gelu(h)
-            h = h.permute(0, 2, 1)
-        h = self.sparse_attn(h.permute(0, 2, 1), b_t, peak_score)
-        h_t = self.final_norm(h[:, -1, :])
-        mu = F.softplus(self.base_head(h_t))
-        alpha = F.softplus(self.alpha_head(h_t)) + 1e-4
-        return mu, alpha, h_t
-
-
-class TCN_ENN(nn.Module):
-    """
-    V8 demand model. Forecast_df / evaluation outputs are unchanged.
-
-    Adds optional category graph delta head:
-      final_mu = base_mu * exp(graph_head_scale * graph_delta)
-    where graph_delta is computed from appended category graph features in future_context.
-    """
-    def __init__(self, input_dim=34, context_dim=2, d_model=32,
-                 d_z=16, horizon=20, prior_scale=0.3,
-                 use_stock_decoder=False, head_type=None,
-                 use_graph_head=None, graph_head_scale=None):
-        super().__init__()
-        self.d_z = d_z
-        self.horizon = horizon
-        self.context_dim = context_dim
-        self.use_stock_decoder = False
-        self.stock_decoder = None
-        self.head_type = (head_type or DEMAND_HEAD_TYPE).lower()
-        self.use_graph_head = USE_DEMAND_GRAPH_HEAD if use_graph_head is None else bool(use_graph_head)
-        self.graph_head_scale = DEMAND_GRAPH_HEAD_SCALE if graph_head_scale is None else float(graph_head_scale)
-
-        self.encoder = TCNSparseAttnEncoder(input_dim, d_model, horizon, head_type=self.head_type)
-        self.z_generator = ContextZGenerator(d_model, context_dim, d_z, horizon)
-        self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
-
-        self.graph_idx = list(DEMAND_GRAPH_CONTEXT_IDX)
-        self.graph_head = None
-        if self.use_graph_head and len(self.graph_idx) > 0:
-            gdim = len(self.graph_idx)
-            self.graph_head = nn.Sequential(
-                nn.Linear(gdim, 32),
-                nn.ReLU(),
-                nn.Dropout(0.05),
-                nn.Linear(32, 1),
+    for offset in rolling_offsets:
+        # V10 rolling-safe dynamic relation graph:
+        # Rebuild graph at each validation origin.  For offset=40, the graph excludes
+        # the final 20+40 weeks, so neighbor relations only use history before that origin.
+        if use_graphsage:
+            data_offset, context_dim_offset, context_cols_offset, graph_assets_offset = load_exposure_data(
+                df, dph_cap_q=dph_cap_q,
+                use_graphsage=True, graph_horizon=horizon + int(offset), neighbor_k=neighbor_k,
+                graph_zero_weight=graph_zero_weight, graph_level_peak_weight=graph_level_peak_weight,
+                graph_transition_weight=graph_transition_weight, graph_static_weight=graph_static_weight,
+                graph_brand_weight=graph_brand_weight,
             )
+        else:
+            data_offset, context_dim_offset, context_cols_offset, graph_assets_offset = data, context_dim, context_cols, graph_assets
+        try:
+            res = _train_one_exposure_window(
+                data=data_offset,
+                context_dim=context_dim_offset,
+                context_cols=context_cols_offset,
+                history=history,
+                horizon=horizon,
+                val_start_offset=int(offset),
+                d_model=d_model,
+                n_heads=n_heads,
+                batch_size=batch_size,
+                epochs=epochs,
+                lr=lr,
+                patience=patience,
+                apply_funnel_constraint=apply_funnel_constraint,
+                anchor_decay=anchor_decay,
+                bce_weight=bce_weight,
+                mag_weight=mag_weight,
+                mean_weight=mean_weight,
+                active_calib_weight=active_calib_weight,
+                zero_weight=zero_weight,
+                total_zero_weight=total_zero_weight,
+                buy_zero_weight=buy_zero_weight,
+                instock_zero_weight=instock_zero_weight,
+                total_zero_consistency_weight=total_zero_consistency_weight,
+                buy_zero_consistency_weight=buy_zero_consistency_weight,
+                horizon_weight_alpha=horizon_weight_alpha,
+                high_weight_alpha=high_weight_alpha,
+                path_zero_weight=path_zero_weight,
+                zero_fp_weight=zero_fp_weight,
+                active_count_weight=active_count_weight,
+                path_sum_weight=path_sum_weight,
+                asin_sum_weight=asin_sum_weight,
+                short_horizon_weight=short_horizon_weight,
+                mid_horizon_weight=mid_horizon_weight,
+                long_horizon_weight=long_horizon_weight,
+                long_block_sum_weight=long_block_sum_weight,
+                peak_weight=peak_weight,
+                topk_peak_weight=topk_peak_weight,
+                peak_under_weight=peak_under_weight,
+                peak_topk=peak_topk,
+                peak_quantile=peak_quantile,
+                zero_fp_threshold=zero_fp_threshold,
+                zero_fp_temperature=zero_fp_temperature,
+                dropout=dropout,
+                use_graphsage=use_graphsage,
+                graph_assets=graph_assets_offset,
+                graph_dim=graph_dim,
+                graph_message_scale=graph_message_scale,
+                use_encoder_self_attn=use_encoder_self_attn,
+            )
+            results_by_offset[int(offset)] = res
+            pred_list.append(res["forecast_df"])
+        except Exception as e:
+            print(f"[SKIP] offset={offset} failed: {e}")
 
-        print("\n[V8 TCN_ENN]")
-        print("  demand head type:", self.head_type)
-        print("  use graph head:", self.use_graph_head, "| scale:", self.graph_head_scale)
-        print("  graph feature dim:", len(self.graph_idx))
+    if len(pred_list) == 0:
+        raise RuntimeError("All rolling backtest windows failed.")
 
-    def _external_exposure_log_hat(self, future_context):
-        # External hats are still the 3 columns immediately before graph cols when graph features are enabled.
-        if future_context.shape[-1] < 3:
-            B, H, _ = future_context.shape
-            return torch.zeros(B, H, 3, device=future_context.device, dtype=future_context.dtype)
-        if len(self.graph_idx) > 0:
-            start = min(self.graph_idx) - 3
-            if start >= 0:
-                return future_context[:, :, start:start+3].clamp(min=0.0)
-        return future_context[:, :, -3:].clamp(min=0.0)
+    rolling_pred_df = pd.concat(pred_list, ignore_index=True)
+    rolling_diagnostics = summarize_rolling_exposure(rolling_pred_df, label="ROLLING BACKTEST")
 
-    def _augment_context_with_stock_hat(self, h_t, future_context, *args, **kwargs):
-        return future_context, self._external_exposure_log_hat(future_context)
+    latest_offset = 0 if 0 in results_by_offset else sorted(results_by_offset.keys())[-1]
+    latest_pred_df = results_by_offset[latest_offset]["forecast_df"]
 
-    def _apply_graph_delta(self, mu, future_context):
-        if self.graph_head is None or len(self.graph_idx) == 0:
-            return mu
-        idx = torch.tensor(self.graph_idx, device=future_context.device, dtype=torch.long)
-        gfeat = future_context.index_select(dim=-1, index=idx).float()
-        delta = self.graph_head(gfeat).squeeze(-1).clamp(-3.0, 3.0)
-        scale = float(self.graph_head_scale)
-        return mu * torch.exp(scale * delta).clamp(0.5, 2.0)
+    # GL diagnostics for the latest prediction window and for all rolling windows.
+    latest_gl_diag = diagnose_by_gl_group(latest_pred_df, df, target="instock", min_asins=30, top_n=30)
+    latest_gl_block_diag = diagnose_by_gl_horizon_block(latest_pred_df, df, target="instock", min_asins=30)
+    latest_gl_summary = summarize_gl_diagnostics(latest_gl_diag, min_asins=30)
 
-    def forward(self, x, future_context, nZ=8, *args, **kwargs):
-        mu_base, alpha_base, h_t = self.encoder(x)
-        mu_base = self._apply_graph_delta(mu_base, future_context)
+    rolling_gl_diag = diagnose_by_gl_group(rolling_pred_df, df, target="instock", min_asins=30, top_n=30)
+    rolling_gl_summary = summarize_gl_diagnostics(rolling_gl_diag, min_asins=30)
 
-        phi = h_t.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
-        z_reg = 0.001 * (z_mean**2 + z_std**2).mean()
+    rolling_diagnostics["latest_gl_group"] = latest_gl_diag
+    rolling_diagnostics["latest_gl_horizon_block"] = latest_gl_block_diag
+    rolling_diagnostics["latest_gl_summary"] = latest_gl_summary
+    rolling_diagnostics["rolling_gl_group"] = rolling_gl_diag
+    rolling_diagnostics["rolling_gl_summary"] = rolling_gl_summary
 
-        preds = []
-        for _ in range(nZ):
-            eps = torch.randn_like(z_mean)
-            z = z_mean + z_std * eps
-            mu_e, al_e = self.epinet(phi, z)
-            mu = F.softplus(mu_base + mu_e)
-            alpha = F.softplus(alpha_base + al_e) + 1e-4
-            preds.append((mu, alpha))
-
-        stock_log_hat = self._external_exposure_log_hat(future_context)
-        return preds, z_reg, stock_log_hat
-
-    def predict(self, x, future_context, M=50, return_stock=False, *args, **kwargs):
-        self.eval()
-        with torch.no_grad():
-            mu_base, alpha_base, h_t = self.encoder(x)
-            mu_base = self._apply_graph_delta(mu_base, future_context)
-            phi = h_t.detach()
-            z_mean, z_std = self.z_generator(phi, future_context)
-
-            samples = []
-            for _ in range(M):
-                eps = torch.randn_like(z_mean)
-                z = z_mean + z_std * eps
-                mu_e, al_e = self.epinet(phi, z)
-                mu = F.softplus(mu_base + mu_e)
-                alpha = F.softplus(alpha_base + al_e) + 1e-4
-                dist = torch.distributions.NegativeBinomial(
-                    total_count=(1.0 / alpha).clamp(min=1e-4),
-                    probs=(mu * alpha / (1 + mu * alpha)).clamp(1e-6, 1 - 1e-6),
-                )
-                samples.append(dist.sample().float())
-
-            samples = torch.stack(samples, dim=1)
-            p50 = samples.quantile(0.5, dim=1)
-            p70 = samples.quantile(0.7, dim=1)
-            p70 = torch.maximum(p70, p50)
-            stock_log_hat = self._external_exposure_log_hat(future_context)
-
-        if return_stock:
-            return p50, p70, stock_log_hat
-        return p50, p70
-
-
-def run_demand_with_predicted_exposure_all3_v8(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    demand_head_type="patch",
-    use_category_graph_features=True,
-    use_graph_head=True,
-    graph_head_scale=0.03,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    lambda_q=0.10,
-    beta_tail=0.7,
-    patience=5,
-):
-    """
-    V8 direct demand run. Keeps original forecast_df and SCOT WAPE format.
-    demand_head_type='direct' gives the old no-decoder head; 'patch' gives patch decoder head.
-    """
-    set_demand_model_ablation(
-        demand_head_type=demand_head_type,
-        use_category_graph_features=use_category_graph_features,
-        use_graph_head=use_graph_head,
-        graph_head_scale=graph_head_scale,
-    )
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=exposure_result_or_hat,
-        exposure_mode="all3",
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-def run_demand_direct_vs_patch_ablation_v8(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    graph_head_scale=0.03,
-):
-    """
-    Fair decoder ablation with SAME features, SAME graph features, SAME loss, SAME WAPE format.
-    Output results keep the old AMXL-vs-SCOT real_scot_outputs format.
-    """
-    print("\n" + "#" * 100)
-    print("RUNNING V8 ABLATION A: NO-DECODER / DIRECT HORIZON HEAD")
-    print("#" * 100)
-    result_direct = run_demand_with_predicted_exposure_all3_v8(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure_result_or_hat=exposure_result_or_hat,
-        demand_head_type="direct",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=0.10,
-        beta_tail=0.7,
-        patience=5,
-    )
-
-    print("\n" + "#" * 100)
-    print("RUNNING V8 ABLATION B: PATCH DECODER HEAD")
-    print("#" * 100)
-    result_patch = run_demand_with_predicted_exposure_all3_v8(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure_result_or_hat=exposure_result_or_hat,
-        demand_head_type="patch",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=0.10,
-        beta_tail=0.7,
-        patience=5,
-    )
-
-    out = {
-        "direct": result_direct,
-        "patch": result_patch,
+    return {
+        "results_by_offset": results_by_offset,
+        "rolling_forecast_df": rolling_pred_df,
+        "forecast_df": latest_pred_df,
+        "diagnostics": rolling_diagnostics,
+        "exposure_hat_for_demand": make_external_hat_df(latest_pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_mu": make_external_hat_df(latest_pred_df, hat_source="mu"),
+        "exposure_hat_for_demand_p50": make_external_hat_df(latest_pred_df, hat_source="p50"),
+        "exposure_hat_for_demand_dist_mean": make_external_hat_df(latest_pred_df, hat_source="dist_mean"),
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "source_df": df,
+        "graph_assets": graph_assets,
+        "rolling_offsets": list(rolling_offsets),
+        "gl_diagnostics": latest_gl_diag,
+        "gl_horizon_block_diagnostics": latest_gl_block_diag,
+        "gl_summary": latest_gl_summary,
+        "rolling_gl_diagnostics": rolling_gl_diag,
+        "rolling_gl_summary": rolling_gl_summary,
     }
 
+
+
+
+
+# ============================================================
+# GL diagnostics: check whether different GL groups are calibrated differently
+# ============================================================
+
+def _attach_gl_product_group(pred_df, source_df):
+    """
+    Attach one GL product group per ASIN to a prediction dataframe.
+    This uses source_df after sampling/filtering when available.
+    """
+    tmp = pred_df.copy()
+    tmp["asin"] = tmp["asin"].astype(str)
+
+    if source_df is None or "gl_product_group" not in source_df.columns:
+        tmp["gl_product_group"] = "MISSING"
+        return tmp
+
+    gl_map = (
+        source_df[["asin", "gl_product_group"]]
+        .dropna(subset=["asin"])
+        .drop_duplicates("asin")
+        .copy()
+    )
+    gl_map["asin"] = gl_map["asin"].astype(str)
+    gl_map["gl_product_group"] = gl_map["gl_product_group"].astype(str).fillna("MISSING")
+
+    tmp = tmp.merge(gl_map, on="asin", how="left")
+    tmp["gl_product_group"] = tmp["gl_product_group"].astype(str).fillna("MISSING")
+    return tmp
+
+
+def diagnose_by_gl_group(pred_df, source_df, target="instock", min_asins=30, top_n=30):
+    """
+    Per-GL diagnostics for exposure forecast.
+
+    target can be:
+      - "instock" / "in_stock"
+      - "buy_box"
+      - "total"
+
+    Returns a dataframe with one row per GL group.
+    """
+    target = str(target).lower()
+    col_map = {
+        "instock": ("true_instock_dph", "pred_instock_dph", "p_active_instock"),
+        "in_stock": ("true_instock_dph", "pred_instock_dph", "p_active_instock"),
+        "buy_box": ("true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box"),
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box"),
+        "total": ("true_total_dph", "pred_total_dph", "p_active_total"),
+    }
+    if target not in col_map:
+        raise ValueError(f"Unknown target={target}. Use instock, buy_box, or total.")
+
+    true_col, pred_col, p_col = col_map[target]
+    tmp = _attach_gl_product_group(pred_df, source_df)
+
+    rows = []
+    for gl, g in tmp.groupby("gl_product_group", dropna=False):
+        y = g[true_col].values.astype(float)
+        p = g[pred_col].values.astype(float)
+        active = (y > 0).astype(int)
+        rows.append({
+            "gl_product_group": gl,
+            "n_rows": int(len(g)),
+            "n_asins": int(g["asin"].nunique()),
+            "true_mean": float(np.mean(y)),
+            "pred_mean": float(np.mean(p)),
+            "ratio": float(np.mean(p) / (np.mean(y) + 1e-8)),
+            "WAPE": float(_wape(y, p)),
+            "underbias": float(np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "overbias": float(np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "corr": float(_corr(y, p)) if not np.isnan(_corr(y, p)) else np.nan,
+            "active_AUC": float(_auc(active, p)) if not np.isnan(_auc(active, p)) else np.nan,
+            "true_active_rate": float(np.mean(y > 0)),
+            "p_active_mean": float(g[p_col].mean()) if p_col in g.columns else np.nan,
+            "p_active_minus_true": float(g[p_col].mean() - np.mean(y > 0)) if p_col in g.columns else np.nan,
+        })
+
+    out = pd.DataFrame(rows).sort_values("n_asins", ascending=False).reset_index(drop=True)
+    eligible = out[out["n_asins"] >= min_asins].copy()
+
     print("\n" + "=" * 100)
-    print("V8 ABLATION FINISHED")
+    print(f"PER-GL DIAGNOSTICS: {target.upper()} DPH")
     print("=" * 100)
-    print("Result keys: out['direct'], out['patch']")
-    print("Both results keep original result['forecast_df'] and result['real_scot_outputs'] format.")
-    print("Use the existing SCOT WAPE outputs exactly as before.")
+    if len(out) == 0:
+        print("No GL diagnostics available.")
+        return out
+
+    print("Top GL groups by ASIN count:")
+    display(out.head(top_n).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH LARGEST OVERPREDICTION (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("ratio", ascending=False).head(15).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH LARGEST UNDERPREDICTION (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("ratio", ascending=True).head(15).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH WORST WAPE (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("WAPE", ascending=False).head(15).round(4))
+
     return out
 
 
-"""
-V8 USAGE IN JUPYTER
--------------------
-%run -i demand_direct_categorygraph_patchdecoder_ablation_v8.py
-
-# Same AMXL-vs-SCOT WAPE format as before. Only model head changes.
-# Use exposure_result or exposure_hat_for_demand from your exposure model.
-
-# Single run with patch decoder:
-demand_result_patch_v8 = run_demand_with_predicted_exposure_all3_v8(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_result,
-    demand_head_type="patch",
-    graph_head_scale=0.03,
-    n_asins=5000,
-    epochs=30,
-    history=52,
-    horizon=20,
-    batch_size=128,
-    M_eval=100,
-)
-
-# Fair ablation: old direct/no-decoder head vs patch decoder head.
-demand_ablation_v8 = run_demand_direct_vs_patch_ablation_v8(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_result,
-    n_asins=5000,
-    epochs=30,
-    history=52,
-    horizon=20,
-    batch_size=128,
-    M_eval=100,
-    graph_head_scale=0.03,
-)
-"""
-
-
-
-# ==================================================================================================
-# V9 EXTENSION: IN-STOCK-DPH ONLY DEMAND ABLATION
-# --------------------------------------------------------------------------------------------------
-# You said you do NOT want to compare all3 here. This keeps the old AMXL-vs-SCOT WAPE output format,
-# but the demand model receives only the predicted in_stock_dph hat as the future exposure signal.
-# total_dph and buy_box_dph hats are explicitly zeroed by attach_external_exposure3_to_raw_data(...,
-# exposure_mode="instock_only"). Historical total/buybox/in-stock DPH features remain available as
-# historical, origin-safe features; the only future predicted exposure covariate is in_stock_dph_hat.
-# ==================================================================================================
-
-
-def run_demand_with_predicted_exposure_instock_v9(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    demand_head_type="patch",
-    use_category_graph_features=True,
-    use_graph_head=True,
-    graph_head_scale=0.03,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    lambda_q=0.10,
-    beta_tail=0.7,
-    patience=5,
-):
+def diagnose_by_gl_horizon_block(pred_df, source_df, target="instock", min_asins=30):
     """
-    V9 direct demand run: predicted in_stock_dph hat only.
-
-    Keeps original forecast_df and SCOT WAPE format unchanged:
-      p50_amxl / p70_amxl vs p50_scot / p70_scot.
-
-    demand_head_type='direct' gives the old no-decoder horizon head;
-    demand_head_type='patch' gives the short/mid/long patch decoder head.
+    Per-GL x horizon block diagnostics.
+    This tells whether each GL is over/under mainly in short, middle, or long horizons.
     """
-    set_demand_model_ablation(
-        demand_head_type=demand_head_type,
-        use_category_graph_features=use_category_graph_features,
-        use_graph_head=use_graph_head,
-        graph_head_scale=graph_head_scale,
-    )
-    print("\n" + "=" * 100)
-    print("V9 DIRECT DEMAND | FUTURE EXPOSURE MODE = IN_STOCK_DPH ONLY")
-    print("=" * 100)
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=exposure_result_or_hat,
-        exposure_mode="instock_only",
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-def run_demand_direct_vs_patch_ablation_instock_v9(
-    data_raw1,
-    scot_df,
-    exposure_result_or_hat,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    graph_head_scale=0.03,
-    lambda_q=0.10,
-    beta_tail=0.7,
-    patience=5,
-):
-    """
-    Fair decoder ablation with SAME features, SAME category graph, SAME loss,
-    and SAME old AMXL-vs-SCOT WAPE format.
-
-    The only future predicted exposure hat used is in_stock_dph.
-    """
-    print("\n" + "#" * 100)
-    print("RUNNING V9 IN-STOCK-ONLY ABLATION A: NO-DECODER / DIRECT HORIZON HEAD")
-    print("#" * 100)
-    result_direct = run_demand_with_predicted_exposure_instock_v9(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure_result_or_hat=exposure_result_or_hat,
-        demand_head_type="direct",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-    )
-
-    print("\n" + "#" * 100)
-    print("RUNNING V9 IN-STOCK-ONLY ABLATION B: PATCH DECODER HEAD")
-    print("#" * 100)
-    result_patch = run_demand_with_predicted_exposure_instock_v9(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure_result_or_hat=exposure_result_or_hat,
-        demand_head_type="patch",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-    )
-
-    out = {
-        "direct_instock_only": result_direct,
-        "patch_instock_only": result_patch,
+    target = str(target).lower()
+    col_map = {
+        "instock": ("true_instock_dph", "pred_instock_dph"),
+        "in_stock": ("true_instock_dph", "pred_instock_dph"),
+        "buy_box": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "total": ("true_total_dph", "pred_total_dph"),
     }
+    if target not in col_map:
+        raise ValueError(f"Unknown target={target}. Use instock, buy_box, or total.")
+
+    true_col, pred_col = col_map[target]
+    tmp = _attach_gl_product_group(pred_df, source_df)
+    tmp["block"] = pd.cut(
+        tmp["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+    )
+
+    rows = []
+    for (gl, block), g in tmp.groupby(["gl_product_group", "block"], observed=True):
+        n_asins = int(g["asin"].nunique())
+        if n_asins < min_asins:
+            continue
+        y = g[true_col].values.astype(float)
+        p = g[pred_col].values.astype(float)
+        rows.append({
+            "gl_product_group": gl,
+            "block": str(block),
+            "n_asins": n_asins,
+            "n_rows": int(len(g)),
+            "true_mean": float(np.mean(y)),
+            "pred_mean": float(np.mean(p)),
+            "ratio": float(np.mean(p) / (np.mean(y) + 1e-8)),
+            "WAPE": float(_wape(y, p)),
+            "underbias": float(np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "overbias": float(np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "corr": float(_corr(y, p)) if not np.isnan(_corr(y, p)) else np.nan,
+            "active_AUC": float(_auc((y > 0).astype(int), p)) if not np.isnan(_auc((y > 0).astype(int), p)) else np.nan,
+        })
+
+    out = pd.DataFrame(rows)
+    print("\n" + "=" * 100)
+    print(f"PER-GL × HORIZON BLOCK DIAGNOSTICS: {target.upper()} DPH")
+    print("=" * 100)
+    if len(out) == 0:
+        print("No GL x block diagnostics available. Try lowering min_asins.")
+        return out
+
+    display(out.sort_values(["gl_product_group", "block"]).round(4))
 
     print("\n" + "=" * 100)
-    print("V9 IN-STOCK-ONLY ABLATION FINISHED")
+    print("WORST GL × BLOCK OVERPREDICTION")
     print("=" * 100)
-    print("Result keys: out['direct_instock_only'], out['patch_instock_only']")
-    print("Both results keep original result['forecast_df'] and result['real_scot_outputs'] format.")
-    print("Use the existing SCOT WAPE outputs exactly as before.")
+    display(out.sort_values("ratio", ascending=False).head(20).round(4))
+
+    print("\n" + "=" * 100)
+    print("WORST GL × BLOCK UNDERPREDICTION")
+    print("=" * 100)
+    display(out.sort_values("ratio", ascending=True).head(20).round(4))
+
     return out
 
 
-"""
-V9 USAGE IN JUPYTER
--------------------
-%run -i demand_direct_categorygraph_patchdecoder_instockonly_v9.py
-
-# Use only future predicted in_stock_dph as exposure input.
-# You can pass exposure_result directly if it contains exposure_hat_for_demand_mu,
-# or pass exposure_result["exposure_hat_for_demand_mu"] / exposure_hat_for_demand dataframe.
-
-# Single patch-decoder run:
-demand_result_patch_instock_v9 = run_demand_with_predicted_exposure_instock_v9(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_result,
-    demand_head_type="patch",
-    graph_head_scale=0.03,
-    n_asins=5000,
-    epochs=30,
-    history=52,
-    horizon=20,
-    batch_size=128,
-    M_eval=100,
-)
-
-# Fair ablation: old no-decoder head vs patch decoder head, both using in_stock_dph hat only.
-demand_ablation_instock_v9 = run_demand_direct_vs_patch_ablation_instock_v9(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    exposure_result_or_hat=exposure_result,
-    n_asins=5000,
-    epochs=30,
-    history=52,
-    horizon=20,
-    batch_size=128,
-    M_eval=100,
-    graph_head_scale=0.03,
-)
-"""
-
-
-# ==================================================================================================
-# V10 EXTENSION: HISTORICAL-DPH-ONLY DIRECT DEMAND ABLATION
-# --------------------------------------------------------------------------------------------------
-# User request: do NOT use predicted future DPH as demand input.
-# This version keeps all historical DPH information already present in the encoder/context proxies:
-#   - historical in_stock_dph / total_dph / buy_box_dph in the history encoder
-#   - origin-safe hist_*_dph_last/mean4/mean13 proxy columns repeated across the horizon
-#   - category graph + GL static + historical demand/exposure graph features
-# But the future predicted exposure-hat columns appended to future_context are set to zeros.
-# Therefore the model cannot use predicted future DPH; DPH information is historical only.
-# The original forecast_df and AMXL-vs-SCOT WAPE format are unchanged.
-# ==================================================================================================
-
-
-def _make_zero_future_exposure_hat_from_raw(data_raw1):
+def summarize_gl_diagnostics(gl_diag, min_asins=30):
     """
-    Build a zero exposure-hat dataframe with the expected columns.
-
-    This is intentionally NOT a predicted exposure model output. It is a placeholder
-    so the existing demand pipeline can keep the same future_context shape and
-    forecast_df diagnostics while carrying no future DPH information.
+    Compact summary to decide whether the next fix should be global calibration or GL-specific calibration.
     """
-    z = data_raw1[["asin", "order_week"]].copy()
-    z["asin"] = z["asin"].astype(str)
-    z["order_week"] = pd.to_datetime(z["order_week"])
-    z = z.drop_duplicates(["asin", "order_week"]).reset_index(drop=True)
-    z["pred_total_dph"] = 0.0
-    z["pred_buy_box_dph"] = 0.0
-    z["pred_instock_dph"] = 0.0
-    return z
+    if gl_diag is None or len(gl_diag) == 0:
+        return {}
+    g = gl_diag[gl_diag["n_asins"] >= min_asins].copy()
+    if len(g) == 0:
+        return {}
 
-
-def run_demand_histdph_only_v10(
-    data_raw1,
-    scot_df,
-    demand_head_type="patch",
-    use_category_graph_features=True,
-    use_graph_head=True,
-    graph_head_scale=0.03,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    lambda_q=0.10,
-    beta_tail=0.7,
-    patience=5,
-):
-    """
-    V10 direct demand run: historical DPH only, no predicted future DPH.
-
-    Keeps original forecast_df and SCOT WAPE format unchanged:
-      p50_amxl / p70_amxl vs p50_scot / p70_scot.
-
-    demand_head_type='direct' gives the old no-decoder horizon head;
-    demand_head_type='patch' gives the short/mid/long patch decoder head.
-
-    Important:
-      - No exposure_result_or_hat is needed.
-      - All future predicted exposure-hat columns are appended as zeros.
-      - Historical DPH features/proxies remain available and are origin-safe.
-    """
-    set_demand_model_ablation(
-        demand_head_type=demand_head_type,
-        use_category_graph_features=use_category_graph_features,
-        use_graph_head=use_graph_head,
-        graph_head_scale=graph_head_scale,
-    )
-
-    zero_hat = _make_zero_future_exposure_hat_from_raw(data_raw1)
-
-    print("\n" + "=" * 100)
-    print("V10 DIRECT DEMAND | HISTORICAL DPH ONLY | NO PREDICTED FUTURE DPH")
-    print("=" * 100)
-    print("Future predicted total_dph_hat: 0.0 placeholder")
-    print("Future predicted buy_box_dph_hat: 0.0 placeholder")
-    print("Future predicted in_stock_dph_hat: 0.0 placeholder")
-    print("Historical total/buy_box/in_stock DPH features are still used.")
-
-    return run_external_exposure3_in_old_decoder_style(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        exposure3_hat=zero_hat,
-        exposure_mode="all3",  # all three are zero placeholders, not predictions
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-        lambda_z_reg=1.0,
-        lambda_stock=0.0,
-        lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
-        extreme_q=0.99,
-        run_wape=True,
-        remove_oos_dp=remove_oos_dp,
-    )
-
-
-def run_demand_direct_vs_patch_ablation_histdph_only_v10(
-    data_raw1,
-    scot_df,
-    n_asins=5000,
-    seed=42,
-    epochs=60,
-    history=52,
-    horizon=20,
-    d_model=32,
-    d_z=16,
-    batch_size=64,
-    M_eval=100,
-    remove_oos_dp=True,
-    graph_head_scale=0.03,
-    lambda_q=0.10,
-    beta_tail=0.7,
-    patience=5,
-):
-    """
-    Fair decoder ablation with SAME features, SAME category graph, SAME loss,
-    and SAME old AMXL-vs-SCOT WAPE format.
-
-    No predicted future DPH is used in either model. DPH information is historical only.
-    """
-    print("\n" + "#" * 100)
-    print("RUNNING V10 HIST-DPH-ONLY ABLATION A: NO-DECODER / DIRECT HORIZON HEAD")
-    print("#" * 100)
-    result_direct = run_demand_histdph_only_v10(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        demand_head_type="direct",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-    )
-
-    print("\n" + "#" * 100)
-    print("RUNNING V10 HIST-DPH-ONLY ABLATION B: PATCH DECODER HEAD")
-    print("#" * 100)
-    result_patch = run_demand_histdph_only_v10(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        demand_head_type="patch",
-        use_category_graph_features=True,
-        use_graph_head=True,
-        graph_head_scale=graph_head_scale,
-        n_asins=n_asins,
-        seed=seed,
-        epochs=epochs,
-        history=history,
-        horizon=horizon,
-        d_model=d_model,
-        d_z=d_z,
-        batch_size=batch_size,
-        M_eval=M_eval,
-        remove_oos_dp=remove_oos_dp,
-        lambda_q=lambda_q,
-        beta_tail=beta_tail,
-        patience=patience,
-    )
-
-    out = {
-        "direct_histdph_only": result_direct,
-        "patch_histdph_only": result_patch,
+    summary = {
+        "n_gl_groups": int(len(g)),
+        "share_over_1p10": float((g["ratio"] > 1.10).mean()),
+        "share_under_0p90": float((g["ratio"] < 0.90).mean()),
+        "median_ratio": float(g["ratio"].median()),
+        "weighted_ratio_by_rows": float(np.average(g["ratio"], weights=g["n_rows"])),
+        "median_WAPE": float(g["WAPE"].median()),
+        "median_active_AUC": float(g["active_AUC"].median()),
+        "median_p_active_minus_true": float(g["p_active_minus_true"].median()) if "p_active_minus_true" in g.columns else np.nan,
     }
 
     print("\n" + "=" * 100)
-    print("V10 HIST-DPH-ONLY ABLATION FINISHED")
+    print("GL DIAGNOSTIC SUMMARY")
     print("=" * 100)
-    print("Result keys: out['direct_histdph_only'], out['patch_histdph_only']")
-    print("Both results keep original result['forecast_df'] and result['real_scot_outputs'] format.")
-    print("Use the existing SCOT WAPE outputs exactly as before.")
-    return out
+    for k, v in summary.items():
+        print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
+    if summary["share_over_1p10"] > 0.50:
+        print("\nJudgment: most GL groups are overpredicted → global calibration/gamma should be fixed first.")
+    elif summary["share_under_0p90"] > 0.50:
+        print("\nJudgment: most GL groups are underpredicted → global level/gamma may be too conservative.")
+    else:
+        print("\nJudgment: bias is GL-specific → consider GL-specific calibration or GL embedding next.")
 
-"""
-V10 USAGE IN JUPYTER
---------------------
-%run -i demand_direct_categorygraph_patchdecoder_histdphonly_v10.py
+    return summary
 
-# Single patch-decoder run: no predicted future DPH, historical DPH only.
-demand_result_patch_histdph_v10 = run_demand_histdph_only_v10(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    demand_head_type="patch",
-    graph_head_scale=0.03,
-    n_asins=5000,
-    epochs=30,
-    history=52,
+def run_exposure_v2_final_scot_5000(
+    data_raw1,
+    scot_df,
+    seed=42,
+    history=13,
     horizon=20,
+    epochs=60,
+    patience=10,
     batch_size=128,
-    M_eval=100,
-)
+    use_graphsage=False,
+    neighbor_k=10,
+    graph_dim=16,
+    graph_message_scale=0.04,
+    use_graph_head=False,
+    graph_head_scale=0.05,
+    use_graph_gate=True,
+    graph_zero_weight=0.03,
+    graph_level_peak_weight=2.2,
+    graph_transition_weight=1.0,
+    graph_static_weight=1.0,
+    graph_brand_weight=0.3,
+    use_encoder_self_attn=True,
+):
+    """
+    Final single-window setup:
+      - sample 5000 ASINs
+      - intersect with SCOT ASINs
+      - train on sliding windows before the final holdout
+      - validate/predict the latest 20-week window only
+      - return exposure_hat_for_demand for the demand model
+    """
+    return run_exposure_v2(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=5000,
+        seed=seed,
+        history=history,
+        horizon=horizon,
+        epochs=epochs,
+        patience=patience,
+        batch_size=batch_size,
+        use_scot_intersection=True,
+        val_start_offset=0,
+        use_graphsage=use_graphsage,
+        neighbor_k=neighbor_k,
+        graph_dim=graph_dim,
+        graph_message_scale=graph_message_scale,
+        use_graph_head=use_graph_head,
+        graph_head_scale=graph_head_scale,
+        use_graph_gate=use_graph_gate,
+        graph_zero_weight=graph_zero_weight,
+        graph_level_peak_weight=graph_level_peak_weight,
+        graph_transition_weight=graph_transition_weight,
+        graph_static_weight=graph_static_weight,
+        graph_brand_weight=graph_brand_weight,
+        use_encoder_self_attn=use_encoder_self_attn,
+    )
 
-# Fair ablation: old no-decoder head vs patch decoder head,
-# both using historical DPH only and no predicted future DPH.
-demand_ablation_histdph_v10 = run_demand_direct_vs_patch_ablation_histdph_only_v10(
-    data_raw1=data_raw1,
-    scot_df=scot_df,
-    n_asins=5000,
-    epochs=30,
-    history=52,
-    horizon=20,
-    batch_size=128,
-    M_eval=100,
-    graph_head_scale=0.03,
-)
-"""
+# ============================================================
+# CLEAN DIAGNOSTICS OVERRIDE
+# Keep only useful checks for the current direction:
+#   1) overall exposure quality
+#   2) horizon behavior
+#   3) naive comparison
+#   4) ASIN-level 20-week sum
+#   5) compact final summary
+# Category_code is already included in load_exposure_data / context features.
+# Heavy encoder/decoder diagnostics are disabled to reduce noise and runtime.
+# ============================================================
+
+def print_exposure_diagnostics(pred_df):
+    print("\n" + "=" * 100)
+    print("MODEL EXPOSURE METRICS")
+    print("=" * 100)
+    model_tbl = exposure_metrics(pred_df, prefix="pred")
+    print(model_tbl.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("BY HORIZON: IN_STOCK_DPH")
+    print("=" * 100)
+    rows = []
+    for h, g in pred_df.groupby("horizon"):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows.append({
+            "horizon": h,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_h = pd.DataFrame(rows)
+    print(by_h.round(4).to_string(index=False))
+
+    naive_cols = {
+        "naive_last": "pred_instock_dph_last",
+        "naive_mean4": "pred_instock_dph_mean4",
+        "naive_mean13": "pred_instock_dph_mean13",
+    }
+    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+    y_all = pred_df["true_instock_dph"].values
+
+    comp_rows = []
+    for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+        if col not in pred_df.columns:
+            continue
+        p_all = pred_df[col].values
+        comp_rows.append({
+            "method": name,
+            "ratio": np.mean(p_all) / (np.mean(y_all) + 1e-8),
+            "WAPE": _wape(y_all, p_all),
+            "active_AUC": _auc((y_all > 0).astype(int), p_all),
+            "corr": _corr(y_all, p_all),
+        })
+    comp_tbl = pd.DataFrame(comp_rows)
+    print("\n" + "=" * 100)
+    print("MODEL VS NAIVE: IN_STOCK_DPH")
+    print("=" * 100)
+    print(comp_tbl.round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
+    print("=" * 100)
+    pred_df["_block"] = pd.cut(
+        pred_df["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+    )
+    block_rows = []
+    for block, g in pred_df.groupby("_block", observed=True):
+        y_b = g["true_instock_dph"].values
+        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+            if col not in g.columns:
+                continue
+            p_b = g[col].values
+            block_rows.append({
+                "block": block,
+                "method": name,
+                "ratio": np.mean(p_b) / (np.mean(y_b) + 1e-8),
+                "WAPE": _wape(y_b, p_b),
+                "active_AUC": _auc((y_b > 0).astype(int), p_b),
+                "corr": _corr(y_b, p_b),
+            })
+    block_tbl = pd.DataFrame(block_rows)
+    print(block_tbl.round(4).to_string(index=False))
+    pred_df.drop(columns=["_block"], inplace=True, errors="ignore")
+
+    print("\n" + "=" * 100)
+    print("ASIN-LEVEL 20-WEEK SUM")
+    print("=" * 100)
+    asin_sum = pred_df.groupby("asin").agg(
+        true_sum=("true_instock_dph", "sum"),
+        pred_sum=("pred_instock_dph", "sum"),
+    ).reset_index()
+    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
+    asin_sum["wape"] = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
+    print(f"ASIN-sum Spearman: {_safe_spearman(asin_sum['true_sum'], asin_sum['pred_sum']):.4f}")
+    print(f"Median ASIN ratio: {asin_sum['ratio'].median():.4f}")
+    print(f"Median ASIN WAPE:  {asin_sum['wape'].median():.4f}")
+    print(f"p90 ASIN WAPE:     {asin_sum['wape'].quantile(0.90):.4f}")
+
+    h1 = by_h[by_h["horizon"] == 1].iloc[0]
+    h20 = by_h[by_h["horizon"] == 20].iloc[0]
+    print("\n" + "=" * 100)
+    print("QUICK JUDGMENT")
+    print("=" * 100)
+    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
+    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
+    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
+
+    model_overall = model_tbl[model_tbl["target"] == "in_stock_dph"].iloc[0]
+    final_rows = [{
+        "section": "overall_instock",
+        "ratio": model_overall["pred_true_ratio"],
+        "WAPE": model_overall["WAPE"],
+        "corr": model_overall["corr"],
+        "active_AUC": model_overall["active_AUC"],
+        "note": "model overall",
+    }]
+    for _, r in comp_tbl.iterrows():
+        if r["method"] != "model":
+            final_rows.append({
+                "section": r["method"],
+                "ratio": r["ratio"],
+                "WAPE": r["WAPE"],
+                "corr": r["corr"],
+                "active_AUC": r["active_AUC"],
+                "note": "baseline",
+            })
+    final_rows += [
+        {"section": "h1_instock", "ratio": h1["ratio"], "WAPE": h1["WAPE"], "corr": h1["corr"], "active_AUC": h1["active_AUC"], "note": "short horizon"},
+        {"section": "h20_instock", "ratio": h20["ratio"], "WAPE": h20["WAPE"], "corr": h20["corr"], "active_AUC": h20["active_AUC"], "note": "long horizon"},
+    ]
+    if "p_active_instock" in pred_df.columns:
+        p_gap = pred_df["p_active_instock"].mean() - (pred_df["true_instock_dph"] > 0).mean()
+        final_rows.append({"section": "p_active_gap", "ratio": np.nan, "WAPE": np.nan, "corr": np.nan, "active_AUC": np.nan, "note": f"mean p_active - true_active = {p_gap:.4f}"})
+    final_summary = pd.DataFrame(final_rows)
+    print("\n" + "=" * 100)
+    print("FINAL SUMMARY TABLE")
+    print("=" * 100)
+    print(final_summary.round(4).to_string(index=False))
+
+    return {
+        "model": model_tbl,
+        "by_horizon": by_h,
+        "model_vs_naive": comp_tbl,
+        "block_vs_naive": block_tbl,
+        "asin_sum": asin_sum,
+        "final_summary": final_summary,
+    }
+
+
+
+def diagnose_graph_gates(pred_df, target="instock", verbose=True):
+    """
+    Compact diagnostics for V9 DualGAT horizon-level positive/competitive graph gates.
+    It checks whether the model uses graph differently by horizon, active state,
+    prediction error direction, and ASIN true-sum bucket.
+    """
+    required = ["graph_pos_gate", "graph_comp_gate", "graph_gate", "graph_pos_minus_comp_gate"]
+    if pred_df is None or len(pred_df) == 0 or not all(c in pred_df.columns for c in required):
+        if verbose:
+            print("[Graph gate diagnostics] No graph gate columns found. Run V9 gated file with use_graphsage=True.")
+        return {}
+
+    true_col = f"true_{target}_dph" if target != "instock" else "true_instock_dph"
+    pred_col = f"pred_{target}_dph" if target != "instock" else "pred_instock_dph"
+    if true_col not in pred_df.columns or pred_col not in pred_df.columns:
+        true_col, pred_col = "true_instock_dph", "pred_instock_dph"
+
+    df = pred_df.copy()
+    df["err"] = df[pred_col] - df[true_col]
+    df["abs_err"] = df["err"].abs()
+    df["active"] = (df[true_col] > 0).astype(int)
+    df["under"] = (df["err"] < 0).astype(int)
+
+    by_h = df.groupby("horizon").agg(
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        true_mean=(true_col, "mean"),
+        pred_mean=(pred_col, "mean"),
+        WAPE_num=("abs_err", "sum"),
+        WAPE_den=(true_col, lambda x: np.abs(x).sum() + 1e-8),
+    ).reset_index()
+    by_h["WAPE"] = by_h["WAPE_num"] / by_h["WAPE_den"]
+    by_h = by_h.drop(columns=["WAPE_num", "WAPE_den"])
+
+    by_active = df.groupby("active").agg(
+        n=("asin", "count"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        true_mean=(true_col, "mean"),
+        pred_mean=(pred_col, "mean"),
+    ).reset_index()
+
+    by_error = df.groupby("under").agg(
+        n=("asin", "count"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_minus_comp=("graph_pos_minus_comp_gate", "mean"),
+        abs_err_mean=("abs_err", "mean"),
+    ).reset_index()
+
+    asin = df.groupby("asin").agg(
+        true_sum=(true_col, "sum"),
+        pred_sum=(pred_col, "sum"),
+        pos_gate_mean=("graph_pos_gate", "mean"),
+        comp_gate_mean=("graph_comp_gate", "mean"),
+        gate_mean=("graph_gate", "mean"),
+        pos_norm=("graph_pos_norm", "mean"),
+        comp_norm=("graph_comp_norm", "mean"),
+        pos_attn_entropy=("graph_pos_attn_entropy", "mean"),
+        comp_attn_entropy=("graph_comp_attn_entropy", "mean"),
+    ).reset_index()
+    try:
+        asin["true_sum_bucket"] = pd.qcut(asin["true_sum"], q=4, duplicates="drop")
+        by_bucket = asin.groupby("true_sum_bucket").agg(
+            n=("asin", "count"),
+            true_sum_mean=("true_sum", "mean"),
+            pred_sum_mean=("pred_sum", "mean"),
+            pos_gate_mean=("pos_gate_mean", "mean"),
+            comp_gate_mean=("comp_gate_mean", "mean"),
+            gate_mean=("gate_mean", "mean"),
+            pos_norm_mean=("pos_norm", "mean"),
+            comp_norm_mean=("comp_norm", "mean"),
+        ).reset_index()
+        by_bucket["ratio"] = by_bucket["pred_sum_mean"] / (by_bucket["true_sum_mean"] + 1e-8)
+    except Exception as e:
+        by_bucket = pd.DataFrame({"error": [str(e)]})
+
+    probe = pd.DataFrame([
+        {"probe": "corr_pos_gate_true", "value": _corr(df["graph_pos_gate"], df[true_col])},
+        {"probe": "corr_comp_gate_true", "value": _corr(df["graph_comp_gate"], df[true_col])},
+        {"probe": "corr_pos_minus_comp_true", "value": _corr(df["graph_pos_minus_comp_gate"], df[true_col])},
+        {"probe": "corr_graph_gate_abs_err", "value": _corr(df["graph_gate"], df["abs_err"])},
+    ])
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("DUALGAT V9 GRAPH GATE DIAGNOSTICS")
+        print("=" * 100)
+        print("\n[Gate by horizon]")
+        print(by_h.round(4).to_string(index=False))
+        print("\n[Gate by active/zero target]")
+        print(by_active.round(4).to_string(index=False))
+        print("\n[Gate by error direction: under=1 means pred < true]")
+        print(by_error.round(4).to_string(index=False))
+        print("\n[Gate by ASIN true-sum bucket]")
+        print(by_bucket.round(4).to_string(index=False))
+        print("\n[Gate probes]")
+        print(probe.round(4).to_string(index=False))
+        print("\nInterpretation:")
+        print("- pos_gate rising with active/high true_sum means positive graph is used as helpful borrowing.")
+        print("- comp_gate rising in under/high-error groups may indicate competitive message is suppressing too much.")
+        print("- flat gates across horizon/active buckets means graph is not yet distinguishing useful vs harmful relations.")
+
+    return {"by_horizon": by_h, "by_active": by_active, "by_error": by_error, "by_true_sum_bucket": by_bucket, "probe": probe}
+
+# ============================================================
+# USAGE: DualGAT V9 gated exposure only; pass final MU exposure hats to demand
+# ============================================================
+# Run this file in Jupyter:
+# %run -i exposure_model_only_nb_mu_hats_v2_DYNAMIC_RELATION_GRAPH_v10.py
+#
+# exposure_result = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#
+#     # Encoder / graph
+#     use_encoder_self_attn=True,
+#     use_graphsage=True,       # In this file this enables DualRelationalGAT, not mean GraphSAGE.
+#     use_graph_gate=True,      # Learn per-horizon positive/competitive graph usage.
+#     neighbor_k=10,
+#     graph_dim=16,
+#     graph_message_scale=0.04,
+#
+#     # First recommended run: keep graph as embedding only.
+#     # Turn this on only after the embedding-only ablation improves validation/demand.
+#     use_graph_head=False,
+#     graph_head_scale=0.03,
+#
+#     # Graph feature weights used to build ASIN profiles / edges
+#     graph_zero_weight=0.03,
+#     graph_level_peak_weight=2.2,
+#     graph_transition_weight=1.0,
+#     graph_static_weight=1.0,
+#     graph_brand_weight=0.3,
+# )
+#
+# forecast_df = exposure_result["forecast_df"]
+# exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
+# summarize_exposure_hat_for_demand(
+#     exposure_hat_for_demand,
+#     title="DYNAMIC RELATION GRAPH V10 MU HAT TO PASS INTO DEMAND",
+# )
+#
+# graph_gate_diagnostics = diagnose_graph_gates(forecast_df, target="instock", verbose=True)
+#
+# Then run the demand model in a separate cell/file and pass only exposure_hat_for_demand.
