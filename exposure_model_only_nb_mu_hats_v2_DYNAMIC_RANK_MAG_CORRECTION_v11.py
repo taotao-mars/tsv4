@@ -2337,8 +2337,21 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.register_parameter("horizon_calib", None)
 
-        # V13 group calibration: future_context contains GL/category/static + event/horizon features.
-        # A small tanh-bounded head provides GL/category/event-specific log-scale correction.
+        # V13 hierarchical calibration: GL embedding + shrinked category residual embedding.
+        # Define the attributes unconditionally so forward() is safe even when a branch is off.
+        if self.use_graphsage and self.use_gl_calibration and self.n_gl_calib > 0:
+            self.gl_calib_emb = nn.Embedding(self.n_gl_calib, 3)
+            nn.init.zeros_(self.gl_calib_emb.weight)
+        else:
+            self.gl_calib_emb = None
+
+        if self.use_graphsage and self.use_category_calibration and self.n_category_calib > 0:
+            self.category_calib_emb = nn.Embedding(self.n_category_calib, 3)
+            nn.init.zeros_(self.category_calib_emb.weight)
+        else:
+            self.category_calib_emb = None
+
+        # Legacy broad group calibration: disabled by default.
         if self.use_group_calibration:
             self.group_calib_head = nn.Sequential(
                 nn.Linear(context_dim, max(32, min(128, context_dim * 2))),
@@ -2352,7 +2365,9 @@ class ExposureForecastModelV2(nn.Module):
 
         print(f"V13 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
               f"horizon_calib={self.use_horizon_calibration}, scale={self.horizon_calibration_scale} | "
-              f"group_calib={self.use_group_calibration}, scale={self.group_calibration_scale}")
+              f"gl_calib={self.use_gl_calibration}, scale={self.gl_calibration_scale} | "
+              f"category_calib={self.use_category_calibration}, scale={self.category_calibration_scale}, shrink_k={self.category_shrinkage_k} | "
+              f"legacy_group_calib={self.use_group_calibration}, scale={self.group_calibration_scale}")
 
         if self.use_graphsage:
             # Horizon-level graph gates. These learn how much positive and competitive
@@ -2611,7 +2626,7 @@ class ExposureForecastModelV2(nn.Module):
         else:
             h_delta = None
 
-        if self.use_graphsage and asin_idx is not None and self.gl_calib_emb is not None:
+        if self.use_graphsage and asin_idx is not None and getattr(self, "gl_calib_emb", None) is not None:
             gl_ids = self.graph_gl_calib_id[asin_idx.long()].to(future_context.device)
             gl_raw = torch.tanh(self.gl_calib_emb(gl_ids)).to(future_context.dtype)
             gl_delta = self.gl_calibration_scale * gl_raw[:, None, :].expand(B_fc, H_fc, -1)
@@ -2619,7 +2634,7 @@ class ExposureForecastModelV2(nn.Module):
         else:
             gl_delta = None
 
-        if self.use_graphsage and asin_idx is not None and self.category_calib_emb is not None:
+        if self.use_graphsage and asin_idx is not None and getattr(self, "category_calib_emb", None) is not None:
             cat_ids = self.graph_category_calib_id[asin_idx.long()].to(future_context.device)
             cat_w = self.graph_category_calib_weight[asin_idx.long()].to(future_context.device, dtype=future_context.dtype)
             cat_raw = torch.tanh(self.category_calib_emb(cat_ids)).to(future_context.dtype)
