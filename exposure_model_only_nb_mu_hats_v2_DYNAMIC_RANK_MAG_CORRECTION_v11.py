@@ -1064,18 +1064,47 @@ def _build_graphsage_assets(
         )
         return pos_score, comp_score, {
             "level_gap": level_gap,
+            "peak_gap": peak_gap,
             "active_gap": active_gap,
+            "zero_gap": zero_gap,
             "price_gap": price_gap,
             "promo_gap": promo_gap,
+            "prime_gap": prime_gap,
             "same_hbt": same_hbt,
+            "hbt_diff": hbt_diff,
             "brand_same": brand_same,
+            "brand_diff": brand_diff,
+            "funnel_strength_gap": funnel_strength_gap,
+            "demand_gap": demand_gap,
+            "stronger": stronger,
+            "stronger_demand": stronger_demand,
             "stronger_top10": stronger_top10,
         }
+
+    # V14 learned-edge graph: keep same candidate pool, but expose rich edge features
+    # so EdgeMLP can learn how to weight positive/competitive messages end-to-end.
+    edge_feature_names = [
+        "rule_pos_score", "rule_comp_score",
+        "level_gap", "peak_gap", "active_gap", "zero_gap", "price_gap", "promo_gap", "prime_gap",
+        "same_hbt", "hbt_diff", "brand_same", "brand_diff",
+        "funnel_strength_gap", "demand_gap", "stronger", "stronger_demand", "stronger_top10",
+    ]
+
+    def _edge_feature_matrix(i, cand):
+        ps, cs, info = _relation_components(i, cand)
+        cols = [ps, cs]
+        for name in edge_feature_names[2:]:
+            cols.append(info.get(name, np.zeros(len(cand), dtype=float)))
+        mat = np.stack(cols, axis=1).astype(np.float32)
+        mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+        return mat
 
     neigh_rows = []
     comp_rows = []
     pos_score_rows = []
     comp_score_rows = []
+    pos_edge_feat_rows = []
+    comp_edge_feat_rows = []
     all_idx = np.arange(N)
     min_category_graph_size = max(4, min(K + 1, 10))
     for i in range(N):
@@ -1088,50 +1117,76 @@ def _build_graphsage_assets(
         # If category is too small, avoid noisy GL/global smoothing.
         if len(cand_pos) < 1:
             pos = [i] * K
+            pos_scores = [0.0] * K
+            pos_feats = [np.zeros(len(edge_feature_names), dtype=np.float32) for _ in range(K)]
         else:
             # Positive relation: same-category ASINs with close historical total/buybox/instock/demand,
             # similar HBT, top10-brand state, promotion regime, and list-price tier.
             pos_score, _, pos_info = _relation_components(i, cand_pos)
+            pos_edge_feat_mat = _edge_feature_matrix(i, cand_pos)
             # Keep a tiny KNN similarity tie-breaker so near-identical profiles rank stably.
             sim = X_knn[cand_pos] @ X_knn[i]
             score = pos_score + 0.03 * sim
             order = np.argsort(-score)
-            pos = [int(cand_pos[j]) for j in order[:K]]
-            pos_scores = [float(score[j]) for j in order[:K]]
+            selected = order[:K]
+            pos = [int(cand_pos[j]) for j in selected]
+            pos_scores = [float(score[j]) for j in selected]
+            pos_feats = [pos_edge_feat_mat[j] for j in selected]
             if not pos:
                 pos = _fallback_neighbors(i, K)
                 pos_scores = [0.0] * len(pos)
+                pos_feats = [np.zeros(len(edge_feature_names), dtype=np.float32) for _ in pos]
             while len(pos) < K:
                 pos.append(pos[-1])
                 pos_scores.append(pos_scores[-1] if pos_scores else 0.0)
+                pos_feats.append(pos_feats[-1].copy() if pos_feats else np.zeros(len(edge_feature_names), dtype=np.float32))
         neigh_rows.append(pos[:K])
         pos_score_rows.append(pos_scores[:K])
+        pos_edge_feat_rows.append(pos_feats[:K])
 
         # Competitive/contrast relation: STRICT same-category but far magnitude/demand/active buckets
         # or much stronger/weaker strength. No GL fallback, to avoid cross-category smoothing.
         cand_comp = same_cat
         if len(cand_comp) < 1:
             comp = [i] * K
+            comp_scores = [0.0] * K
+            comp_feats = [np.zeros(len(edge_feature_names), dtype=np.float32) for _ in range(K)]
         else:
             # Competitive relation: same-category ASINs with clear stronger/weaker or regime contrast:
             # funnel/demand gap + HBT/top10 brand/list-price/promotion contrast.
             _, comp_score, comp_info = _relation_components(i, cand_comp)
+            comp_edge_feat_mat = _edge_feature_matrix(i, cand_comp)
             order = np.argsort(-comp_score)
-            comp = [int(cand_comp[j]) for j in order[:K]]
-            comp_scores = [float(comp_score[j]) for j in order[:K]]
+            selected = order[:K]
+            comp = [int(cand_comp[j]) for j in selected]
+            comp_scores = [float(comp_score[j]) for j in selected]
+            comp_feats = [comp_edge_feat_mat[j] for j in selected]
             if not comp:
                 comp = _fallback_neighbors(i, K)
                 comp_scores = [0.0] * len(comp)
+                comp_feats = [np.zeros(len(edge_feature_names), dtype=np.float32) for _ in comp]
             while len(comp) < K:
                 comp.append(comp[-1])
                 comp_scores.append(comp_scores[-1] if comp_scores else 0.0)
+                comp_feats.append(comp_feats[-1].copy() if comp_feats else np.zeros(len(edge_feature_names), dtype=np.float32))
         comp_rows.append(comp[:K])
         comp_score_rows.append(comp_scores[:K])
+        comp_edge_feat_rows.append(comp_feats[:K])
 
     neigh_idx = np.asarray(neigh_rows, dtype=np.int64)
     comp_idx = np.asarray(comp_rows, dtype=np.int64)
     pos_edge_score = np.asarray(pos_score_rows, dtype=np.float32) if len(pos_score_rows) else np.zeros((N, K), dtype=np.float32)
     comp_edge_score = np.asarray(comp_score_rows, dtype=np.float32) if len(comp_score_rows) else np.zeros((N, K), dtype=np.float32)
+    pos_edge_features = np.asarray(pos_edge_feat_rows, dtype=np.float32) if len(pos_edge_feat_rows) else np.zeros((N, K, len(edge_feature_names)), dtype=np.float32)
+    comp_edge_features = np.asarray(comp_edge_feat_rows, dtype=np.float32) if len(comp_edge_feat_rows) else np.zeros((N, K, len(edge_feature_names)), dtype=np.float32)
+    # Standardize edge-feature channels across all stored candidate edges. This lets EdgeMLP train stably.
+    ef_all = np.concatenate([pos_edge_features.reshape(-1, len(edge_feature_names)), comp_edge_features.reshape(-1, len(edge_feature_names))], axis=0)
+    ef_mean = np.nanmean(ef_all, axis=0, keepdims=True)
+    ef_std = np.nanstd(ef_all, axis=0, keepdims=True) + 1e-8
+    pos_edge_features = (pos_edge_features - ef_mean.reshape(1, 1, -1)) / ef_std.reshape(1, 1, -1)
+    comp_edge_features = (comp_edge_features - ef_mean.reshape(1, 1, -1)) / ef_std.reshape(1, 1, -1)
+    pos_edge_features = np.nan_to_num(pos_edge_features, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    comp_edge_features = np.nan_to_num(comp_edge_features, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     # Standardize edge scores before using them as GAT attention bias.
     pos_edge_score = (pos_edge_score - np.nanmean(pos_edge_score)) / (np.nanstd(pos_edge_score) + 1e-8)
     comp_edge_score = (comp_edge_score - np.nanmean(comp_edge_score)) / (np.nanstd(comp_edge_score) + 1e-8)
@@ -1204,6 +1259,9 @@ def _build_graphsage_assets(
         "competitive_neighbor_idx": comp_idx.astype(np.int64),
         "positive_edge_score": pos_edge_score.astype(np.float32),
         "competitive_edge_score": comp_edge_score.astype(np.float32),
+        "positive_edge_features": pos_edge_features.astype(np.float32),
+        "competitive_edge_features": comp_edge_features.astype(np.float32),
+        "edge_feature_names": edge_feature_names,
         "asin_to_idx": asin_to_idx,
         "idx_to_asin": asin_list,
         "node_feature_names": node_feature_cols,
@@ -1766,13 +1824,19 @@ class DualRelationalGATEncoder(nn.Module):
     """
     def __init__(self, node_feat_dim, graph_dim=16, dropout=0.10,
                  neighbor_message_scale=0.20, n_heads=4,
-                 attention_leaky_slope=0.2):
+                 attention_leaky_slope=0.2,
+                 edge_feat_dim=0, use_learned_edge_score=True,
+                 learned_edge_score_scale=1.0, rule_edge_prior_scale=0.25):
         super().__init__()
         self.neighbor_message_scale = float(neighbor_message_scale)
         self.graph_dim = int(graph_dim)
         self.n_heads = int(max(1, n_heads))
         self.dropout = nn.Dropout(dropout)
         self.leaky_relu = nn.LeakyReLU(attention_leaky_slope)
+        self.edge_feat_dim = int(edge_feat_dim or 0)
+        self.use_learned_edge_score = bool(use_learned_edge_score and self.edge_feat_dim > 0)
+        self.learned_edge_score_scale = float(learned_edge_score_scale)
+        self.rule_edge_prior_scale = float(rule_edge_prior_scale)
 
         self.self_proj = nn.Linear(node_feat_dim, graph_dim)
         self.pos_proj = nn.Linear(node_feat_dim, graph_dim)
@@ -1786,6 +1850,20 @@ class DualRelationalGATEncoder(nn.Module):
         self.pos_head_mix = nn.Linear(graph_dim * self.n_heads, graph_dim)
         self.comp_head_mix = nn.Linear(graph_dim * self.n_heads, graph_dim)
 
+        if self.use_learned_edge_score:
+            hidden = max(32, min(128, self.edge_feat_dim * 4))
+            self.pos_edge_mlp = nn.Sequential(
+                nn.Linear(self.edge_feat_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
+                nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1), nn.Tanh(),
+            )
+            self.comp_edge_mlp = nn.Sequential(
+                nn.Linear(self.edge_feat_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
+                nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1), nn.Tanh(),
+            )
+        else:
+            self.pos_edge_mlp = None
+            self.comp_edge_mlp = None
+
         self.out = nn.Sequential(
             nn.Linear(graph_dim * 3, graph_dim),
             nn.ReLU(),
@@ -1793,6 +1871,16 @@ class DualRelationalGATEncoder(nn.Module):
             nn.Linear(graph_dim, graph_dim),
             nn.LayerNorm(graph_dim),
         )
+
+    def _make_edge_bias(self, rule_edge_bias=None, edge_features=None, relation="pos"):
+        bias = None
+        if rule_edge_bias is not None:
+            bias = self.rule_edge_prior_scale * rule_edge_bias
+        if self.use_learned_edge_score and edge_features is not None:
+            mlp = self.pos_edge_mlp if relation == "pos" else self.comp_edge_mlp
+            learned = mlp(edge_features).squeeze(-1) * self.learned_edge_score_scale
+            bias = learned if bias is None else bias + learned
+        return bias
 
     def _gat_message(self, h_self, h_neigh, attn_vec, return_alpha=False, edge_bias=None):
         """
@@ -1828,15 +1916,17 @@ class DualRelationalGATEncoder(nn.Module):
         return ent.mean(dim=1)
 
     def forward(self, node_features, neighbor_idx, competitive_neighbor_idx=None, return_aux=False,
-                positive_edge_score=None, competitive_edge_score=None):
+                positive_edge_score=None, competitive_edge_score=None,
+                positive_edge_features=None, competitive_edge_features=None):
         h_self = self.self_proj(node_features)  # [N,G]
 
         pos_raw = node_features[neighbor_idx]
         h_pos_neigh = self.pos_proj(pos_raw)
+        pos_bias = self._make_edge_bias(positive_edge_score, positive_edge_features, relation="pos")
         if return_aux:
-            pos_msg_heads, pos_alpha = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=True, edge_bias=positive_edge_score)
+            pos_msg_heads, pos_alpha = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=True, edge_bias=pos_bias)
         else:
-            pos_msg_heads = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=False, edge_bias=positive_edge_score)
+            pos_msg_heads = self._gat_message(h_self, h_pos_neigh, self.pos_attn, return_alpha=False, edge_bias=pos_bias)
             pos_alpha = None
         h_pos = self.neighbor_message_scale * self.pos_head_mix(pos_msg_heads)
 
@@ -1846,10 +1936,11 @@ class DualRelationalGATEncoder(nn.Module):
         else:
             comp_raw = node_features[competitive_neighbor_idx]
             h_comp_neigh = self.comp_proj(comp_raw)
+            comp_bias = self._make_edge_bias(competitive_edge_score, competitive_edge_features, relation="comp")
             if return_aux:
-                comp_msg_heads, comp_alpha = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=True, edge_bias=competitive_edge_score)
+                comp_msg_heads, comp_alpha = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=True, edge_bias=comp_bias)
             else:
-                comp_msg_heads = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=False, edge_bias=competitive_edge_score)
+                comp_msg_heads = self._gat_message(h_self, h_comp_neigh, self.comp_attn, return_alpha=False, edge_bias=comp_bias)
                 comp_alpha = None
             h_comp = self.neighbor_message_scale * self.comp_head_mix(comp_msg_heads)
 
@@ -2210,6 +2301,7 @@ class ExposureForecastModelV2(nn.Module):
                  use_gl_calibration=True, gl_calibration_scale=0.025,
                  use_category_calibration=True, category_calibration_scale=0.015,
                  category_shrinkage_k=100.0,
+                 use_learned_edge_score=True, learned_edge_score_scale=1.0, rule_edge_prior_scale=0.25,
                  # Backward-compatible aliases; the old broad MLP group calibration is disabled by default.
                  use_group_calibration=False, group_calibration_scale=0.0):
         super().__init__()
@@ -2230,10 +2322,10 @@ class ExposureForecastModelV2(nn.Module):
         self.use_graph_gate = bool(use_graph_gate and self.use_graphsage)
         self.use_rank_correction = bool(use_rank_correction and self.use_graphsage)
         self.rank_correction_scale = float(rank_correction_scale)
-        # V13: keep rank prior alive at long horizons instead of letting it collapse to 0.
+        # V14: keep rank prior alive at long horizons instead of letting it collapse to 0.
         # h1 uses 1.0; hH uses rank_horizon_min_scale.
         self.rank_horizon_min_scale = float(rank_horizon_min_scale)
-        # V13: lightweight horizon-level plus hierarchical GL/category calibration.
+        # V14: lightweight horizon-level plus hierarchical GL/category calibration.
         # Broad group MLP calibration was too wide; we now use:
         #   gl_delta + shrinkage(category_count) * category_delta.
         self.use_horizon_calibration = bool(use_horizon_calibration)
@@ -2243,6 +2335,10 @@ class ExposureForecastModelV2(nn.Module):
         self.use_category_calibration = bool(use_category_calibration)
         self.category_calibration_scale = float(category_calibration_scale)
         self.category_shrinkage_k = float(category_shrinkage_k)
+        # V14 learned-edge scoring: rule scores are kept as weak priors, but EdgeMLP learns edge attention bias.
+        self.use_learned_edge_score = bool(use_learned_edge_score)
+        self.learned_edge_score_scale = float(learned_edge_score_scale)
+        self.rule_edge_prior_scale = float(rule_edge_prior_scale)
         # Keep the old broad context MLP only if explicitly requested.
         self.use_group_calibration = bool(use_group_calibration)
         self.group_calibration_scale = float(group_calibration_scale)
@@ -2257,12 +2353,18 @@ class ExposureForecastModelV2(nn.Module):
             comp_score_np = graph_assets.get("competitive_edge_score", np.zeros_like(comp_np, dtype=np.float32)).astype(np.float32)
             self.register_buffer("graph_positive_edge_score", torch.tensor(pos_score_np, dtype=torch.float32))
             self.register_buffer("graph_competitive_edge_score", torch.tensor(comp_score_np, dtype=torch.float32))
+            pos_edge_feat_np = graph_assets.get("positive_edge_features", np.zeros((neigh_np.shape[0], neigh_np.shape[1], 0), dtype=np.float32)).astype(np.float32)
+            comp_edge_feat_np = graph_assets.get("competitive_edge_features", np.zeros((comp_np.shape[0], comp_np.shape[1], pos_edge_feat_np.shape[-1] if pos_edge_feat_np.ndim == 3 else 0), dtype=np.float32)).astype(np.float32)
+            self.register_buffer("graph_positive_edge_features", torch.tensor(pos_edge_feat_np, dtype=torch.float32))
+            self.register_buffer("graph_competitive_edge_features", torch.tensor(comp_edge_feat_np, dtype=torch.float32))
+            self.edge_feature_names = graph_assets.get("edge_feature_names", [])
+            self.edge_feat_dim = int(pos_edge_feat_np.shape[-1]) if pos_edge_feat_np.ndim == 3 else 0
             rank_np = graph_assets.get("rank_node_features", np.zeros((node_np.shape[0], 1), dtype=np.float32)).astype(np.float32)
             self.register_buffer("graph_rank_node_features", torch.tensor(rank_np, dtype=torch.float32))
             self.rank_feature_names = graph_assets.get("rank_feature_names", [])
             self.rank_feat_dim = int(rank_np.shape[1])
 
-            # V13 hierarchical calibration IDs. These are ASIN-node-level ids aligned with graph nodes.
+            # V14 hierarchical calibration IDs. These are ASIN-node-level ids aligned with graph nodes.
             meta_df = graph_assets.get("meta_df", None)
             if meta_df is not None and len(meta_df) == node_np.shape[0]:
                 gl_vals = meta_df.get("gl_product_group", pd.Series(["MISSING"] * node_np.shape[0])).astype(str).fillna("MISSING")
@@ -2286,13 +2388,17 @@ class ExposureForecastModelV2(nn.Module):
                 dropout=dropout,
                 neighbor_message_scale=graph_message_scale,
                 n_heads=4,
+                edge_feat_dim=self.edge_feat_dim,
+                use_learned_edge_score=self.use_learned_edge_score,
+                learned_edge_score_scale=self.learned_edge_score_scale,
+                rule_edge_prior_scale=self.rule_edge_prior_scale,
             )
             # IMPORTANT v4: expose graph embedding as named future-context columns so the
             # magnitude patch heads can directly consume it, not only through the TCN/cross-attn path.
             self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
-            print(f"DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
+            print(f"V14 LearnedEdge DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
             print(f"Dynamic rank node features: dim={self.rank_feat_dim} | rank_correction={self.use_rank_correction} | scale={self.rank_correction_scale}")
             print(f"Category-only graph v12: sparse/event-aware dynamic rank + long-horizon floor + horizon + GL/category shrinkage calibration.")
         else:
@@ -2330,14 +2436,14 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.rank_correction_head = None
 
-        # V13 horizon calibration: target-specific log-multiplier by forecast horizon.
+        # V14 horizon calibration: target-specific log-multiplier by forecast horizon.
         # Initialized at 0; training learns small upward/downward corrections, especially h13-h20.
         if self.use_horizon_calibration:
             self.horizon_calib = nn.Parameter(torch.zeros(int(horizon), 3))
         else:
             self.register_parameter("horizon_calib", None)
 
-        # V13 hierarchical calibration: GL embedding + shrinked category residual embedding.
+        # V14 hierarchical calibration: GL embedding + shrinked category residual embedding.
         # Define the attributes unconditionally so forward() is safe even when a branch is off.
         if self.use_graphsage and self.use_gl_calibration and self.n_gl_calib > 0:
             self.gl_calib_emb = nn.Embedding(self.n_gl_calib, 3)
@@ -2363,7 +2469,7 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.group_calib_head = None
 
-        print(f"V13 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
+        print(f"V14 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
               f"horizon_calib={self.use_horizon_calibration}, scale={self.horizon_calibration_scale} | "
               f"gl_calib={self.use_gl_calibration}, scale={self.gl_calibration_scale} | "
               f"category_calib={self.use_category_calibration}, scale={self.category_calibration_scale}, shrink_k={self.category_shrinkage_k} | "
@@ -2539,6 +2645,8 @@ class ExposureForecastModelV2(nn.Module):
                 return_aux=True,
                 positive_edge_score=self.graph_positive_edge_score,
                 competitive_edge_score=self.graph_competitive_edge_score,
+                positive_edge_features=self.graph_positive_edge_features,
+                competitive_edge_features=self.graph_competitive_edge_features,
             )
             idx = asin_idx.long()
             g = graph_all["graph_emb"][idx]       # [B,G]
@@ -2571,7 +2679,7 @@ class ExposureForecastModelV2(nn.Module):
                 g_comp_rep2 = g_comp[:, None, :].expand(B, H, -1)
                 rank_in = torch.cat([orig_future_context, g_self_rep2, g_pos_rep2, g_comp_rep2, rank_rep], dim=-1)
                 rank_raw_delta = self.rank_correction_head(rank_in)
-                # V13: deterministic long-horizon floor. The rank prior should not disappear
+                # V14: deterministic long-horizon floor. The rank prior should not disappear
                 # in h13-h20 because ASIN magnitude hierarchy is still useful there.
                 if H > 1:
                     h_scale = torch.linspace(
@@ -2613,7 +2721,7 @@ class ExposureForecastModelV2(nn.Module):
                         graph_aux["rank_log_delta_buybox"] = rank_log_delta[:, :, 1]
                         graph_aux["rank_log_delta_instock"] = rank_log_delta[:, :, 2]
 
-        # V13: horizon-level + hierarchical GL/category calibration are added as small
+        # V14: horizon-level + hierarchical GL/category calibration are added as small
         # log-multiplier streams. Category correction is shrinked by category size.
         calib_log_delta = rank_log_delta
         B_fc, H_fc, _ = future_context.shape
@@ -4138,7 +4246,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V13: DYNAMIC RANK + HORIZON + GL/CATEGORY SHRINKAGE CALIBRATION")
+    print("EXPOSURE MODEL V14: DYNAMIC RANK + HORIZON + GL/CATEGORY SHRINKAGE CALIBRATION")
     print("Preset: dynamic relation graph + sparse/event-aware rank prior + long-horizon calibration; MU hats for demand")
     print("=" * 100)
 
@@ -4878,7 +4986,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V13: SINGLE-HEAD DIRECT + SCOT OPTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
+    print("EXPOSURE MODEL V14: SINGLE-HEAD DIRECT + SCOT OPTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -5060,7 +5168,7 @@ def run_exposure_v2_rolling(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V13: ROLLING BACKTEST + SCOT INTERSECTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
+    print("EXPOSURE MODEL V14: ROLLING BACKTEST + SCOT INTERSECTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
     print("=" * 100)
     print(f"n_asins={n_asins} | history={history} | rolling_offsets={list(rolling_offsets)} | epochs={epochs} | patience={patience} | encoder_attn={use_encoder_self_attn}")
 
@@ -5767,7 +5875,7 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
     return {"by_horizon": by_h, "by_active": by_active, "by_error": by_error, "by_true_sum_bucket": by_bucket, "probe": probe}
 
 # ============================================================
-# USAGE: V13 dynamic rank + horizon + GL/category shrinkage calibration; pass MU hats to demand
+# USAGE: V14 dynamic rank + horizon + GL/category shrinkage calibration; pass MU hats to demand
 # ============================================================
 # Run this file in Jupyter:
 # %run -i exposure_model_only_nb_mu_hats_v2_DYNAMIC_RANK_HORIZON_CATCALIB_v13.py
@@ -5818,7 +5926,7 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 # exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
 # summarize_exposure_hat_for_demand(
 #     exposure_hat_for_demand,
-#     title="DYNAMIC RANK HORIZON CATCALIB V13 MU HAT TO PASS INTO DEMAND",
+#     title="DYNAMIC RANK HORIZON CATCALIB V14 MU HAT TO PASS INTO DEMAND",
 # )
 #
 # graph_gate_diagnostics = diagnose_graph_gates(forecast_df, target="instock", verbose=True)
