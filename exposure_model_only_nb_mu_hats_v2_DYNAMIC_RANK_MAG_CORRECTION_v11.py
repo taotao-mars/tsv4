@@ -2204,7 +2204,14 @@ class ExposureForecastModelV2(nn.Module):
                  use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0,
                  use_graphsage=False, graph_assets=None, graph_dim=16, graph_message_scale=0.10,
                  use_graph_head=False, graph_head_scale=0.05, use_graph_gate=True,
-                 use_rank_correction=True, rank_correction_scale=0.03):
+                 use_rank_correction=True, rank_correction_scale=0.03,
+                 rank_horizon_min_scale=0.40,
+                 use_horizon_calibration=True, horizon_calibration_scale=0.03,
+                 use_gl_calibration=True, gl_calibration_scale=0.025,
+                 use_category_calibration=True, category_calibration_scale=0.015,
+                 category_shrinkage_k=100.0,
+                 # Backward-compatible aliases; the old broad MLP group calibration is disabled by default.
+                 use_group_calibration=False, group_calibration_scale=0.0):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -2223,6 +2230,22 @@ class ExposureForecastModelV2(nn.Module):
         self.use_graph_gate = bool(use_graph_gate and self.use_graphsage)
         self.use_rank_correction = bool(use_rank_correction and self.use_graphsage)
         self.rank_correction_scale = float(rank_correction_scale)
+        # V13: keep rank prior alive at long horizons instead of letting it collapse to 0.
+        # h1 uses 1.0; hH uses rank_horizon_min_scale.
+        self.rank_horizon_min_scale = float(rank_horizon_min_scale)
+        # V13: lightweight horizon-level plus hierarchical GL/category calibration.
+        # Broad group MLP calibration was too wide; we now use:
+        #   gl_delta + shrinkage(category_count) * category_delta.
+        self.use_horizon_calibration = bool(use_horizon_calibration)
+        self.horizon_calibration_scale = float(horizon_calibration_scale)
+        self.use_gl_calibration = bool(use_gl_calibration)
+        self.gl_calibration_scale = float(gl_calibration_scale)
+        self.use_category_calibration = bool(use_category_calibration)
+        self.category_calibration_scale = float(category_calibration_scale)
+        self.category_shrinkage_k = float(category_shrinkage_k)
+        # Keep the old broad context MLP only if explicitly requested.
+        self.use_group_calibration = bool(use_group_calibration)
+        self.group_calibration_scale = float(group_calibration_scale)
         if self.use_graphsage:
             node_np = graph_assets["node_features"].astype(np.float32)
             neigh_np = graph_assets["neighbor_idx"].astype(np.int64)
@@ -2238,6 +2261,25 @@ class ExposureForecastModelV2(nn.Module):
             self.register_buffer("graph_rank_node_features", torch.tensor(rank_np, dtype=torch.float32))
             self.rank_feature_names = graph_assets.get("rank_feature_names", [])
             self.rank_feat_dim = int(rank_np.shape[1])
+
+            # V13 hierarchical calibration IDs. These are ASIN-node-level ids aligned with graph nodes.
+            meta_df = graph_assets.get("meta_df", None)
+            if meta_df is not None and len(meta_df) == node_np.shape[0]:
+                gl_vals = meta_df.get("gl_product_group", pd.Series(["MISSING"] * node_np.shape[0])).astype(str).fillna("MISSING")
+                cat_vals = meta_df.get("category_code", pd.Series(["MISSING"] * node_np.shape[0])).astype(str).fillna("MISSING")
+            else:
+                gl_vals = pd.Series(["MISSING"] * node_np.shape[0])
+                cat_vals = pd.Series(["MISSING"] * node_np.shape[0])
+            gl_ids_np, gl_uniques = pd.factorize(gl_vals, sort=True)
+            cat_ids_np, cat_uniques = pd.factorize(cat_vals, sort=True)
+            cat_counts = pd.Series(cat_ids_np).map(pd.Series(cat_ids_np).value_counts()).astype(float).values
+            cat_w = cat_counts / (cat_counts + self.category_shrinkage_k)
+            self.n_gl_calib = max(int(len(gl_uniques)), 1)
+            self.n_category_calib = max(int(len(cat_uniques)), 1)
+            self.register_buffer("graph_gl_calib_id", torch.tensor(gl_ids_np, dtype=torch.long))
+            self.register_buffer("graph_category_calib_id", torch.tensor(cat_ids_np, dtype=torch.long))
+            self.register_buffer("graph_category_calib_weight", torch.tensor(cat_w, dtype=torch.float32))
+
             self.graph_encoder = DualRelationalGATEncoder(
                 node_feat_dim=node_np.shape[1],
                 graph_dim=self.graph_dim,
@@ -2252,11 +2294,15 @@ class ExposureForecastModelV2(nn.Module):
                 context_cols = list(context_cols) + self.graph_context_cols
             print(f"DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | msg_scale={graph_message_scale}")
             print(f"Dynamic rank node features: dim={self.rank_feat_dim} | rank_correction={self.use_rank_correction} | scale={self.rank_correction_scale}")
-            print(f"Category-only graph v11: GL is static only; positive/competitive edges + sparse/event-aware dynamic rank correction.")
+            print(f"Category-only graph v12: sparse/event-aware dynamic rank + long-horizon floor + horizon + GL/category shrinkage calibration.")
         else:
             self.graph_encoder = None
             self.rank_feat_dim = 0
             self.rank_feature_names = []
+            self.n_gl_calib = 0
+            self.n_category_calib = 0
+            self.use_gl_calibration = False
+            self.use_category_calibration = False
             print("DualRelationalGAT disabled")
 
         if self.use_graph_head:
@@ -2283,6 +2329,30 @@ class ExposureForecastModelV2(nn.Module):
             )
         else:
             self.rank_correction_head = None
+
+        # V13 horizon calibration: target-specific log-multiplier by forecast horizon.
+        # Initialized at 0; training learns small upward/downward corrections, especially h13-h20.
+        if self.use_horizon_calibration:
+            self.horizon_calib = nn.Parameter(torch.zeros(int(horizon), 3))
+        else:
+            self.register_parameter("horizon_calib", None)
+
+        # V13 group calibration: future_context contains GL/category/static + event/horizon features.
+        # A small tanh-bounded head provides GL/category/event-specific log-scale correction.
+        if self.use_group_calibration:
+            self.group_calib_head = nn.Sequential(
+                nn.Linear(context_dim, max(32, min(128, context_dim * 2))),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(32, min(128, context_dim * 2)), 3),
+                nn.Tanh(),
+            )
+        else:
+            self.group_calib_head = None
+
+        print(f"V13 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
+              f"horizon_calib={self.use_horizon_calibration}, scale={self.horizon_calibration_scale} | "
+              f"group_calib={self.use_group_calibration}, scale={self.group_calibration_scale}")
 
         if self.use_graphsage:
             # Horizon-level graph gates. These learn how much positive and competitive
@@ -2485,7 +2555,17 @@ class ExposureForecastModelV2(nn.Module):
                 g_pos_rep2 = g_pos[:, None, :].expand(B, H, -1)
                 g_comp_rep2 = g_comp[:, None, :].expand(B, H, -1)
                 rank_in = torch.cat([orig_future_context, g_self_rep2, g_pos_rep2, g_comp_rep2, rank_rep], dim=-1)
-                rank_log_delta = self.rank_correction_scale * self.rank_correction_head(rank_in)
+                rank_raw_delta = self.rank_correction_head(rank_in)
+                # V13: deterministic long-horizon floor. The rank prior should not disappear
+                # in h13-h20 because ASIN magnitude hierarchy is still useful there.
+                if H > 1:
+                    h_scale = torch.linspace(
+                        1.0, self.rank_horizon_min_scale, H,
+                        device=orig_future_context.device, dtype=orig_future_context.dtype,
+                    ).view(1, H, 1)
+                else:
+                    h_scale = torch.ones(1, H, 1, device=orig_future_context.device, dtype=orig_future_context.dtype)
+                rank_log_delta = self.rank_correction_scale * h_scale * rank_raw_delta
 
             future_context = torch.cat([future_context, g_rep], dim=-1)
             if return_aux:
@@ -2518,11 +2598,72 @@ class ExposureForecastModelV2(nn.Module):
                         graph_aux["rank_log_delta_buybox"] = rank_log_delta[:, :, 1]
                         graph_aux["rank_log_delta_instock"] = rank_log_delta[:, :, 2]
 
+        # V13: horizon-level + hierarchical GL/category calibration are added as small
+        # log-multiplier streams. Category correction is shrinked by category size.
+        calib_log_delta = rank_log_delta
+        B_fc, H_fc, _ = future_context.shape
+        orig_fc_for_calib = future_context[:, :, :self.group_calib_head[0].in_features] if self.group_calib_head is not None else None
+
+        if self.use_horizon_calibration and self.horizon_calib is not None:
+            h_delta = self.horizon_calibration_scale * self.horizon_calib[:H_fc, :].to(future_context.device, dtype=future_context.dtype)
+            h_delta = h_delta.unsqueeze(0).expand(B_fc, -1, -1)
+            calib_log_delta = h_delta if calib_log_delta is None else calib_log_delta + h_delta
+        else:
+            h_delta = None
+
+        if self.use_graphsage and asin_idx is not None and self.gl_calib_emb is not None:
+            gl_ids = self.graph_gl_calib_id[asin_idx.long()].to(future_context.device)
+            gl_raw = torch.tanh(self.gl_calib_emb(gl_ids)).to(future_context.dtype)
+            gl_delta = self.gl_calibration_scale * gl_raw[:, None, :].expand(B_fc, H_fc, -1)
+            calib_log_delta = gl_delta if calib_log_delta is None else calib_log_delta + gl_delta
+        else:
+            gl_delta = None
+
+        if self.use_graphsage and asin_idx is not None and self.category_calib_emb is not None:
+            cat_ids = self.graph_category_calib_id[asin_idx.long()].to(future_context.device)
+            cat_w = self.graph_category_calib_weight[asin_idx.long()].to(future_context.device, dtype=future_context.dtype)
+            cat_raw = torch.tanh(self.category_calib_emb(cat_ids)).to(future_context.dtype)
+            cat_delta = self.category_calibration_scale * cat_w[:, None, None] * cat_raw[:, None, :].expand(B_fc, H_fc, -1)
+            calib_log_delta = cat_delta if calib_log_delta is None else calib_log_delta + cat_delta
+        else:
+            cat_delta = None
+            cat_w = None
+
+        if self.use_group_calibration and self.group_calib_head is not None:
+            # Optional legacy broad context calibration; disabled by default.
+            gcal_delta = self.group_calibration_scale * self.group_calib_head(orig_fc_for_calib)
+            calib_log_delta = gcal_delta if calib_log_delta is None else calib_log_delta + gcal_delta
+        else:
+            gcal_delta = None
+
         dec_out = self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
-        dec_out = self._apply_rank_correction_head(dec_out, rank_log_delta)
+        dec_out = self._apply_rank_correction_head(dec_out, calib_log_delta)
         dec_out = self._apply_graph_delta_head(dec_out, g)
-        if return_aux and isinstance(dec_out, dict) and graph_aux is not None:
-            dec_out.update(graph_aux)
+        if return_aux and isinstance(dec_out, dict):
+            if graph_aux is not None:
+                dec_out.update(graph_aux)
+            if calib_log_delta is not None:
+                dec_out["calib_log_delta_total"] = calib_log_delta[:, :, 0]
+                dec_out["calib_log_delta_buybox"] = calib_log_delta[:, :, 1]
+                dec_out["calib_log_delta_instock"] = calib_log_delta[:, :, 2]
+            if h_delta is not None:
+                dec_out["horizon_log_delta_total"] = h_delta[:, :, 0]
+                dec_out["horizon_log_delta_buybox"] = h_delta[:, :, 1]
+                dec_out["horizon_log_delta_instock"] = h_delta[:, :, 2]
+            if gl_delta is not None:
+                dec_out["gl_log_delta_total"] = gl_delta[:, :, 0]
+                dec_out["gl_log_delta_buybox"] = gl_delta[:, :, 1]
+                dec_out["gl_log_delta_instock"] = gl_delta[:, :, 2]
+            if cat_delta is not None:
+                dec_out["category_log_delta_total"] = cat_delta[:, :, 0]
+                dec_out["category_log_delta_buybox"] = cat_delta[:, :, 1]
+                dec_out["category_log_delta_instock"] = cat_delta[:, :, 2]
+                if cat_w is not None:
+                    dec_out["category_calibration_weight"] = cat_w[:, None].expand(B_fc, H_fc)
+            if gcal_delta is not None:
+                dec_out["group_log_delta_total"] = gcal_delta[:, :, 0]
+                dec_out["group_log_delta_buybox"] = gcal_delta[:, :, 1]
+                dec_out["group_log_delta_instock"] = gcal_delta[:, :, 2]
         return dec_out
 
 
@@ -3107,6 +3248,22 @@ def predict_exposure_v2(
             rank_delta_total_np = _aux_horizon_np("rank_log_delta_total")
             rank_delta_buybox_np = _aux_horizon_np("rank_log_delta_buybox")
             rank_delta_instock_np = _aux_horizon_np("rank_log_delta_instock")
+            calib_delta_total_np = _aux_horizon_np("calib_log_delta_total")
+            calib_delta_buybox_np = _aux_horizon_np("calib_log_delta_buybox")
+            calib_delta_instock_np = _aux_horizon_np("calib_log_delta_instock")
+            gl_delta_total_np = _aux_horizon_np("gl_log_delta_total")
+            gl_delta_buybox_np = _aux_horizon_np("gl_log_delta_buybox")
+            gl_delta_instock_np = _aux_horizon_np("gl_log_delta_instock")
+            category_delta_total_np = _aux_horizon_np("category_log_delta_total")
+            category_delta_buybox_np = _aux_horizon_np("category_log_delta_buybox")
+            category_delta_instock_np = _aux_horizon_np("category_log_delta_instock")
+            category_calib_weight_np = _aux_horizon_np("category_calibration_weight")
+            horizon_delta_total_np = _aux_horizon_np("horizon_log_delta_total")
+            horizon_delta_buybox_np = _aux_horizon_np("horizon_log_delta_buybox")
+            horizon_delta_instock_np = _aux_horizon_np("horizon_log_delta_instock")
+            group_delta_total_np = _aux_horizon_np("group_log_delta_total")
+            group_delta_buybox_np = _aux_horizon_np("group_log_delta_buybox")
+            group_delta_instock_np = _aux_horizon_np("group_log_delta_instock")
 
             if apply_funnel_constraint:
                 # apply funnel to all prediction views
@@ -3170,6 +3327,22 @@ def predict_exposure_v2(
                         "rank_log_delta_total": rank_delta_total_np[i, h],
                         "rank_log_delta_buybox": rank_delta_buybox_np[i, h],
                         "rank_log_delta_instock": rank_delta_instock_np[i, h],
+                        "calib_log_delta_total": calib_delta_total_np[i, h],
+                        "calib_log_delta_buybox": calib_delta_buybox_np[i, h],
+                        "calib_log_delta_instock": calib_delta_instock_np[i, h],
+                        "gl_log_delta_total": gl_delta_total_np[i, h],
+                        "gl_log_delta_buybox": gl_delta_buybox_np[i, h],
+                        "gl_log_delta_instock": gl_delta_instock_np[i, h],
+                        "category_log_delta_total": category_delta_total_np[i, h],
+                        "category_log_delta_buybox": category_delta_buybox_np[i, h],
+                        "category_log_delta_instock": category_delta_instock_np[i, h],
+                        "category_calibration_weight": category_calib_weight_np[i, h],
+                        "horizon_log_delta_total": horizon_delta_total_np[i, h],
+                        "horizon_log_delta_buybox": horizon_delta_buybox_np[i, h],
+                        "horizon_log_delta_instock": horizon_delta_instock_np[i, h],
+                        "group_log_delta_total": group_delta_total_np[i, h],
+                        "group_log_delta_buybox": group_delta_buybox_np[i, h],
+                        "group_log_delta_instock": group_delta_instock_np[i, h],
                     })
     return pd.DataFrame(rows)
 
@@ -3930,6 +4103,18 @@ def run_exposure_v2(
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
+    use_rank_correction=True,
+    rank_correction_scale=0.03,
+    rank_horizon_min_scale=0.40,
+    use_horizon_calibration=True,
+    horizon_calibration_scale=0.03,
+    use_gl_calibration=True,
+    gl_calibration_scale=0.025,
+    use_category_calibration=True,
+    category_calibration_scale=0.015,
+    category_shrinkage_k=100.0,
+    use_group_calibration=False,
+    group_calibration_scale=0.0,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -3938,8 +4123,8 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V3: SINGLE-HEAD PATCH + MAGNITUDE-AWARE GRAPH + ASIN-SUM LOSS")
-    print("Preset: no two-head/gate; magnitude-aware positive/competitive graph; ASIN 20w sum loss; MU hats for demand")
+    print("EXPOSURE MODEL V13: DYNAMIC RANK + HORIZON + GL/CATEGORY SHRINKAGE CALIBRATION")
+    print("Preset: dynamic relation graph + sparse/event-aware rank prior + long-horizon calibration; MU hats for demand")
     print("=" * 100)
 
     df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -3982,6 +4167,18 @@ def run_exposure_v2(
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
+        use_rank_correction=use_rank_correction,
+        rank_correction_scale=rank_correction_scale,
+        rank_horizon_min_scale=rank_horizon_min_scale,
+        use_horizon_calibration=use_horizon_calibration,
+        horizon_calibration_scale=horizon_calibration_scale,
+        use_gl_calibration=use_gl_calibration,
+        gl_calibration_scale=gl_calibration_scale,
+        use_category_calibration=use_category_calibration,
+        category_calibration_scale=category_calibration_scale,
+        category_shrinkage_k=category_shrinkage_k,
+        use_group_calibration=use_group_calibration,
+        group_calibration_scale=group_calibration_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -4353,6 +4550,18 @@ def _train_one_exposure_window(
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
+        use_rank_correction=use_rank_correction,
+        rank_correction_scale=rank_correction_scale,
+        rank_horizon_min_scale=rank_horizon_min_scale,
+        use_horizon_calibration=use_horizon_calibration,
+        horizon_calibration_scale=horizon_calibration_scale,
+        use_gl_calibration=use_gl_calibration,
+        gl_calibration_scale=gl_calibration_scale,
+        use_category_calibration=use_category_calibration,
+        category_calibration_scale=category_calibration_scale,
+        category_shrinkage_k=category_shrinkage_k,
+        use_group_calibration=use_group_calibration,
+        group_calibration_scale=group_calibration_scale,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -4622,6 +4831,18 @@ def run_exposure_v2(
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
+    use_rank_correction=True,
+    rank_correction_scale=0.03,
+    rank_horizon_min_scale=0.40,
+    use_horizon_calibration=True,
+    horizon_calibration_scale=0.03,
+    use_gl_calibration=True,
+    gl_calibration_scale=0.025,
+    use_category_calibration=True,
+    category_calibration_scale=0.015,
+    category_shrinkage_k=100.0,
+    use_group_calibration=False,
+    group_calibration_scale=0.0,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4630,7 +4851,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
+    print("EXPOSURE MODEL V13: SINGLE-HEAD DIRECT + SCOT OPTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -4780,6 +5001,18 @@ def run_exposure_v2_rolling(
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
+    use_rank_correction=True,
+    rank_correction_scale=0.03,
+    rank_horizon_min_scale=0.40,
+    use_horizon_calibration=True,
+    horizon_calibration_scale=0.03,
+    use_gl_calibration=True,
+    gl_calibration_scale=0.025,
+    use_category_calibration=True,
+    category_calibration_scale=0.015,
+    category_shrinkage_k=100.0,
+    use_group_calibration=False,
+    group_calibration_scale=0.0,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -4788,7 +5021,7 @@ def run_exposure_v2_rolling(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: ROLLING BACKTEST + SCOT INTERSECTION")
+    print("EXPOSURE MODEL V13: ROLLING BACKTEST + SCOT INTERSECTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
     print("=" * 100)
     print(f"n_asins={n_asins} | history={history} | rolling_offsets={list(rolling_offsets)} | epochs={epochs} | patience={patience} | encoder_attn={use_encoder_self_attn}")
 
@@ -5159,6 +5392,18 @@ def run_exposure_v2_final_scot_5000(
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
+    use_rank_correction=True,
+    rank_correction_scale=0.03,
+    rank_horizon_min_scale=0.40,
+    use_horizon_calibration=True,
+    horizon_calibration_scale=0.03,
+    use_gl_calibration=True,
+    gl_calibration_scale=0.025,
+    use_category_calibration=True,
+    category_calibration_scale=0.015,
+    category_shrinkage_k=100.0,
+    use_group_calibration=False,
+    group_calibration_scale=0.0,
     graph_zero_weight=0.03,
     graph_level_peak_weight=2.2,
     graph_transition_weight=1.0,
@@ -5451,7 +5696,7 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 
     if verbose:
         print("\n" + "=" * 100)
-        print("DUALGAT V9 GRAPH GATE DIAGNOSTICS")
+        print("GRAPH GATE DIAGNOSTICS")
         print("=" * 100)
         print("\n[Gate by horizon]")
         print(by_h.round(4).to_string(index=False))
@@ -5471,10 +5716,10 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
     return {"by_horizon": by_h, "by_active": by_active, "by_error": by_error, "by_true_sum_bucket": by_bucket, "probe": probe}
 
 # ============================================================
-# USAGE: DualGAT V9 gated exposure only; pass final MU exposure hats to demand
+# USAGE: V13 dynamic rank + horizon + GL/category shrinkage calibration; pass MU hats to demand
 # ============================================================
 # Run this file in Jupyter:
-# %run -i exposure_model_only_nb_mu_hats_v2_DYNAMIC_RANK_MAG_CORRECTION_v11.py
+# %run -i exposure_model_only_nb_mu_hats_v2_DYNAMIC_RANK_HORIZON_CATCALIB_v13.py
 #
 # exposure_result = run_exposure_v2_final_scot_5000(
 #     data_raw1=data_raw1,
@@ -5489,6 +5734,18 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 #     use_encoder_self_attn=True,
 #     use_graphsage=True,       # In this file this enables DualRelationalGAT, not mean GraphSAGE.
 #     use_graph_gate=True,      # Learn per-horizon positive/competitive graph usage.
+#     use_rank_correction=True,
+#     rank_correction_scale=0.03,
+#     rank_horizon_min_scale=0.40,
+#     use_horizon_calibration=True,
+#     horizon_calibration_scale=0.03,
+#     use_gl_calibration=True,
+#     gl_calibration_scale=0.025,
+#     use_category_calibration=True,
+#     category_calibration_scale=0.015,
+#     category_shrinkage_k=100.0,
+#     use_group_calibration=False,     # legacy broad MLP group calibration; keep off by default
+#     group_calibration_scale=0.0,
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
@@ -5510,7 +5767,7 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 # exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
 # summarize_exposure_hat_for_demand(
 #     exposure_hat_for_demand,
-#     title="DYNAMIC RANK MAG CORRECTION V11 MU HAT TO PASS INTO DEMAND",
+#     title="DYNAMIC RANK HORIZON CATCALIB V13 MU HAT TO PASS INTO DEMAND",
 # )
 #
 # graph_gate_diagnostics = diagnose_graph_gates(forecast_df, target="instock", verbose=True)
