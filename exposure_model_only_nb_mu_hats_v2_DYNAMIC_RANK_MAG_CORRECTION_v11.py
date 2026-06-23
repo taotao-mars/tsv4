@@ -2302,6 +2302,7 @@ class ExposureForecastModelV2(nn.Module):
                  use_category_calibration=True, category_calibration_scale=0.015,
                  category_shrinkage_k=100.0,
                  use_learned_edge_score=True, learned_edge_score_scale=1.0, rule_edge_prior_scale=0.25,
+                 use_graph_encoder_fusion=True, graph_encoder_scale=0.05,
                  # Backward-compatible aliases; the old broad MLP group calibration is disabled by default.
                  use_group_calibration=False, group_calibration_scale=0.0):
         super().__init__()
@@ -2322,7 +2323,7 @@ class ExposureForecastModelV2(nn.Module):
         self.use_graph_gate = bool(use_graph_gate and self.use_graphsage)
         self.use_rank_correction = bool(use_rank_correction and self.use_graphsage)
         self.rank_correction_scale = float(rank_correction_scale)
-        # V14: keep rank prior alive at long horizons instead of letting it collapse to 0.
+        # V15: keep rank prior alive at long horizons instead of letting it collapse to 0.
         # h1 uses 1.0; hH uses rank_horizon_min_scale.
         self.rank_horizon_min_scale = float(rank_horizon_min_scale)
         # V14: lightweight horizon-level plus hierarchical GL/category calibration.
@@ -2335,10 +2336,14 @@ class ExposureForecastModelV2(nn.Module):
         self.use_category_calibration = bool(use_category_calibration)
         self.category_calibration_scale = float(category_calibration_scale)
         self.category_shrinkage_k = float(category_shrinkage_k)
-        # V14 learned-edge scoring: rule scores are kept as weak priors, but EdgeMLP learns edge attention bias.
+        # V15 learned-edge scoring: rule scores are kept as weak priors, but EdgeMLP learns edge attention bias.
         self.use_learned_edge_score = bool(use_learned_edge_score)
         self.learned_edge_score_scale = float(learned_edge_score_scale)
         self.rule_edge_prior_scale = float(rule_edge_prior_scale)
+        # V15: early graph fusion lets graph/rank information shape the encoder memory,
+        # not only act as late-stage correction after the decoder.
+        self.use_graph_encoder_fusion = bool(use_graph_encoder_fusion and self.use_graphsage)
+        self.graph_encoder_scale = float(graph_encoder_scale)
         # Keep the old broad context MLP only if explicitly requested.
         self.use_group_calibration = bool(use_group_calibration)
         self.group_calibration_scale = float(group_calibration_scale)
@@ -2398,7 +2403,7 @@ class ExposureForecastModelV2(nn.Module):
             self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
-            print(f"V14 LearnedEdge DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
+            print(f"V15 LearnedEdge EarlyFusion DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
             print(f"Dynamic rank node features: dim={self.rank_feat_dim} | rank_correction={self.use_rank_correction} | scale={self.rank_correction_scale}")
             print(f"Category-only graph v12: sparse/event-aware dynamic rank + long-horizon floor + horizon + GL/category shrinkage calibration.")
         else:
@@ -2469,7 +2474,7 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.group_calib_head = None
 
-        print(f"V14 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
+        print(f"V15 calibration: rank_horizon_min_scale={self.rank_horizon_min_scale} | "
               f"horizon_calib={self.use_horizon_calibration}, scale={self.horizon_calibration_scale} | "
               f"gl_calib={self.use_gl_calibration}, scale={self.gl_calibration_scale} | "
               f"category_calib={self.use_category_calibration}, scale={self.category_calibration_scale}, shrink_k={self.category_shrinkage_k} | "
@@ -2489,6 +2494,27 @@ class ExposureForecastModelV2(nn.Module):
         else:
             self.graph_gate_net = None
             self.graph_fusion_norm = None
+
+        if self.use_graph_encoder_fusion:
+            enc_graph_in_dim = self.graph_dim * 3 + self.rank_feat_dim
+            self.graph_encoder_proj = nn.Sequential(
+                nn.Linear(enc_graph_in_dim, max(d_model, self.graph_dim * 4)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(d_model, self.graph_dim * 4), d_model),
+                nn.Tanh(),
+            )
+            self.graph_encoder_gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.Sigmoid(),
+            )
+            self.graph_encoder_norm = nn.LayerNorm(d_model)
+        else:
+            self.graph_encoder_proj = None
+            self.graph_encoder_gate = None
+            self.graph_encoder_norm = None
+
+        print(f"V15 graph encoder fusion: {self.use_graph_encoder_fusion} | scale={self.graph_encoder_scale}")
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -2690,6 +2716,27 @@ class ExposureForecastModelV2(nn.Module):
                     h_scale = torch.ones(1, H, 1, device=orig_future_context.device, dtype=orig_future_context.dtype)
                 rank_log_delta = self.rank_correction_scale * h_scale * rank_raw_delta
 
+            # V15 early graph fusion: condition the encoder memory on self/positive/competitive
+            # graph messages before the decoder cross-attends to history. This makes graph
+            # information affect the whole 20-week path, instead of only late correction.
+            enc_gate_mean = None
+            if self.use_graph_encoder_fusion and self.graph_encoder_proj is not None:
+                if rank_feat is not None:
+                    rank_for_enc = rank_feat.to(enc_out.device, dtype=enc_out.dtype)
+                else:
+                    rank_for_enc = torch.zeros(B, 0, device=enc_out.device, dtype=enc_out.dtype)
+                enc_graph_in = torch.cat([
+                    g_self.to(enc_out.device, dtype=enc_out.dtype),
+                    g_pos.to(enc_out.device, dtype=enc_out.dtype),
+                    g_comp.to(enc_out.device, dtype=enc_out.dtype),
+                    rank_for_enc,
+                ], dim=-1)
+                g_enc = self.graph_encoder_proj(enc_graph_in)  # [B,D]
+                g_enc_rep = g_enc[:, None, :].expand(-1, enc_out.shape[1], -1)
+                enc_gate = self.graph_encoder_gate(torch.cat([enc_out, g_enc_rep], dim=-1))
+                enc_out = self.graph_encoder_norm(enc_out + self.graph_encoder_scale * enc_gate * g_enc_rep)
+                enc_gate_mean = enc_gate.mean(dim=-1)
+
             future_context = torch.cat([future_context, g_rep], dim=-1)
             if return_aux:
                 graph_aux = {
@@ -2697,6 +2744,7 @@ class ExposureForecastModelV2(nn.Module):
                     "graph_comp_gate": comp_gate.squeeze(-1),
                     "graph_gate": 0.5 * (pos_gate.squeeze(-1) + comp_gate.squeeze(-1)),
                     "graph_pos_minus_comp_gate": (pos_gate.squeeze(-1) - comp_gate.squeeze(-1)),
+                    "graph_encoder_gate_mean": enc_gate_mean if enc_gate_mean is not None else torch.full((B, enc_out.shape[1]), float("nan"), device=future_context.device, dtype=future_context.dtype),
                     "graph_pos_norm": graph_all["pos_norm"][idx],
                     "graph_comp_norm": graph_all["comp_norm"][idx],
                     "graph_emb_norm": graph_all["graph_norm"][idx],
@@ -2721,7 +2769,7 @@ class ExposureForecastModelV2(nn.Module):
                         graph_aux["rank_log_delta_buybox"] = rank_log_delta[:, :, 1]
                         graph_aux["rank_log_delta_instock"] = rank_log_delta[:, :, 2]
 
-        # V14: horizon-level + hierarchical GL/category calibration are added as small
+        # V15: horizon-level + hierarchical GL/category calibration are added as small
         # log-multiplier streams. Category correction is shrinked by category size.
         calib_log_delta = rank_log_delta
         B_fc, H_fc, _ = future_context.shape
@@ -4223,6 +4271,8 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_encoder_fusion=True,
+    graph_encoder_scale=0.05,
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
@@ -4246,7 +4296,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V14: DYNAMIC RANK + HORIZON + GL/CATEGORY SHRINKAGE CALIBRATION")
+    print("EXPOSURE MODEL V15: LEARNED EDGE + GRAPH EARLY FUSION + HORIZON/CAT CALIBRATION")
     print("Preset: dynamic relation graph + sparse/event-aware rank prior + long-horizon calibration; MU hats for demand")
     print("=" * 100)
 
@@ -4287,6 +4337,8 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_encoder_fusion=use_graph_encoder_fusion,
+        graph_encoder_scale=graph_encoder_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
@@ -4623,6 +4675,8 @@ def _train_one_exposure_window(
     graph_assets=None,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_encoder_fusion=True,
+    graph_encoder_scale=0.05,
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
@@ -4682,6 +4736,8 @@ def _train_one_exposure_window(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_encoder_fusion=use_graph_encoder_fusion,
+        graph_encoder_scale=graph_encoder_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
@@ -4963,6 +5019,8 @@ def run_exposure_v2(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_encoder_fusion=True,
+    graph_encoder_scale=0.05,
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
@@ -5047,6 +5105,8 @@ def run_exposure_v2(
         graph_assets=graph_assets,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_encoder_fusion=use_graph_encoder_fusion,
+        graph_encoder_scale=graph_encoder_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
@@ -5145,6 +5205,8 @@ def run_exposure_v2_rolling(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_encoder_fusion=True,
+    graph_encoder_scale=0.05,
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
@@ -5536,6 +5598,8 @@ def run_exposure_v2_final_scot_5000(
     neighbor_k=10,
     graph_dim=16,
     graph_message_scale=0.04,
+    use_graph_encoder_fusion=True,
+    graph_encoder_scale=0.05,
     use_graph_head=False,
     graph_head_scale=0.05,
     use_graph_gate=True,
@@ -5582,6 +5646,8 @@ def run_exposure_v2_final_scot_5000(
         neighbor_k=neighbor_k,
         graph_dim=graph_dim,
         graph_message_scale=graph_message_scale,
+        use_graph_encoder_fusion=use_graph_encoder_fusion,
+        graph_encoder_scale=graph_encoder_scale,
         use_graph_head=use_graph_head,
         graph_head_scale=graph_head_scale,
         use_graph_gate=use_graph_gate,
@@ -5908,6 +5974,8 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 #     neighbor_k=10,
 #     graph_dim=16,
 #     graph_message_scale=0.04,
+#     use_graph_encoder_fusion=True,
+#     graph_encoder_scale=0.05,
 #
 #     # First recommended run: keep graph as embedding only.
 #     # Turn this on only after the embedding-only ablation improves validation/demand.
@@ -5926,7 +5994,7 @@ def diagnose_graph_gates(pred_df, target="instock", verbose=True):
 # exposure_hat_for_demand = exposure_result["exposure_hat_for_demand_mu"].copy()
 # summarize_exposure_hat_for_demand(
 #     exposure_hat_for_demand,
-#     title="DYNAMIC RANK HORIZON CATCALIB V14 MU HAT TO PASS INTO DEMAND",
+#     title="LEARNED EDGE EARLYFUSION V15 MU HAT TO PASS INTO DEMAND",
 # )
 #
 # graph_gate_diagnostics = diagnose_graph_gates(forecast_df, target="instock", verbose=True)
