@@ -3263,30 +3263,162 @@ def run_demand_with_predicted_exposure_buybox_only(
     )
 
 
+
+
+def run_demand_with_predicted_exposure_all_modes_graph(
+    data_raw1,
+    scot_df,
+    exposure_result_or_hat,
+    n_asins=5000,
+    seed=42,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    remove_oos_dp=True,
+):
+    """
+    Convenience helper: run all three exposure modes with the same exposure_result.
+
+    Pass FULL exposure_result from exposure V15 if you want demand to receive graph/rank
+    context. Passing exposure_hat_for_demand dataframe will run hats-only behavior.
+    """
+    results = {}
+
+    print("\n" + "#" * 100)
+    print("RUNNING DEMAND: BUYBOX_ONLY + EXPOSURE GRAPH")
+    print("#" * 100)
+    results["buybox_graph"] = run_demand_with_predicted_exposure_buybox_only(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_result_or_hat=exposure_result_or_hat,
+        n_asins=n_asins,
+        seed=seed,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        remove_oos_dp=remove_oos_dp,
+    )
+
+    print("\n" + "#" * 100)
+    print("RUNNING DEMAND: INSTOCK_ONLY + EXPOSURE GRAPH")
+    print("#" * 100)
+    results["instock_graph"] = run_demand_with_predicted_exposure_instock_only(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_result_or_hat=exposure_result_or_hat,
+        n_asins=n_asins,
+        seed=seed,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        remove_oos_dp=remove_oos_dp,
+    )
+
+    print("\n" + "#" * 100)
+    print("RUNNING DEMAND: ALL3 + EXPOSURE GRAPH")
+    print("#" * 100)
+    results["all3_graph"] = run_demand_with_predicted_exposure_all3(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        exposure_result_or_hat=exposure_result_or_hat,
+        n_asins=n_asins,
+        seed=seed,
+        epochs=epochs,
+        history=history,
+        horizon=horizon,
+        d_model=d_model,
+        d_z=d_z,
+        batch_size=batch_size,
+        M_eval=M_eval,
+        remove_oos_dp=remove_oos_dp,
+    )
+
+    print("\n" + "=" * 100)
+    print("DEMAND GRAPH ALL-MODES RUN FINISHED")
+    print("=" * 100)
+    print("Result keys:", list(results.keys()))
+    return results
+
 """
 USAGE IN JUPYTER
 ----------------
-%run -i demand_external_exposure3_with_exposure_graph_v1.py
+%run -i demand_external_exposure3_with_exposure_graph_v2_all_modes_usage.py
 
-# Recommended: pass the FULL exposure_result from V15, not only
-# exposure_hat_for_demand.  The full dict contains forecast_df with
-# graph/rank diagnostics.  The demand model will safely extract:
+# Recommended: pass the FULL exposure_result from exposure V15, not only
+# exposure_hat_for_demand.  The full dict contains forecast_df with graph/rank
+# diagnostics.  The demand model will safely extract:
 #   - predicted total/buybox/instock DPH hats
 #   - exposure graph/rank context columns
 # and will fuse graph context into the demand hidden state.
 
+# ---------------------------------------------------------------------
+# Option A: run all three modes one by one and keep clear variable names
+# ---------------------------------------------------------------------
+
 demand_result_buybox_graph = run_demand_with_predicted_exposure_buybox_only(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    exposure_result_or_hat=exposure_result,   # <- pass FULL V15 exposure_result
+    exposure_result_or_hat=exposure_result,   # FULL V15 exposure_result => hats + graph/rank context
     n_asins=5000,
     epochs=60,
     history=52,
     horizon=20,
 )
 
-# For comparison, you can still pass exposure_hat_for_demand only.
-# That will run the old behavior: DPH hats only, no graph context.
+demand_result_instock_graph = run_demand_with_predicted_exposure_instock_only(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    exposure_result_or_hat=exposure_result,
+    n_asins=5000,
+    epochs=60,
+    history=52,
+    horizon=20,
+)
+
+demand_result_all3_graph = run_demand_with_predicted_exposure_all3(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    exposure_result_or_hat=exposure_result,
+    n_asins=5000,
+    epochs=60,
+    history=52,
+    horizon=20,
+)
+
+# ---------------------------------------------------------------------
+# Option B: one helper to run all three modes sequentially
+# ---------------------------------------------------------------------
+
+# demand_results_graph = run_demand_with_predicted_exposure_all_modes_graph(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     exposure_result_or_hat=exposure_result,
+#     n_asins=5000,
+#     epochs=60,
+#     history=52,
+#     horizon=20,
+# )
+# demand_result_buybox_graph = demand_results_graph["buybox_graph"]
+# demand_result_instock_graph = demand_results_graph["instock_graph"]
+# demand_result_all3_graph = demand_results_graph["all3_graph"]
+
+# ---------------------------------------------------------------------
+# Optional hats-only ablation: pass exposure_hat_for_demand instead.
+# This removes graph/rank context and uses only predicted DPH hats.
+# ---------------------------------------------------------------------
+
 # demand_result_buybox_hat_only = run_demand_with_predicted_exposure_buybox_only(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
