@@ -1502,6 +1502,29 @@ def generate_forecast_df(model, va_ld, M=50):
                 M=M,
                 return_stock=True,
             )
+
+            # Demand distribution/zero diagnostics.  Average NB parameters over a
+            # small ENN ensemble so the forecast_df directly contains active scores.
+            nb_mu_mean = torch.full_like(b["y"], float("nan"))
+            nb_alpha_mean = torch.full_like(b["y"], float("nan"))
+            nb_p_active = torch.full_like(b["y"], float("nan"))
+            nb_nll = torch.full_like(b["y"], float("nan"))
+            poisson_nll = torch.full_like(b["y"], float("nan"))
+            try:
+                preds, _, _ = model(b["x"], b["future_context"], nZ=min(16, max(4, M)))
+                mu_stack = torch.stack([pa[0] for pa in preds], dim=0)
+                alpha_stack = torch.stack([pa[1] for pa in preds], dim=0)
+                nb_mu_mean = mu_stack.mean(dim=0).clamp(min=1e-6)
+                nb_alpha_mean = alpha_stack.mean(dim=0).clamp(min=1e-6)
+                r = (1.0 / alpha_stack.clamp(min=1e-6)).clamp(min=1e-6)
+                prob = (mu_stack * alpha_stack / (1.0 + mu_stack * alpha_stack)).clamp(1e-6, 1 - 1e-6)
+                p0 = torch.exp(r * torch.log1p(-prob))
+                nb_p_active = (1.0 - p0).mean(dim=0).clamp(0.0, 1.0)
+                nb_nll = torch.stack([negbin_nll_elementwise(b["y"], pa[0], pa[1]) for pa in preds], dim=0).mean(dim=0)
+                poisson_nll = nb_mu_mean - b["y"] * torch.log(nb_mu_mean.clamp(min=1e-6)) + torch.lgamma(b["y"] + 1.0)
+            except Exception as _diag_exc:
+                pass
+
             hist_mean = (b["x"][:, :, 0].exp() - 1).mean(dim=1, keepdim=True).clamp(min=0)
             hm50 = hist_mean.expand_as(b["y"])
             hm70 = hm50 * 1.25
@@ -1537,6 +1560,14 @@ def generate_forecast_df(model, va_ld, M=50):
                         "p70_amxl": p70[i, h].item(),
                         "p50_scot": hm50[i, h].item(),
                         "p70_scot": hm70[i, h].item(),
+
+                        # Demand NB distribution and zero/nonzero diagnostics.
+                        "demand_nb_mu": nb_mu_mean[i, h].item(),
+                        "demand_nb_alpha": nb_alpha_mean[i, h].item(),
+                        "demand_p_active": nb_p_active[i, h].item(),
+                        "demand_nb_nll": nb_nll[i, h].item(),
+                        "demand_poisson_nll": poisson_nll[i, h].item(),
+                        "demand_true_active": int(b["y"][i, h].item() > 0),
                     })
     return pd.DataFrame(rows)
 
@@ -1608,7 +1639,276 @@ def magnitude_gap(diag_df):
     }])
     print("\n[Magnitude Gap - Active weeks only]")
     print(out.T)
+
     return out
+
+
+def _binary_prf(y_true, y_pred):
+    y_true = np.asarray(y_true).astype(bool)
+    y_pred = np.asarray(y_pred).astype(bool)
+    tp = np.sum(y_true & y_pred)
+    fp = np.sum(~y_true & y_pred)
+    fn = np.sum(y_true & ~y_pred)
+    tn = np.sum(~y_true & ~y_pred)
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    f1 = 2 * precision * recall / max(1e-8, precision + recall)
+    return {
+        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+        "precision": precision, "recall": recall, "f1": f1,
+    }
+
+
+def demand_active_zero_diagnostics(
+    forecast_df,
+    score_col="demand_p_active",
+    true_col="fbi_demand",
+    horizon_col="fcst_week_index",
+    thresholds=(0.1, 0.2, 0.3, 0.4, 0.5),
+    verbose=True,
+):
+    """
+    Demand zero/non-zero forecast check for the final holdout horizon.
+
+    This is the metric you want for the slide item:
+      Encoder / demand pipeline zero detection: active AUC + recall/precision.
+
+    The preferred score is demand_p_active from the NB head.  If unavailable,
+    it falls back to p50_amxl / p70_amxl / pred mean style scores.
+    """
+    df = forecast_df.copy()
+    if true_col not in df.columns:
+        raise KeyError(f"{true_col} not found in forecast_df")
+    df[true_col] = pd.to_numeric(df[true_col], errors="coerce").fillna(0.0)
+    y = (df[true_col].values > 0).astype(int)
+
+    candidate_scores = []
+    if score_col in df.columns and df[score_col].notna().any():
+        candidate_scores.append(score_col)
+    for c in ["p50_amxl", "p70_amxl", "demand_nb_mu"]:
+        if c in df.columns and c not in candidate_scores:
+            candidate_scores.append(c)
+
+    rows = []
+    for c in candidate_scores:
+        score = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+        if len(np.unique(y)) < 2 or len(np.unique(score)) < 2:
+            auc = np.nan
+        else:
+            try:
+                auc = roc_auc_score(y, score)
+            except Exception:
+                auc = np.nan
+
+        # For p_active probabilities, use probability thresholds. For count scores,
+        # threshold at >0 by default plus quantile-like thresholds are still reported.
+        thrs = list(thresholds) if c == score_col else [0.0, 0.5, 1.0]
+        best = None
+        for t in thrs:
+            pred = score >= t if c == score_col else score > t
+            prf = _binary_prf(y, pred)
+            row = {
+                "score_col": c,
+                "threshold": t,
+                "auc": auc,
+                "true_active_rate": y.mean(),
+                "pred_active_rate": pred.mean(),
+                "p_active_minus_true": pred.mean() - y.mean(),
+                **prf,
+            }
+            rows.append(row)
+            if best is None or row["f1"] > best["f1"]:
+                best = row
+
+    summary = pd.DataFrame(rows)
+
+    # Horizon / horizon-block view using the preferred score.
+    horizon_rows = []
+    preferred = score_col if score_col in df.columns and df[score_col].notna().any() else candidate_scores[0]
+    score = pd.to_numeric(df[preferred], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    pred_default = score >= 0.5 if preferred == score_col else score > 0.0
+
+    if horizon_col in df.columns:
+        for h, sub in df.assign(_score=score, _y=y, _pred=pred_default).groupby(horizon_col):
+            yy = sub["_y"].values.astype(int)
+            ss = sub["_score"].values
+            pp = sub["_pred"].values.astype(bool)
+            try:
+                auc_h = roc_auc_score(yy, ss) if len(np.unique(yy)) == 2 and len(np.unique(ss)) > 1 else np.nan
+            except Exception:
+                auc_h = np.nan
+            prf = _binary_prf(yy, pp)
+            horizon_rows.append({
+                "horizon": int(h),
+                "n": len(sub),
+                "auc": auc_h,
+                "true_active_rate": yy.mean(),
+                "pred_active_rate": pp.mean(),
+                "p_active_minus_true": pp.mean() - yy.mean(),
+                **prf,
+            })
+    by_horizon = pd.DataFrame(horizon_rows)
+
+    if len(by_horizon) > 0:
+        def _block(h):
+            if h <= 5: return "short_1_5"
+            if h <= 12: return "mid_6_12"
+            return "long_13_20"
+        block_rows = []
+        dfb = df.assign(_score=score, _y=y, _pred=pred_default)
+        dfb["block"] = dfb[horizon_col].apply(_block)
+        for block, sub in dfb.groupby("block"):
+            yy = sub["_y"].values.astype(int)
+            ss = sub["_score"].values
+            pp = sub["_pred"].values.astype(bool)
+            try:
+                auc_b = roc_auc_score(yy, ss) if len(np.unique(yy)) == 2 and len(np.unique(ss)) > 1 else np.nan
+            except Exception:
+                auc_b = np.nan
+            prf = _binary_prf(yy, pp)
+            block_rows.append({
+                "block": block,
+                "n": len(sub),
+                "auc": auc_b,
+                "true_active_rate": yy.mean(),
+                "pred_active_rate": pp.mean(),
+                "p_active_minus_true": pp.mean() - yy.mean(),
+                **prf,
+            })
+        by_block = pd.DataFrame(block_rows)
+    else:
+        by_block = pd.DataFrame()
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("DEMAND ZERO / ACTIVE DETECTION DIAGNOSTICS")
+        print("=" * 90)
+        print("Preferred score:", preferred)
+        print("Overall threshold summary:")
+        print(summary)
+        print("\nBy horizon:")
+        print(by_horizon)
+        print("\nBy horizon block:")
+        print(by_block)
+
+    return {
+        "summary": summary,
+        "by_horizon": by_horizon,
+        "by_block": by_block,
+        "preferred_score": preferred,
+    }
+
+
+def demand_nb_distribution_diagnostics(
+    forecast_df,
+    true_col="fbi_demand",
+    mu_col="demand_nb_mu",
+    alpha_col="demand_nb_alpha",
+    nb_nll_col="demand_nb_nll",
+    poisson_nll_col="demand_poisson_nll",
+    verbose=True,
+):
+    """NB distribution assumption check for sparse demand."""
+    df = forecast_df.copy()
+    y = pd.to_numeric(df[true_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    rows = [{
+        "n": len(df),
+        "true_mean": y.mean(),
+        "true_var": y.var(ddof=1),
+        "var_over_mean": y.var(ddof=1) / max(y.mean(), 1e-8),
+        "zero_rate": (y == 0).mean(),
+        "active_rate": (y > 0).mean(),
+        "active_mean": y[y > 0].mean() if (y > 0).any() else np.nan,
+    }]
+    out = pd.DataFrame(rows)
+
+    if mu_col in df.columns:
+        mu = pd.to_numeric(df[mu_col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["pred_mu_mean"] = mu.mean()
+        out["pred_mu_true_ratio"] = mu.mean() / max(y.mean(), 1e-8)
+    if alpha_col in df.columns:
+        alpha = pd.to_numeric(df[alpha_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        out["alpha_mean"] = alpha.mean()
+        out["alpha_p50"] = alpha.median()
+        out["alpha_p90"] = alpha.quantile(0.90)
+    if nb_nll_col in df.columns and poisson_nll_col in df.columns:
+        nb_nll = pd.to_numeric(df[nb_nll_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        pois_nll = pd.to_numeric(df[poisson_nll_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        out["nb_nll_mean"] = nb_nll.mean()
+        out["poisson_nll_mean"] = pois_nll.mean()
+        out["nb_minus_poisson_nll"] = nb_nll.mean() - pois_nll.mean()
+        out["nb_better_than_poisson"] = bool(nb_nll.mean() < pois_nll.mean())
+
+    # mean/variance by ASIN, useful for showing over-dispersion visually later.
+    by_asin = (
+        df.assign(_y=y)
+        .groupby("asin")
+        .agg(n=("_y", "size"), mean=("_y", "mean"), var=("_y", "var"), zero_rate=("_y", lambda s: (s == 0).mean()))
+        .reset_index()
+    ) if "asin" in df.columns else pd.DataFrame()
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("DEMAND NB DISTRIBUTION ASSUMPTION DIAGNOSTICS")
+        print("=" * 90)
+        print(out.T)
+        if len(by_asin) > 0:
+            print("\nASIN mean/variance sample:")
+            print(by_asin.head(10))
+        print("\nInterpretation:")
+        print("- var_over_mean >> 1 supports NB over Poisson for over-dispersed sparse demand.")
+        print("- nb_minus_poisson_nll < 0 means NB fits the heldout demand better than Poisson.")
+
+    return {"summary": out, "by_asin": by_asin}
+
+
+def demand_exposure_graph_validation_diagnostics(
+    result,
+    verbose=True,
+):
+    """Demand-side check that exposure graph/rank context is present and useful."""
+    df = result.get("forecast_df", pd.DataFrame()).copy()
+    graph_cols = [c for c in df.columns if c.startswith("exposure_graph_") or c.startswith("expgraph_")]
+
+    # Forecast_df may not store all context columns, so also read global context info.
+    n_graph_context = int(globals().get("_DEMAND_EXPOSURE_GRAPH_CONTEXT_DIM", 0))
+    graph_context_cols = list(globals().get("_DEMAND_EXPOSURE_GRAPH_CONTEXT_COLS", []))
+
+    out = pd.DataFrame([{
+        "n_graph_context_cols": n_graph_context,
+        "stored_graph_cols_in_forecast_df": len(graph_cols),
+        "use_encoder_fusion": bool(globals().get("_DEMAND_USE_EXPOSURE_GRAPH_ENCODER_FUSION", False)),
+        "encoder_fusion_scale": float(globals().get("_DEMAND_EXPOSURE_GRAPH_ENCODER_SCALE", 0.0)),
+    }])
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("DEMAND EXPOSURE-GRAPH CONTEXT CHECK")
+        print("=" * 90)
+        print(out.T)
+        if graph_context_cols:
+            print("Graph context cols preview:", graph_context_cols[:30], "..." if len(graph_context_cols) > 30 else "")
+        print("\nInterpretation:")
+        print("- This checks whether demand is receiving exposure graph/rank context, not just DPH hats.")
+        print("- Compare graph+hat vs hats-only runs to validate impact on demand WAPE/zero detection.")
+
+    return {"summary": out, "graph_context_cols": graph_context_cols, "stored_graph_cols": graph_cols}
+
+
+def add_demand_validation_checks_to_result(result, verbose=True):
+    """
+    Add the three slide-ready demand validation checks to a result dict:
+      1) NB distribution assumption
+      2) Demand zero/active detection AUC + recall/precision
+      3) Exposure-graph context presence/usefulness check
+    """
+    if "forecast_df" not in result:
+        return result
+    forecast_df = result["forecast_df"]
+    result["demand_nb_distribution_diagnostics"] = demand_nb_distribution_diagnostics(forecast_df, verbose=verbose)
+    result["demand_zero_active_diagnostics"] = demand_active_zero_diagnostics(forecast_df, verbose=verbose)
+    result["demand_exposure_graph_validation_diagnostics"] = demand_exposure_graph_validation_diagnostics(result, verbose=verbose)
+    return result
 
 
 # =====================================================
@@ -1700,6 +2000,9 @@ def run_nb_high_sparse(
     print("\nUnderbias P50:"); print(diag_p50.T)
     print("\nUnderbias P70:"); print(diag_p70.T)
 
+    nb_distribution_diagnostics = demand_nb_distribution_diagnostics(forecast_df, verbose=True)
+    zero_active_diagnostics = demand_active_zero_diagnostics(forecast_df, verbose=True)
+
     return {
         "model": model,
         "forecast_df": forecast_df,
@@ -1707,6 +2010,8 @@ def run_nb_high_sparse(
         "diag_p50": diag_p50,
         "diag_p70": diag_p70,
         "mag_gap": mag_gap_df,
+        "demand_nb_distribution_diagnostics": nb_distribution_diagnostics,
+        "demand_zero_active_diagnostics": zero_active_diagnostics,
         "tr_ld": tr_ld,
         "va_ld": va_ld,
     }
@@ -2296,6 +2601,12 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     print("\nUnderbias P70:")
     print(diag_p70.T)
 
+    # Slide-ready demand checks:
+    # 1) NB distribution assumption, 2) zero/nonzero active detection,
+    # 3) exposure graph context validation.
+    nb_distribution_diagnostics = demand_nb_distribution_diagnostics(forecast_df, verbose=True)
+    zero_active_diagnostics = demand_active_zero_diagnostics(forecast_df, verbose=True)
+
     result = {
         "model": model,
         "forecast_df": forecast_df,
@@ -2313,6 +2624,8 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         "removed_extreme": removed_extreme,
         "extreme_cap": extreme_cap,
     }
+
+    result["demand_exposure_graph_validation_diagnostics"] = demand_exposure_graph_validation_diagnostics(result, verbose=True)
 
     if run_wape:
         result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
@@ -3354,7 +3667,7 @@ def run_demand_with_predicted_exposure_all_modes_graph(
 """
 USAGE IN JUPYTER
 ----------------
-%run -i demand_external_exposure3_with_exposure_graph_v2_all_modes_usage.py
+%run -i demand_external_exposure3_with_exposure_graph_v3_demand_zero_nb_graph_checks.py
 
 # Recommended: pass the FULL exposure_result from exposure V15, not only
 # exposure_hat_for_demand.  The full dict contains forecast_df with graph/rank
