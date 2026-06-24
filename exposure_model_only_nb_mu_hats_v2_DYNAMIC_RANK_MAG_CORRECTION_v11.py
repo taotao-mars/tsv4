@@ -2383,10 +2383,15 @@ class ExposureForecastModelV2(nn.Module):
                  category_shrinkage_k=100.0,
                  use_learned_edge_score=True, learned_edge_score_scale=1.0, rule_edge_prior_scale=0.25,
                  use_graph_encoder_fusion=True, graph_encoder_scale=0.05,
+                 # V17: targeted h13-h20 magnitude correction; keep graph same as V15_PKG,
+                 # but add a small horizon-specific log-multiplier for long-horizon drift.
+                 use_long_horizon_correction=True, long_horizon_start=13,
+                 long_horizon_correction_scale=0.06,
                  # Backward-compatible aliases; the old broad MLP group calibration is disabled by default.
                  use_group_calibration=False, group_calibration_scale=0.0):
         super().__init__()
         self.use_enn = use_enn
+        self.context_dim = int(context_dim)
         self.z_dim = int(z_dim)
         print(f"Exposure ENN regime enabled: {use_enn} | z_dim={z_dim}")
 
@@ -2424,6 +2429,11 @@ class ExposureForecastModelV2(nn.Module):
         # not only act as late-stage correction after the decoder.
         self.use_graph_encoder_fusion = bool(use_graph_encoder_fusion and self.use_graphsage)
         self.graph_encoder_scale = float(graph_encoder_scale)
+        # V17: long-horizon correction targets the observed h13-h20 magnitude decay.
+        # It is deliberately small and applied as a log-multiplier only for h >= long_horizon_start.
+        self.use_long_horizon_correction = bool(use_long_horizon_correction)
+        self.long_horizon_start = int(long_horizon_start)
+        self.long_horizon_correction_scale = float(long_horizon_correction_scale)
         # Keep the old broad context MLP only if explicitly requested.
         self.use_group_calibration = bool(use_group_calibration)
         self.group_calibration_scale = float(group_calibration_scale)
@@ -2483,7 +2493,7 @@ class ExposureForecastModelV2(nn.Module):
             self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
-            print(f"V15 LearnedEdge EarlyFusion DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
+            print(f"V17 LearnedEdge EarlyFusion DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
             print(f"Dynamic rank node features: dim={self.rank_feat_dim} | rank_correction={self.use_rank_correction} | scale={self.rank_correction_scale}")
             print(f"Category-only graph v12: sparse/event-aware dynamic rank + long-horizon floor + horizon + GL/category shrinkage calibration.")
         else:
@@ -2520,6 +2530,30 @@ class ExposureForecastModelV2(nn.Module):
             )
         else:
             self.rank_correction_head = None
+
+        # V17 long-horizon correction head. This is NOT a new exposure head.
+        # It learns a small multiplicative log correction for h13-h20 using the same
+        # ASIN graph/rank context that proved useful in V15_PKG.
+        if self.use_long_horizon_correction:
+            if self.use_graphsage:
+                long_in_dim = context_dim + self.graph_dim * 3 + self.rank_feat_dim
+            else:
+                long_in_dim = context_dim
+            hidden_long = max(64, min(192, long_in_dim * 2))
+            self.long_horizon_correction_head = nn.Sequential(
+                nn.Linear(long_in_dim, hidden_long),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_long, 32),
+                nn.ReLU(),
+                nn.Linear(32, 3),
+                nn.Tanh(),
+            )
+            # A separate free horizon bias lets the model fix systematic h13-h20 under/over drift.
+            self.long_horizon_bias = nn.Parameter(torch.zeros(int(horizon), 3))
+        else:
+            self.long_horizon_correction_head = None
+            self.register_parameter("long_horizon_bias", None)
 
         # V14 horizon calibration: target-specific log-multiplier by forecast horizon.
         # Initialized at 0; training learns small upward/downward corrections, especially h13-h20.
@@ -2558,7 +2592,8 @@ class ExposureForecastModelV2(nn.Module):
               f"horizon_calib={self.use_horizon_calibration}, scale={self.horizon_calibration_scale} | "
               f"gl_calib={self.use_gl_calibration}, scale={self.gl_calibration_scale} | "
               f"category_calib={self.use_category_calibration}, scale={self.category_calibration_scale}, shrink_k={self.category_shrinkage_k} | "
-              f"legacy_group_calib={self.use_group_calibration}, scale={self.group_calibration_scale}")
+              f"legacy_group_calib={self.use_group_calibration}, scale={self.group_calibration_scale} | "
+              f"long_horizon_correction={self.use_long_horizon_correction}, start={self.long_horizon_start}, scale={self.long_horizon_correction_scale}")
 
         if self.use_graphsage:
             # Horizon-level graph gates. These learn how much positive and competitive
@@ -2699,6 +2734,41 @@ class ExposureForecastModelV2(nn.Module):
             return dec_out
         return _adjust(dec_out)
 
+    def _apply_long_horizon_correction(self, dec_out, long_log_delta):
+        """
+        V17 targeted long-horizon magnitude correction.
+
+        Applies a small multiplicative correction on level scale:
+            level_final = level_base * exp(long_log_delta)
+
+        long_log_delta is masked to h >= long_horizon_start, so short horizons are unchanged.
+        """
+        if long_log_delta is None:
+            return dec_out
+
+        def _adjust(base_log_hat):
+            base_level = torch.expm1(base_log_hat).clamp(min=0.0)
+            final_level = base_level * torch.exp(long_log_delta)
+            return torch.log1p(final_level.clamp(min=0.0))
+
+        if isinstance(dec_out, dict):
+            base_log_hat = dec_out["log_hat"]
+            final_log_hat = _adjust(base_log_hat)
+            final_level = torch.expm1(final_log_hat).clamp(min=0.0)
+            dec_out = dict(dec_out)
+            dec_out["base_log_hat_before_long_horizon_correction"] = base_log_hat
+            dec_out["long_horizon_log_delta"] = long_log_delta
+            dec_out["long_horizon_correction_scale"] = torch.tensor(
+                self.long_horizon_correction_scale, dtype=base_log_hat.dtype, device=base_log_hat.device
+            )
+            dec_out["log_hat"] = final_log_hat
+            dec_out["log_mag"] = final_log_hat
+            dec_out["mag_level"] = final_level
+            dec_out["pred_level"] = final_level
+            dec_out["mu_level"] = final_level
+            return dec_out
+        return _adjust(dec_out)
+
     def _apply_graph_delta_head(self, dec_out, g):
         """
         V7 optional graph head.
@@ -2739,6 +2809,7 @@ class ExposureForecastModelV2(nn.Module):
         enc_out = self.encoder(x)
         g = None
         rank_log_delta = None
+        long_horizon_log_delta = None
 
         graph_aux = None
         if self.use_graphsage:
@@ -2795,6 +2866,24 @@ class ExposureForecastModelV2(nn.Module):
                 else:
                     h_scale = torch.ones(1, H, 1, device=orig_future_context.device, dtype=orig_future_context.dtype)
                 rank_log_delta = self.rank_correction_scale * h_scale * rank_raw_delta
+
+            # V17: targeted h13-h20 magnitude correction using graph/rank context.
+            # This is separate from rank correction and exists only to address long-horizon decay.
+            if self.use_long_horizon_correction and self.long_horizon_correction_head is not None:
+                if rank_feat is not None:
+                    long_rank_rep = rank_feat[:, None, :].expand(B, H, -1).to(orig_future_context.device, dtype=orig_future_context.dtype)
+                else:
+                    long_rank_rep = torch.zeros(B, H, 0, device=orig_future_context.device, dtype=orig_future_context.dtype)
+                g_self_rep_long = g_self[:, None, :].expand(B, H, -1)
+                g_pos_rep_long = g_pos[:, None, :].expand(B, H, -1)
+                g_comp_rep_long = g_comp[:, None, :].expand(B, H, -1)
+                long_in = torch.cat([orig_future_context, g_self_rep_long, g_pos_rep_long, g_comp_rep_long, long_rank_rep], dim=-1)
+                long_raw = self.long_horizon_correction_head(long_in)
+                long_bias = torch.tanh(self.long_horizon_bias[:H, :].to(orig_future_context.device, dtype=orig_future_context.dtype)).unsqueeze(0)
+                long_delta_raw = long_raw + long_bias
+                h_ids = torch.arange(H, device=orig_future_context.device).view(1, H, 1)
+                long_mask = (h_ids >= max(self.long_horizon_start - 1, 0)).to(orig_future_context.dtype)
+                long_horizon_log_delta = self.long_horizon_correction_scale * long_mask * long_delta_raw
 
             # V15 early graph fusion: condition the encoder memory on self/positive/competitive
             # graph messages before the decoder cross-attends to history. This makes graph
@@ -2887,8 +2976,17 @@ class ExposureForecastModelV2(nn.Module):
         else:
             gcal_delta = None
 
+        # If graph is off, still allow a context-only long-horizon correction.
+        if (long_horizon_log_delta is None) and self.use_long_horizon_correction and self.long_horizon_correction_head is not None:
+            long_raw = self.long_horizon_correction_head(future_context[:, :, :self.context_dim] if hasattr(self, "context_dim") else future_context)
+            long_bias = torch.tanh(self.long_horizon_bias[:H_fc, :].to(future_context.device, dtype=future_context.dtype)).unsqueeze(0)
+            h_ids = torch.arange(H_fc, device=future_context.device).view(1, H_fc, 1)
+            long_mask = (h_ids >= max(self.long_horizon_start - 1, 0)).to(future_context.dtype)
+            long_horizon_log_delta = self.long_horizon_correction_scale * long_mask * (long_raw + long_bias)
+
         dec_out = self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
         dec_out = self._apply_rank_correction_head(dec_out, calib_log_delta)
+        dec_out = self._apply_long_horizon_correction(dec_out, long_horizon_log_delta)
         dec_out = self._apply_graph_delta_head(dec_out, g)
         if return_aux and isinstance(dec_out, dict):
             if graph_aux is not None:
@@ -2897,6 +2995,10 @@ class ExposureForecastModelV2(nn.Module):
                 dec_out["calib_log_delta_total"] = calib_log_delta[:, :, 0]
                 dec_out["calib_log_delta_buybox"] = calib_log_delta[:, :, 1]
                 dec_out["calib_log_delta_instock"] = calib_log_delta[:, :, 2]
+            if long_horizon_log_delta is not None:
+                dec_out["long_horizon_log_delta_total"] = long_horizon_log_delta[:, :, 0]
+                dec_out["long_horizon_log_delta_buybox"] = long_horizon_log_delta[:, :, 1]
+                dec_out["long_horizon_log_delta_instock"] = long_horizon_log_delta[:, :, 2]
             if h_delta is not None:
                 dec_out["horizon_log_delta_total"] = h_delta[:, :, 0]
                 dec_out["horizon_log_delta_buybox"] = h_delta[:, :, 1]
@@ -4366,6 +4468,9 @@ def run_exposure_v2(
     use_category_calibration=True,
     category_calibration_scale=0.015,
     category_shrinkage_k=100.0,
+    use_long_horizon_correction=True,
+    long_horizon_start=13,
+    long_horizon_correction_scale=0.06,
     use_group_calibration=False,
     group_calibration_scale=0.0,
     graph_zero_weight=0.03,
@@ -4376,8 +4481,8 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V15: LEARNED EDGE + GRAPH EARLY FUSION + HORIZON/CAT CALIBRATION")
-    print("Preset: dynamic relation graph + sparse/event-aware rank prior + long-horizon calibration; MU hats for demand")
+    print("EXPOSURE MODEL V17: V15_PKG + LONG-HORIZON MAGNITUDE CORRECTION")
+    print("Preset: V15_PKG graph + h13-h20 magnitude correction; MU hats for demand")
     print("=" * 100)
 
     df = prepare_exposure_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -4432,6 +4537,9 @@ def run_exposure_v2(
         use_category_calibration=use_category_calibration,
         category_calibration_scale=category_calibration_scale,
         category_shrinkage_k=category_shrinkage_k,
+        use_long_horizon_correction=use_long_horizon_correction,
+        long_horizon_start=long_horizon_start,
+        long_horizon_correction_scale=long_horizon_correction_scale,
         use_group_calibration=use_group_calibration,
         group_calibration_scale=group_calibration_scale,
     )
@@ -4770,6 +4878,9 @@ def _train_one_exposure_window(
     use_category_calibration=True,
     category_calibration_scale=0.015,
     category_shrinkage_k=100.0,
+    use_long_horizon_correction=True,
+    long_horizon_start=13,
+    long_horizon_correction_scale=0.06,
     use_group_calibration=False,
     group_calibration_scale=0.0,
     use_encoder_self_attn=True,
@@ -4831,6 +4942,9 @@ def _train_one_exposure_window(
         use_category_calibration=use_category_calibration,
         category_calibration_scale=category_calibration_scale,
         category_shrinkage_k=category_shrinkage_k,
+        use_long_horizon_correction=use_long_horizon_correction,
+        long_horizon_start=long_horizon_start,
+        long_horizon_correction_scale=long_horizon_correction_scale,
         use_group_calibration=use_group_calibration,
         group_calibration_scale=group_calibration_scale,
     )
@@ -5693,6 +5807,9 @@ def run_exposure_v2_final_scot_5000(
     use_category_calibration=True,
     category_calibration_scale=0.015,
     category_shrinkage_k=100.0,
+    use_long_horizon_correction=True,
+    long_horizon_start=13,
+    long_horizon_correction_scale=0.06,
     use_group_calibration=False,
     group_calibration_scale=0.0,
     graph_zero_weight=0.03,
@@ -5741,6 +5858,9 @@ def run_exposure_v2_final_scot_5000(
         use_category_calibration=use_category_calibration,
         category_calibration_scale=category_calibration_scale,
         category_shrinkage_k=category_shrinkage_k,
+        use_long_horizon_correction=use_long_horizon_correction,
+        long_horizon_start=long_horizon_start,
+        long_horizon_correction_scale=long_horizon_correction_scale,
         use_group_calibration=use_group_calibration,
         group_calibration_scale=group_calibration_scale,
         graph_zero_weight=graph_zero_weight,
