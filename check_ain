@@ -1,0 +1,412 @@
+import pandas as pd
+import numpy as np
+
+def find_good_short_term_dynamic_category_example(
+    pair_df,
+    max_gap_weeks=4,
+    min_category_demand_sum=5000,
+    min_pair_demand_sum=100,
+    min_pair_total_dph_sum=1000,
+    min_score_strength=0.35,
+    top_n=20,
+    verbose=True,
+):
+    """
+    Find examples where the same ASIN pair within the same category switches relation
+    from positive <-> competitive within a short time window.
+
+    Required input:
+        pair_df: output from dynamic ASIN relation search.
+                 It should contain one row per ASIN pair per origin_week.
+
+    Main output:
+        out: dataframe with good short-term dynamic relation examples.
+    """
+
+    df = pair_df.copy()
+
+    if "origin_week" not in df.columns:
+        raise ValueError("pair_df must contain origin_week column.")
+
+    df["origin_week"] = pd.to_datetime(df["origin_week"])
+
+    # Only use positive / competitive relations
+    if "relation_label" not in df.columns:
+        raise ValueError("pair_df must contain relation_label column.")
+
+    df = df[df["relation_label"].isin(["positive", "competitive"])].copy()
+
+    if df.empty:
+        print("No positive or competitive relation rows found.")
+        return df
+
+    # Required ASIN columns
+    for col in ["asin_i", "asin_j", "category_code"]:
+        if col not in df.columns:
+            raise ValueError(f"pair_df must contain {col} column.")
+
+    # Canonical pair key, independent of asin_i / asin_j order
+    df["pair_key"] = df.apply(
+        lambda r: "||".join(sorted([str(r["asin_i"]), str(r["asin_j"])])),
+        axis=1
+    )
+
+    # Compatible GL columns
+    if "gl_product_group_i" not in df.columns:
+        if "gl_product_group" in df.columns:
+            df["gl_product_group_i"] = df["gl_product_group"]
+        else:
+            df["gl_product_group_i"] = np.nan
+
+    if "gl_product_group_desc_i" not in df.columns:
+        if "gl_product_group_desc" in df.columns:
+            df["gl_product_group_desc_i"] = df["gl_product_group_desc"]
+        else:
+            df["gl_product_group_desc_i"] = np.nan
+
+    # Make sure numeric feature columns exist
+    numeric_cols = [
+        "positive_score", "competitive_score", "distance", "rank_gap",
+        "r13_demand_i", "r13_demand_j",
+        "r13_total_i", "r13_total_j",
+        "r13_buybox_i", "r13_buybox_j",
+        "r13_instock_i", "r13_instock_j",
+        "promo_i", "promo_j",
+        "price_i", "price_j",
+        "hbt_i", "hbt_j",
+        "top10_i", "top10_j",
+    ]
+
+    for col in numeric_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Pair-level activity
+    df["pair_demand_sum"] = df["r13_demand_i"].fillna(0) + df["r13_demand_j"].fillna(0)
+    df["pair_total_dph_sum"] = df["r13_total_i"].fillna(0) + df["r13_total_j"].fillna(0)
+    df["pair_buybox_dph_sum"] = df["r13_buybox_i"].fillna(0) + df["r13_buybox_j"].fillna(0)
+    df["pair_instock_dph_sum"] = df["r13_instock_i"].fillna(0) + df["r13_instock_j"].fillna(0)
+
+    # Category-level activity
+    cat_stats = (
+        df.groupby("category_code", dropna=False)
+        .agg(
+            category_rows=("pair_key", "size"),
+            category_pair_count=("pair_key", "nunique"),
+            category_demand_sum=("pair_demand_sum", "sum"),
+            category_total_dph_sum=("pair_total_dph_sum", "sum"),
+            category_buybox_dph_sum=("pair_buybox_dph_sum", "sum"),
+            category_instock_dph_sum=("pair_instock_dph_sum", "sum"),
+        )
+        .reset_index()
+    )
+
+    df = df.merge(cat_stats, on="category_code", how="left")
+
+    rows = []
+
+    group_cols = ["category_code", "pair_key"]
+
+    for _, g in df.sort_values("origin_week").groupby(group_cols, dropna=False):
+        g = g.sort_values("origin_week").reset_index(drop=True)
+
+        for k in range(1, len(g)):
+            prev = g.iloc[k - 1]
+            cur = g.iloc[k]
+
+            gap_weeks = (cur["origin_week"] - prev["origin_week"]).days / 7.0
+
+            # Need short-term switch
+            if gap_weeks > max_gap_weeks:
+                continue
+
+            # Need positive <-> competitive switch
+            if prev["relation_label"] == cur["relation_label"]:
+                continue
+
+            # Need category activity
+            if cur["category_demand_sum"] < min_category_demand_sum:
+                continue
+
+            # Need pair activity
+            if max(prev["pair_demand_sum"], cur["pair_demand_sum"]) < min_pair_demand_sum:
+                continue
+
+            if max(prev["pair_total_dph_sum"], cur["pair_total_dph_sum"]) < min_pair_total_dph_sum:
+                continue
+
+            prev_strength = max(
+                0 if pd.isna(prev["positive_score"]) else prev["positive_score"],
+                0 if pd.isna(prev["competitive_score"]) else prev["competitive_score"],
+            )
+            cur_strength = max(
+                0 if pd.isna(cur["positive_score"]) else cur["positive_score"],
+                0 if pd.isna(cur["competitive_score"]) else cur["competitive_score"],
+            )
+
+            if min(prev_strength, cur_strength) < min_score_strength:
+                continue
+
+            row = {
+                "category_code": cur["category_code"],
+                "gl_product_group": cur["gl_product_group_i"],
+                "gl_product_group_desc": cur["gl_product_group_desc_i"],
+
+                "asin_i": cur["asin_i"],
+                "asin_j": cur["asin_j"],
+
+                "prev_origin_week": prev["origin_week"].date(),
+                "origin_week": cur["origin_week"].date(),
+                "gap_weeks": gap_weeks,
+
+                "prev_label": prev["relation_label"],
+                "current_label": cur["relation_label"],
+                "switch_type": f'{prev["relation_label"]}_to_{cur["relation_label"]}',
+
+                "prev_positive_score": prev["positive_score"],
+                "positive_score": cur["positive_score"],
+                "prev_competitive_score": prev["competitive_score"],
+                "competitive_score": cur["competitive_score"],
+
+                "prev_distance": prev["distance"],
+                "distance": cur["distance"],
+                "delta_distance": cur["distance"] - prev["distance"],
+
+                "prev_rank_gap": prev["rank_gap"],
+                "rank_gap": cur["rank_gap"],
+                "delta_rank_gap": cur["rank_gap"] - prev["rank_gap"],
+
+                "prev_pair_demand_sum": prev["pair_demand_sum"],
+                "pair_demand_sum": cur["pair_demand_sum"],
+                "delta_pair_demand_sum": cur["pair_demand_sum"] - prev["pair_demand_sum"],
+
+                "prev_pair_total_dph_sum": prev["pair_total_dph_sum"],
+                "pair_total_dph_sum": cur["pair_total_dph_sum"],
+                "delta_pair_total_dph_sum": cur["pair_total_dph_sum"] - prev["pair_total_dph_sum"],
+
+                "prev_pair_buybox_dph_sum": prev["pair_buybox_dph_sum"],
+                "pair_buybox_dph_sum": cur["pair_buybox_dph_sum"],
+                "delta_pair_buybox_dph_sum": cur["pair_buybox_dph_sum"] - prev["pair_buybox_dph_sum"],
+
+                "prev_pair_instock_dph_sum": prev["pair_instock_dph_sum"],
+                "pair_instock_dph_sum": cur["pair_instock_dph_sum"],
+                "delta_pair_instock_dph_sum": cur["pair_instock_dph_sum"] - prev["pair_instock_dph_sum"],
+
+                "prev_r13_demand_i": prev["r13_demand_i"],
+                "r13_demand_i": cur["r13_demand_i"],
+                "prev_r13_demand_j": prev["r13_demand_j"],
+                "r13_demand_j": cur["r13_demand_j"],
+
+                "prev_r13_total_i": prev["r13_total_i"],
+                "r13_total_i": cur["r13_total_i"],
+                "prev_r13_total_j": prev["r13_total_j"],
+                "r13_total_j": cur["r13_total_j"],
+
+                "prev_r13_buybox_i": prev["r13_buybox_i"],
+                "r13_buybox_i": cur["r13_buybox_i"],
+                "prev_r13_buybox_j": prev["r13_buybox_j"],
+                "r13_buybox_j": cur["r13_buybox_j"],
+
+                "prev_r13_instock_i": prev["r13_instock_i"],
+                "r13_instock_i": cur["r13_instock_i"],
+                "prev_r13_instock_j": prev["r13_instock_j"],
+                "r13_instock_j": cur["r13_instock_j"],
+
+                "prev_promo_i": prev["promo_i"],
+                "promo_i": cur["promo_i"],
+                "prev_promo_j": prev["promo_j"],
+                "promo_j": cur["promo_j"],
+
+                "prev_price_i": prev["price_i"],
+                "price_i": cur["price_i"],
+                "prev_price_j": prev["price_j"],
+                "price_j": cur["price_j"],
+
+                "hbt_i": cur["hbt_i"],
+                "hbt_j": cur["hbt_j"],
+                "top10_i": cur["top10_i"],
+                "top10_j": cur["top10_j"],
+
+                "category_demand_sum": cur["category_demand_sum"],
+                "category_total_dph_sum": cur["category_total_dph_sum"],
+                "category_buybox_dph_sum": cur["category_buybox_dph_sum"],
+                "category_instock_dph_sum": cur["category_instock_dph_sum"],
+                "category_pair_count": cur["category_pair_count"],
+            }
+
+            rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        print("没有找到满足条件的 4 周内 positive <-> competitive 切换例子。")
+        print("建议放宽参数，比如：")
+        print("min_category_demand_sum=2000")
+        print("min_pair_demand_sum=50")
+        print("min_pair_total_dph_sum=500")
+        print("min_score_strength=0.25")
+        return out
+
+    out["relation_strength"] = out[
+        [
+            "prev_positive_score",
+            "positive_score",
+            "prev_competitive_score",
+            "competitive_score",
+        ]
+    ].max(axis=1)
+
+    # More useful examples first:
+    # short gap, high pair demand, active category, strong relation score
+    out = out.sort_values(
+        [
+            "gap_weeks",
+            "pair_demand_sum",
+            "pair_total_dph_sum",
+            "category_demand_sum",
+            "relation_strength",
+        ],
+        ascending=[True, False, False, False, False],
+    ).head(top_n)
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("GOOD SHORT-TERM DYNAMIC RELATION EXAMPLES")
+        print("=" * 100)
+
+        for idx, r in out.iterrows():
+            print("\n" + "=" * 100)
+            print(f"Category: {r['category_code']} | GL: {r['gl_product_group']} | {r['gl_product_group_desc']}")
+            print(f"ASIN_i: {r['asin_i']}")
+            print(f"ASIN_j: {r['asin_j']}")
+            print(
+                f"Switch: {r['prev_label']} -> {r['current_label']} | "
+                f"{r['prev_origin_week']} -> {r['origin_week']} | "
+                f"gap={r['gap_weeks']:.1f} weeks"
+            )
+
+            print("\nRelation scores:")
+            print(f"  Positive score:     {r['prev_positive_score']:.4f} -> {r['positive_score']:.4f}")
+            print(f"  Competitive score:  {r['prev_competitive_score']:.4f} -> {r['competitive_score']:.4f}")
+            print(f"  Distance:           {r['prev_distance']:.4f} -> {r['distance']:.4f} | delta={r['delta_distance']:.4f}")
+            print(f"  Rank gap:           {r['prev_rank_gap']:.4f} -> {r['rank_gap']:.4f} | delta={r['delta_rank_gap']:.4f}")
+
+            print("\nPair activity:")
+            print(f"  Pair demand sum:      {r['prev_pair_demand_sum']:.1f} -> {r['pair_demand_sum']:.1f} | delta={r['delta_pair_demand_sum']:.1f}")
+            print(f"  Pair total DPH sum:   {r['prev_pair_total_dph_sum']:.1f} -> {r['pair_total_dph_sum']:.1f} | delta={r['delta_pair_total_dph_sum']:.1f}")
+            print(f"  Pair buybox DPH sum:  {r['prev_pair_buybox_dph_sum']:.1f} -> {r['pair_buybox_dph_sum']:.1f} | delta={r['delta_pair_buybox_dph_sum']:.1f}")
+            print(f"  Pair instock DPH sum: {r['prev_pair_instock_dph_sum']:.1f} -> {r['pair_instock_dph_sum']:.1f} | delta={r['delta_pair_instock_dph_sum']:.1f}")
+
+            print("\nASIN-level recent 13-week values:")
+            print(f"  ASIN_i demand:  {r['prev_r13_demand_i']:.1f} -> {r['r13_demand_i']:.1f}")
+            print(f"  ASIN_j demand:  {r['prev_r13_demand_j']:.1f} -> {r['r13_demand_j']:.1f}")
+            print(f"  ASIN_i total:   {r['prev_r13_total_i']:.1f} -> {r['r13_total_i']:.1f}")
+            print(f"  ASIN_j total:   {r['prev_r13_total_j']:.1f} -> {r['r13_total_j']:.1f}")
+            print(f"  ASIN_i buybox:  {r['prev_r13_buybox_i']:.1f} -> {r['r13_buybox_i']:.1f}")
+            print(f"  ASIN_j buybox:  {r['prev_r13_buybox_j']:.1f} -> {r['r13_buybox_j']:.1f}")
+            print(f"  ASIN_i instock: {r['prev_r13_instock_i']:.1f} -> {r['r13_instock_i']:.1f}")
+            print(f"  ASIN_j instock: {r['prev_r13_instock_j']:.1f} -> {r['r13_instock_j']:.1f}")
+
+            print("\nPromo / price / static:")
+            print(f"  ASIN_i promo: {r['prev_promo_i']} -> {r['promo_i']} | price: {r['prev_price_i']} -> {r['price_i']}")
+            print(f"  ASIN_j promo: {r['prev_promo_j']} -> {r['promo_j']} | price: {r['prev_price_j']} -> {r['price_j']}")
+            print(f"  HBT_i={r['hbt_i']} | HBT_j={r['hbt_j']} | top10_i={r['top10_i']} | top10_j={r['top10_j']}")
+
+            print("\nCategory activity:")
+            print(f"  Category demand sum:      {r['category_demand_sum']:.1f}")
+            print(f"  Category total DPH sum:   {r['category_total_dph_sum']:.1f}")
+            print(f"  Category buybox DPH sum:  {r['category_buybox_dph_sum']:.1f}")
+            print(f"  Category instock DPH sum: {r['category_instock_dph_sum']:.1f}")
+            print(f"  Category pair count:      {r['category_pair_count']}")
+
+    return out
+
+
+# =========================
+# Run strict version first
+# =========================
+
+good_dynamic_examples = find_good_short_term_dynamic_category_example(
+    pair_df=pair_df,
+    max_gap_weeks=4,
+    min_category_demand_sum=5000,
+    min_pair_demand_sum=100,
+    min_pair_total_dph_sum=1000,
+    min_score_strength=0.35,
+    top_n=20,
+    verbose=True,
+)
+
+display(good_dynamic_examples)
+
+
+# =========================
+# If empty, run relaxed version
+# =========================
+
+if good_dynamic_examples.empty:
+    print("\nRunning relaxed search...\n")
+
+    good_dynamic_examples = find_good_short_term_dynamic_category_example(
+        pair_df=pair_df,
+        max_gap_weeks=4,
+        min_category_demand_sum=2000,
+        min_pair_demand_sum=50,
+        min_pair_total_dph_sum=500,
+        min_score_strength=0.25,
+        top_n=20,
+        verbose=True,
+    )
+
+    display(good_dynamic_examples)
+
+
+# =========================
+# Optional: inspect full time path of the first example
+# =========================
+
+if not good_dynamic_examples.empty:
+    first = good_dynamic_examples.iloc[0]
+    target_pair = {str(first["asin_i"]), str(first["asin_j"])}
+    target_category = first["category_code"]
+
+    full_pair_path = pair_df[
+        (pair_df["category_code"] == target_category) &
+        (pair_df.apply(lambda r: {str(r["asin_i"]), str(r["asin_j"])} == target_pair, axis=1))
+    ].sort_values("origin_week")
+
+    print("\n" + "=" * 100)
+    print("FULL TIME PATH FOR FIRST EXAMPLE")
+    print("=" * 100)
+    print(f"Category: {target_category}")
+    print(f"ASIN pair: {target_pair}")
+
+    cols_to_show = [
+        "origin_week",
+        "category_code",
+        "gl_product_group_i",
+        "gl_product_group_desc_i",
+        "asin_i",
+        "asin_j",
+        "relation_label",
+        "positive_score",
+        "competitive_score",
+        "distance",
+        "rank_gap",
+        "r13_demand_i",
+        "r13_demand_j",
+        "r13_total_i",
+        "r13_total_j",
+        "r13_buybox_i",
+        "r13_buybox_j",
+        "r13_instock_i",
+        "r13_instock_j",
+        "promo_i",
+        "promo_j",
+        "price_i",
+        "price_j",
+    ]
+
+    cols_to_show = [c for c in cols_to_show if c in full_pair_path.columns]
+
+    display(full_pair_path[cols_to_show])
