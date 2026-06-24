@@ -570,6 +570,22 @@ def _build_graphsage_assets(
             price_mean = float(_safe_numeric(g.get("list_price", 0.0)).clip(lower=0.0).mean())
         else:
             price_mean = 0.0
+        # V15-PKG: physical comparability features for graph edges.
+        # Package fields are static/slow-moving, so use historical median before origin.
+        def _pkg_median(col):
+            if col not in g.columns:
+                return 0.0
+            x = _safe_numeric(g[col]).clip(lower=0.0)
+            x = x.replace([np.inf, -np.inf], np.nan).dropna()
+            return float(x.median()) if len(x) else 0.0
+
+        pkg_height = _pkg_median("pkg_height")
+        pkg_length = _pkg_median("pkg_length")
+        pkg_width  = _pkg_median("pkg_width")
+        pkg_weight = _pkg_median("pkg_weight")
+        pkg_volume = float(pkg_height * pkg_length * pkg_width) if (pkg_height > 0 and pkg_length > 0 and pkg_width > 0) else 0.0
+        pkg_complete = float(pkg_height > 0 and pkg_length > 0 and pkg_width > 0 and pkg_weight > 0)
+
         # Prefer customer_active_review_count if present; fall back to customer_review_count.
         review_col = "customer_active_review_count" if "customer_active_review_count" in g.columns else ("customer_review_count" if "customer_review_count" in g.columns else None)
         review_last = float(_safe_numeric(g[review_col]).clip(lower=0.0).iloc[-1]) if review_col is not None and len(g) else 0.0
@@ -705,6 +721,13 @@ def _build_graphsage_assets(
             # static / business
             "ind_top10_brand": topbrand,
             "log_price_mean": np.log1p(price_mean),
+            # V15-PKG: package size/weight node features used as pairwise edge gaps.
+            "log_pkg_height": np.log1p(pkg_height),
+            "log_pkg_length": np.log1p(pkg_length),
+            "log_pkg_width": np.log1p(pkg_width),
+            "log_pkg_weight": np.log1p(pkg_weight),
+            "log_pkg_volume": np.log1p(pkg_volume),
+            "pkg_complete": pkg_complete,
             "log_review_last": np.log1p(review_last),
             "promo_rate": promo_rate,
             "prime_rate": prime_rate,
@@ -909,7 +932,8 @@ def _build_graphsage_assets(
     transition_cols = ["active_to_zero_rate", "zero_to_active_rate", "log_avg_active_spell", "log_avg_zero_spell", "last_active_streak", "last_zero_streak", "weeks_since_last_positive"]
     static_cols = ["gl_product_group_code", "gl_product_group_freq", "category_code_code", "category_code_freq", "category_is_unknown",
                    "hbt_code", "hbt_freq", "hbt_is_unknown", "hbt_is_head", "hbt_is_body", "hbt_is_tail",
-                   "log_price_mean", "log_review_last", "promo_rate", "prime_rate"]
+                   "log_price_mean", "log_pkg_height", "log_pkg_length", "log_pkg_width", "log_pkg_weight", "log_pkg_volume", "pkg_complete",
+                   "log_review_last", "promo_rate", "prime_rate"]
     brand_cols = ["ind_top10_brand"]
     node_feature_cols = list(dict.fromkeys(
         zero_cols + level_peak_cols + demand_cols + transition_cols + static_cols + brand_cols +
@@ -1001,6 +1025,14 @@ def _build_graphsage_assets(
     z_instock_q90  = _z_arr("log_instock_q90")
     z_demand_q90   = _z_arr("log_demand_q90")
     z_price        = _z_arr("log_price_mean")
+    # V15-PKG: package size/weight gaps are edge-level features. Use raw log gaps,
+    # not z gaps, so thresholds/penalties remain interpretable.
+    log_pkg_height = feat.get("log_pkg_height", pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    log_pkg_length = feat.get("log_pkg_length", pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    log_pkg_width  = feat.get("log_pkg_width",  pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    log_pkg_weight = feat.get("log_pkg_weight", pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    log_pkg_volume = feat.get("log_pkg_volume", pd.Series(np.zeros(N))).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    pkg_complete_arr = feat.get("pkg_complete", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
     promo_arr      = feat.get("promo_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
     prime_arr      = feat.get("prime_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
     instock_ar     = feat.get("instock_active_rate", pd.Series(np.zeros(N))).astype(float).fillna(0.0).values
@@ -1025,6 +1057,34 @@ def _build_graphsage_assets(
         active_gap = (np.abs(instock_ar[cand] - instock_ar[i]) + np.abs(demand_ar[cand] - demand_ar[i])) / 2.0
         zero_gap = (np.abs(total_zero[cand] - total_zero[i]) + np.abs(buybox_zero[cand] - buybox_zero[i]) + np.abs(instock_zero[cand] - instock_zero[i])) / 3.0
         price_gap = np.abs(z_price[cand] - z_price[i])
+        # V15-PKG: physical comparability. Positive edges are heavily penalized
+        # when package height/length/width/weight/volume are far apart.
+        pkg_height_gap = np.abs(log_pkg_height[cand] - log_pkg_height[i])
+        pkg_length_gap = np.abs(log_pkg_length[cand] - log_pkg_length[i])
+        pkg_width_gap  = np.abs(log_pkg_width[cand]  - log_pkg_width[i])
+        pkg_weight_gap = np.abs(log_pkg_weight[cand] - log_pkg_weight[i])
+        pkg_volume_gap = np.abs(log_pkg_volume[cand] - log_pkg_volume[i])
+        pkg_distance = np.sqrt(pkg_height_gap ** 2 + pkg_length_gap ** 2 + pkg_width_gap ** 2 + pkg_weight_gap ** 2)
+        pkg_both_complete = ((pkg_complete_arr[cand] > 0.5) & (pkg_complete_arr[i] > 0.5)).astype(float)
+        pkg_size_similar_strict = (
+            (pkg_both_complete > 0.5)
+            & (pkg_height_gap <= 0.35)
+            & (pkg_length_gap <= 0.35)
+            & (pkg_width_gap  <= 0.35)
+            & (pkg_weight_gap <= 0.50)
+            & (pkg_volume_gap <= 0.70)
+            & (pkg_distance <= 0.90)
+        ).astype(float)
+        pkg_size_similar_relaxed = (
+            (pkg_both_complete > 0.5)
+            & (pkg_height_gap <= 0.45)
+            & (pkg_length_gap <= 0.45)
+            & (pkg_width_gap  <= 0.45)
+            & (pkg_weight_gap <= 0.65)
+            & (pkg_volume_gap <= 0.90)
+            & (pkg_distance <= 1.10)
+        ).astype(float)
+        pkg_not_comparable = 1.0 - pkg_size_similar_relaxed
         promo_gap = np.abs(promo_arr[cand] - promo_arr[i])
         prime_gap = np.abs(prime_arr[cand] - prime_arr[i])
         same_hbt = (hbt_arr[cand] == hbt_arr[i]).astype(float)
@@ -1044,6 +1104,10 @@ def _build_graphsage_assets(
             - 0.75 * active_gap
             - 0.55 * zero_gap
             - 0.45 * price_gap
+            - 0.75 * pkg_distance
+            - 0.45 * pkg_volume_gap
+            - 0.35 * pkg_weight_gap
+            + 0.35 * pkg_size_similar_strict
             - 0.65 * promo_gap
             - 0.15 * prime_gap
             + 0.42 * same_hbt
@@ -1061,6 +1125,9 @@ def _build_graphsage_assets(
             + 0.35 * price_gap
             + 0.45 * promo_gap
             + 0.20 * prime_gap
+            + 0.30 * pkg_size_similar_relaxed
+            - 0.35 * pkg_not_comparable
+            - 0.20 * pkg_distance
         )
         return pos_score, comp_score, {
             "level_gap": level_gap,
@@ -1068,6 +1135,16 @@ def _build_graphsage_assets(
             "active_gap": active_gap,
             "zero_gap": zero_gap,
             "price_gap": price_gap,
+            "pkg_height_gap": pkg_height_gap,
+            "pkg_length_gap": pkg_length_gap,
+            "pkg_width_gap": pkg_width_gap,
+            "pkg_weight_gap": pkg_weight_gap,
+            "pkg_volume_gap": pkg_volume_gap,
+            "pkg_distance": pkg_distance,
+            "pkg_both_complete": pkg_both_complete,
+            "pkg_size_similar_strict": pkg_size_similar_strict,
+            "pkg_size_similar_relaxed": pkg_size_similar_relaxed,
+            "pkg_not_comparable": pkg_not_comparable,
             "promo_gap": promo_gap,
             "prime_gap": prime_gap,
             "same_hbt": same_hbt,
@@ -1085,7 +1162,10 @@ def _build_graphsage_assets(
     # so EdgeMLP can learn how to weight positive/competitive messages end-to-end.
     edge_feature_names = [
         "rule_pos_score", "rule_comp_score",
-        "level_gap", "peak_gap", "active_gap", "zero_gap", "price_gap", "promo_gap", "prime_gap",
+        "level_gap", "peak_gap", "active_gap", "zero_gap", "price_gap",
+        "pkg_height_gap", "pkg_length_gap", "pkg_width_gap", "pkg_weight_gap", "pkg_volume_gap",
+        "pkg_distance", "pkg_both_complete", "pkg_size_similar_strict", "pkg_size_similar_relaxed", "pkg_not_comparable",
+        "promo_gap", "prime_gap",
         "same_hbt", "hbt_diff", "brand_same", "brand_diff",
         "funnel_strength_gap", "demand_gap", "stronger", "stronger_demand", "stronger_top10",
     ]
