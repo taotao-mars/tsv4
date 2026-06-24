@@ -1,57 +1,198 @@
 import pandas as pd
 import numpy as np
 
-def find_good_short_term_dynamic_category_example(
+def _pick_first_existing_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _attach_pkg_features_from_raw(
     pair_df,
+    data_raw1,
+    asin_col="asin",
+):
+    """
+    Attach package features to pair_df if pair_df does not already contain pkg_*_i / pkg_*_j.
+
+    It creates:
+        pkg_height_i, pkg_height_j
+        pkg_length_i, pkg_length_j
+        pkg_width_i,  pkg_width_j
+        pkg_weight_i, pkg_weight_j
+    """
+
+    df = pair_df.copy()
+    raw = data_raw1.copy()
+
+    raw[asin_col] = raw[asin_col].astype(str)
+    df["asin_i"] = df["asin_i"].astype(str)
+    df["asin_j"] = df["asin_j"].astype(str)
+
+    pkg_map = {
+        "pkg_height": [
+            "pkg_height", "package_height", "item_package_height",
+            "pkg_height_value", "package_height_value"
+        ],
+        "pkg_length": [
+            "pkg_length", "package_length", "item_package_length",
+            "pkg_length_value", "package_length_value"
+        ],
+        "pkg_width": [
+            "pkg_width", "package_width", "item_package_width",
+            "pkg_width_value", "package_width_value"
+        ],
+        "pkg_weight": [
+            "pkg_weight", "package_weight", "item_package_weight",
+            "pkg_weight_value", "package_weight_value"
+        ],
+    }
+
+    selected_cols = {}
+    for base, candidates in pkg_map.items():
+        col = _pick_first_existing_col(raw, candidates)
+        selected_cols[base] = col
+
+    print("Detected raw package columns:")
+    for base, col in selected_cols.items():
+        print(f"  {base}: {col}")
+
+    missing = [base for base, col in selected_cols.items() if col is None]
+    if missing:
+        raise ValueError(
+            f"Cannot find package columns in data_raw1 for: {missing}. "
+            f"Please check raw columns: {list(raw.columns)[:80]}..."
+        )
+
+    # Use median by ASIN; package should be mostly static, median is robust.
+    pkg_profile = raw[[asin_col] + list(selected_cols.values())].copy()
+
+    for c in selected_cols.values():
+        pkg_profile[c] = pd.to_numeric(pkg_profile[c], errors="coerce")
+
+    agg_dict = {
+        selected_cols["pkg_height"]: "median",
+        selected_cols["pkg_length"]: "median",
+        selected_cols["pkg_width"]: "median",
+        selected_cols["pkg_weight"]: "median",
+    }
+
+    pkg_profile = (
+        pkg_profile
+        .groupby(asin_col, as_index=False)
+        .agg(agg_dict)
+        .rename(columns={
+            selected_cols["pkg_height"]: "pkg_height",
+            selected_cols["pkg_length"]: "pkg_length",
+            selected_cols["pkg_width"]: "pkg_width",
+            selected_cols["pkg_weight"]: "pkg_weight",
+        })
+    )
+
+    pkg_i = pkg_profile.rename(columns={
+        asin_col: "asin_i",
+        "pkg_height": "pkg_height_i",
+        "pkg_length": "pkg_length_i",
+        "pkg_width": "pkg_width_i",
+        "pkg_weight": "pkg_weight_i",
+    })
+
+    pkg_j = pkg_profile.rename(columns={
+        asin_col: "asin_j",
+        "pkg_height": "pkg_height_j",
+        "pkg_length": "pkg_length_j",
+        "pkg_width": "pkg_width_j",
+        "pkg_weight": "pkg_weight_j",
+    })
+
+    # Only attach if missing; if already present, keep existing.
+    need_attach_i = any(c not in df.columns for c in ["pkg_height_i", "pkg_length_i", "pkg_width_i", "pkg_weight_i"])
+    need_attach_j = any(c not in df.columns for c in ["pkg_height_j", "pkg_length_j", "pkg_width_j", "pkg_weight_j"])
+
+    if need_attach_i:
+        df = df.merge(pkg_i, on="asin_i", how="left")
+
+    if need_attach_j:
+        df = df.merge(pkg_j, on="asin_j", how="left")
+
+    return df
+
+
+def find_good_short_term_dynamic_category_example_strict_pkg(
+    pair_df,
+    data_raw1=None,
+
     max_gap_weeks=4,
+
+    # volume filters
     min_category_demand_sum=5000,
     min_pair_demand_sum=100,
     min_pair_total_dph_sum=1000,
     min_score_strength=0.35,
+
+    # strict package similarity thresholds
+    max_height_log_gap=0.35,
+    max_length_log_gap=0.35,
+    max_width_log_gap=0.35,
+    max_weight_log_gap=0.50,
+    max_volume_log_gap=0.70,
+    max_pkg_distance=0.90,
+
     top_n=20,
     verbose=True,
 ):
     """
-    Find examples where the same ASIN pair within the same category switches relation
-    from positive <-> competitive within a short time window.
+    Find examples where:
+      - same category
+      - same / similar package size and weight, hard required
+      - positive <-> competitive switch within max_gap_weeks
+      - category and ASIN pair have decent volume
 
-    Required input:
-        pair_df: output from dynamic ASIN relation search.
-                 It should contain one row per ASIN pair per origin_week.
+    Inputs:
+      pair_df:
+          output from dynamic relation search.
+      data_raw1:
+          optional raw data, used to attach pkg_height/pkg_length/pkg_width/pkg_weight
+          if pair_df does not have package columns.
 
-    Main output:
-        out: dataframe with good short-term dynamic relation examples.
+    Returns:
+      out dataframe.
     """
 
     df = pair_df.copy()
 
-    if "origin_week" not in df.columns:
-        raise ValueError("pair_df must contain origin_week column.")
+    required = ["origin_week", "relation_label", "asin_i", "asin_j", "category_code"]
+    for c in required:
+        if c not in df.columns:
+            raise ValueError(f"pair_df must contain column: {c}")
 
     df["origin_week"] = pd.to_datetime(df["origin_week"])
+    df["asin_i"] = df["asin_i"].astype(str)
+    df["asin_j"] = df["asin_j"].astype(str)
 
-    # Only use positive / competitive relations
-    if "relation_label" not in df.columns:
-        raise ValueError("pair_df must contain relation_label column.")
+    # Attach package cols if missing
+    pkg_required = [
+        "pkg_height_i", "pkg_length_i", "pkg_width_i", "pkg_weight_i",
+        "pkg_height_j", "pkg_length_j", "pkg_width_j", "pkg_weight_j",
+    ]
 
+    if any(c not in df.columns for c in pkg_required):
+        if data_raw1 is None:
+            raise ValueError(
+                "pair_df does not contain pkg_*_i/j columns. "
+                "Please pass data_raw1=data_raw1 so package features can be attached."
+            )
+        df = _attach_pkg_features_from_raw(df, data_raw1=data_raw1)
+
+    # Only positive / competitive
     df = df[df["relation_label"].isin(["positive", "competitive"])].copy()
 
     if df.empty:
-        print("No positive or competitive relation rows found.")
+        print("No positive / competitive rows found.")
         return df
 
-    # Required ASIN columns
-    for col in ["asin_i", "asin_j", "category_code"]:
-        if col not in df.columns:
-            raise ValueError(f"pair_df must contain {col} column.")
-
-    # Canonical pair key, independent of asin_i / asin_j order
-    df["pair_key"] = df.apply(
-        lambda r: "||".join(sorted([str(r["asin_i"]), str(r["asin_j"])])),
-        axis=1
-    )
-
-    # Compatible GL columns
+    # GL compatibility
     if "gl_product_group_i" not in df.columns:
         if "gl_product_group" in df.columns:
             df["gl_product_group_i"] = df["gl_product_group"]
@@ -64,30 +205,121 @@ def find_good_short_term_dynamic_category_example(
         else:
             df["gl_product_group_desc_i"] = np.nan
 
-    # Make sure numeric feature columns exist
+    # Numeric columns
     numeric_cols = [
         "positive_score", "competitive_score", "distance", "rank_gap",
+
         "r13_demand_i", "r13_demand_j",
         "r13_total_i", "r13_total_j",
         "r13_buybox_i", "r13_buybox_j",
         "r13_instock_i", "r13_instock_j",
+
         "promo_i", "promo_j",
         "price_i", "price_j",
         "hbt_i", "hbt_j",
         "top10_i", "top10_j",
+
+        "pkg_height_i", "pkg_length_i", "pkg_width_i", "pkg_weight_i",
+        "pkg_height_j", "pkg_length_j", "pkg_width_j", "pkg_weight_j",
     ]
 
     for col in numeric_cols:
         if col not in df.columns:
             df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Pair-level activity
+    # Canonical pair key
+    df["pair_key"] = df.apply(
+        lambda r: "||".join(sorted([str(r["asin_i"]), str(r["asin_j"])])),
+        axis=1
+    )
+
+    # -----------------------------
+    # Strict package hard filter
+    # -----------------------------
+    pkg_cols = [
+        "pkg_height_i", "pkg_length_i", "pkg_width_i", "pkg_weight_i",
+        "pkg_height_j", "pkg_length_j", "pkg_width_j", "pkg_weight_j",
+    ]
+
+    # Must be complete and positive
+    df["pkg_complete"] = df[pkg_cols].notna().all(axis=1)
+
+    for c in pkg_cols:
+        df[c] = df[c].clip(lower=0)
+
+    df["pkg_positive"] = (
+        (df["pkg_height_i"] > 0) &
+        (df["pkg_length_i"] > 0) &
+        (df["pkg_width_i"] > 0) &
+        (df["pkg_weight_i"] > 0) &
+        (df["pkg_height_j"] > 0) &
+        (df["pkg_length_j"] > 0) &
+        (df["pkg_width_j"] > 0) &
+        (df["pkg_weight_j"] > 0)
+    )
+
+    # Log gaps
+    df["log_pkg_height_i"] = np.log1p(df["pkg_height_i"])
+    df["log_pkg_height_j"] = np.log1p(df["pkg_height_j"])
+    df["log_pkg_length_i"] = np.log1p(df["pkg_length_i"])
+    df["log_pkg_length_j"] = np.log1p(df["pkg_length_j"])
+    df["log_pkg_width_i"] = np.log1p(df["pkg_width_i"])
+    df["log_pkg_width_j"] = np.log1p(df["pkg_width_j"])
+    df["log_pkg_weight_i"] = np.log1p(df["pkg_weight_i"])
+    df["log_pkg_weight_j"] = np.log1p(df["pkg_weight_j"])
+
+    df["pkg_height_log_gap"] = (df["log_pkg_height_i"] - df["log_pkg_height_j"]).abs()
+    df["pkg_length_log_gap"] = (df["log_pkg_length_i"] - df["log_pkg_length_j"]).abs()
+    df["pkg_width_log_gap"] = (df["log_pkg_width_i"] - df["log_pkg_width_j"]).abs()
+    df["pkg_weight_log_gap"] = (df["log_pkg_weight_i"] - df["log_pkg_weight_j"]).abs()
+
+    df["pkg_volume_i"] = df["pkg_height_i"] * df["pkg_length_i"] * df["pkg_width_i"]
+    df["pkg_volume_j"] = df["pkg_height_j"] * df["pkg_length_j"] * df["pkg_width_j"]
+
+    df["pkg_volume_log_gap"] = (
+        np.log1p(df["pkg_volume_i"]) - np.log1p(df["pkg_volume_j"])
+    ).abs()
+
+    df["pkg_distance"] = np.sqrt(
+        df["pkg_height_log_gap"] ** 2 +
+        df["pkg_length_log_gap"] ** 2 +
+        df["pkg_width_log_gap"] ** 2 +
+        df["pkg_weight_log_gap"] ** 2
+    )
+
+    # HARD FILTER: package must be complete and similar
+    df["pkg_similar_ok"] = (
+        df["pkg_complete"]
+        &
+        df["pkg_positive"]
+        &
+        (df["pkg_height_log_gap"] <= max_height_log_gap)
+        &
+        (df["pkg_length_log_gap"] <= max_length_log_gap)
+        &
+        (df["pkg_width_log_gap"] <= max_width_log_gap)
+        &
+        (df["pkg_weight_log_gap"] <= max_weight_log_gap)
+        &
+        (df["pkg_volume_log_gap"] <= max_volume_log_gap)
+        &
+        (df["pkg_distance"] <= max_pkg_distance)
+    )
+
+    print("Package similarity filter summary:")
+    print(df["pkg_similar_ok"].value_counts(dropna=False))
+    print("Pkg complete rate:", df["pkg_complete"].mean())
+    print("Pkg positive rate:", df["pkg_positive"].mean())
+
+    # -----------------------------
+    # Activity stats
+    # -----------------------------
     df["pair_demand_sum"] = df["r13_demand_i"].fillna(0) + df["r13_demand_j"].fillna(0)
     df["pair_total_dph_sum"] = df["r13_total_i"].fillna(0) + df["r13_total_j"].fillna(0)
     df["pair_buybox_dph_sum"] = df["r13_buybox_i"].fillna(0) + df["r13_buybox_j"].fillna(0)
     df["pair_instock_dph_sum"] = df["r13_instock_i"].fillna(0) + df["r13_instock_j"].fillna(0)
 
-    # Category-level activity
     cat_stats = (
         df.groupby("category_code", dropna=False)
         .agg(
@@ -105,9 +337,7 @@ def find_good_short_term_dynamic_category_example(
 
     rows = []
 
-    group_cols = ["category_code", "pair_key"]
-
-    for _, g in df.sort_values("origin_week").groupby(group_cols, dropna=False):
+    for _, g in df.sort_values("origin_week").groupby(["category_code", "pair_key"], dropna=False):
         g = g.sort_values("origin_week").reset_index(drop=True)
 
         for k in range(1, len(g)):
@@ -116,19 +346,21 @@ def find_good_short_term_dynamic_category_example(
 
             gap_weeks = (cur["origin_week"] - prev["origin_week"]).days / 7.0
 
-            # Need short-term switch
             if gap_weeks > max_gap_weeks:
                 continue
 
-            # Need positive <-> competitive switch
             if prev["relation_label"] == cur["relation_label"]:
                 continue
 
-            # Need category activity
+            # Must be size similar at current week.
+            if not bool(cur["pkg_similar_ok"]):
+                continue
+
+            # Category volume
             if cur["category_demand_sum"] < min_category_demand_sum:
                 continue
 
-            # Need pair activity
+            # Pair volume
             if max(prev["pair_demand_sum"], cur["pair_demand_sum"]) < min_pair_demand_sum:
                 continue
 
@@ -147,7 +379,7 @@ def find_good_short_term_dynamic_category_example(
             if min(prev_strength, cur_strength) < min_score_strength:
                 continue
 
-            row = {
+            rows.append({
                 "category_code": cur["category_code"],
                 "gl_product_group": cur["gl_product_group_i"],
                 "gl_product_group_desc": cur["gl_product_group_desc_i"],
@@ -175,6 +407,22 @@ def find_good_short_term_dynamic_category_example(
                 "prev_rank_gap": prev["rank_gap"],
                 "rank_gap": cur["rank_gap"],
                 "delta_rank_gap": cur["rank_gap"] - prev["rank_gap"],
+
+                "pkg_height_i": cur["pkg_height_i"],
+                "pkg_height_j": cur["pkg_height_j"],
+                "pkg_length_i": cur["pkg_length_i"],
+                "pkg_length_j": cur["pkg_length_j"],
+                "pkg_width_i": cur["pkg_width_i"],
+                "pkg_width_j": cur["pkg_width_j"],
+                "pkg_weight_i": cur["pkg_weight_i"],
+                "pkg_weight_j": cur["pkg_weight_j"],
+
+                "pkg_height_log_gap": cur["pkg_height_log_gap"],
+                "pkg_length_log_gap": cur["pkg_length_log_gap"],
+                "pkg_width_log_gap": cur["pkg_width_log_gap"],
+                "pkg_weight_log_gap": cur["pkg_weight_log_gap"],
+                "pkg_volume_log_gap": cur["pkg_volume_log_gap"],
+                "pkg_distance": cur["pkg_distance"],
 
                 "prev_pair_demand_sum": prev["pair_demand_sum"],
                 "pair_demand_sum": cur["pair_demand_sum"],
@@ -232,19 +480,22 @@ def find_good_short_term_dynamic_category_example(
                 "category_buybox_dph_sum": cur["category_buybox_dph_sum"],
                 "category_instock_dph_sum": cur["category_instock_dph_sum"],
                 "category_pair_count": cur["category_pair_count"],
-            }
-
-            rows.append(row)
+            })
 
     out = pd.DataFrame(rows)
 
     if out.empty:
-        print("没有找到满足条件的 4 周内 positive <-> competitive 切换例子。")
-        print("建议放宽参数，比如：")
-        print("min_category_demand_sum=2000")
-        print("min_pair_demand_sum=50")
-        print("min_pair_total_dph_sum=500")
-        print("min_score_strength=0.25")
+        print("\n没有找到满足条件的 4 周内 positive <-> competitive 切换例子。")
+        print("可能是 package size hard filter 或 volume filter 太严格。")
+        print("建议尝试放宽：")
+        print("  max_height_log_gap=0.45")
+        print("  max_length_log_gap=0.45")
+        print("  max_width_log_gap=0.45")
+        print("  max_weight_log_gap=0.65")
+        print("  max_volume_log_gap=0.90")
+        print("  max_pkg_distance=1.10")
+        print("  min_pair_demand_sum=50")
+        print("  min_pair_total_dph_sum=500")
         return out
 
     out["relation_strength"] = out[
@@ -256,26 +507,25 @@ def find_good_short_term_dynamic_category_example(
         ]
     ].max(axis=1)
 
-    # More useful examples first:
-    # short gap, high pair demand, active category, strong relation score
     out = out.sort_values(
         [
             "gap_weeks",
             "pair_demand_sum",
             "pair_total_dph_sum",
+            "pkg_distance",
             "category_demand_sum",
             "relation_strength",
         ],
-        ascending=[True, False, False, False, False],
+        ascending=[True, False, False, True, False, False],
     ).head(top_n)
 
     if verbose:
-        print("\n" + "=" * 100)
-        print("GOOD SHORT-TERM DYNAMIC RELATION EXAMPLES")
-        print("=" * 100)
+        print("\n" + "=" * 120)
+        print("GOOD SHORT-TERM DYNAMIC RELATION EXAMPLES WITH STRICT PACKAGE SIZE SIMILARITY")
+        print("=" * 120)
 
         for idx, r in out.iterrows():
-            print("\n" + "=" * 100)
+            print("\n" + "=" * 120)
             print(f"Category: {r['category_code']} | GL: {r['gl_product_group']} | {r['gl_product_group_desc']}")
             print(f"ASIN_i: {r['asin_i']}")
             print(f"ASIN_j: {r['asin_j']}")
@@ -284,6 +534,13 @@ def find_good_short_term_dynamic_category_example(
                 f"{r['prev_origin_week']} -> {r['origin_week']} | "
                 f"gap={r['gap_weeks']:.1f} weeks"
             )
+
+            print("\nPackage size similarity:")
+            print(f"  height: {r['pkg_height_i']:.3f} vs {r['pkg_height_j']:.3f} | log_gap={r['pkg_height_log_gap']:.4f}")
+            print(f"  length: {r['pkg_length_i']:.3f} vs {r['pkg_length_j']:.3f} | log_gap={r['pkg_length_log_gap']:.4f}")
+            print(f"  width:  {r['pkg_width_i']:.3f} vs {r['pkg_width_j']:.3f} | log_gap={r['pkg_width_log_gap']:.4f}")
+            print(f"  weight: {r['pkg_weight_i']:.3f} vs {r['pkg_weight_j']:.3f} | log_gap={r['pkg_weight_log_gap']:.4f}")
+            print(f"  volume_log_gap={r['pkg_volume_log_gap']:.4f} | pkg_distance={r['pkg_distance']:.4f}")
 
             print("\nRelation scores:")
             print(f"  Positive score:     {r['prev_positive_score']:.4f} -> {r['positive_score']:.4f}")
@@ -322,62 +579,88 @@ def find_good_short_term_dynamic_category_example(
     return out
 
 
-# =========================
+# ============================================================
 # Run strict version first
-# =========================
+# ============================================================
 
-good_dynamic_examples = find_good_short_term_dynamic_category_example(
+good_dynamic_examples_pkg = find_good_short_term_dynamic_category_example_strict_pkg(
     pair_df=pair_df,
+    data_raw1=data_raw1,
+
     max_gap_weeks=4,
+
     min_category_demand_sum=5000,
     min_pair_demand_sum=100,
     min_pair_total_dph_sum=1000,
     min_score_strength=0.35,
+
+    # strict but not impossible
+    max_height_log_gap=0.35,
+    max_length_log_gap=0.35,
+    max_width_log_gap=0.35,
+    max_weight_log_gap=0.50,
+    max_volume_log_gap=0.70,
+    max_pkg_distance=0.90,
+
     top_n=20,
     verbose=True,
 )
 
-display(good_dynamic_examples)
+display(good_dynamic_examples_pkg)
 
 
-# =========================
-# If empty, run relaxed version
-# =========================
+# ============================================================
+# If empty, run relaxed package version
+# ============================================================
 
-if good_dynamic_examples.empty:
-    print("\nRunning relaxed search...\n")
+if good_dynamic_examples_pkg.empty:
+    print("\nRunning relaxed package-size search...\n")
 
-    good_dynamic_examples = find_good_short_term_dynamic_category_example(
+    good_dynamic_examples_pkg = find_good_short_term_dynamic_category_example_strict_pkg(
         pair_df=pair_df,
+        data_raw1=data_raw1,
+
         max_gap_weeks=4,
+
         min_category_demand_sum=2000,
         min_pair_demand_sum=50,
         min_pair_total_dph_sum=500,
         min_score_strength=0.25,
+
+        max_height_log_gap=0.45,
+        max_length_log_gap=0.45,
+        max_width_log_gap=0.45,
+        max_weight_log_gap=0.65,
+        max_volume_log_gap=0.90,
+        max_pkg_distance=1.10,
+
         top_n=20,
         verbose=True,
     )
 
-    display(good_dynamic_examples)
+    display(good_dynamic_examples_pkg)
 
 
-# =========================
-# Optional: inspect full time path of the first example
-# =========================
+# ============================================================
+# Full time path for first example
+# ============================================================
 
-if not good_dynamic_examples.empty:
-    first = good_dynamic_examples.iloc[0]
+if not good_dynamic_examples_pkg.empty:
+    first = good_dynamic_examples_pkg.iloc[0]
     target_pair = {str(first["asin_i"]), str(first["asin_j"])}
     target_category = first["category_code"]
 
     full_pair_path = pair_df[
         (pair_df["category_code"] == target_category) &
         (pair_df.apply(lambda r: {str(r["asin_i"]), str(r["asin_j"])} == target_pair, axis=1))
-    ].sort_values("origin_week")
+    ].copy()
 
-    print("\n" + "=" * 100)
-    print("FULL TIME PATH FOR FIRST EXAMPLE")
-    print("=" * 100)
+    full_pair_path["origin_week"] = pd.to_datetime(full_pair_path["origin_week"])
+    full_pair_path = full_pair_path.sort_values("origin_week")
+
+    print("\n" + "=" * 120)
+    print("FULL TIME PATH FOR FIRST PACKAGE-SIMILAR EXAMPLE")
+    print("=" * 120)
     print(f"Category: {target_category}")
     print(f"ASIN pair: {target_pair}")
 
@@ -408,5 +691,4 @@ if not good_dynamic_examples.empty:
     ]
 
     cols_to_show = [c for c in cols_to_show if c in full_pair_path.columns]
-
     display(full_pair_path[cols_to_show])
