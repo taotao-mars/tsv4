@@ -5228,6 +5228,9 @@ def run_exposure_v2(
     use_category_calibration=True,
     category_calibration_scale=0.015,
     category_shrinkage_k=100.0,
+    use_long_horizon_correction=True,
+    long_horizon_start=13,
+    long_horizon_correction_scale=0.06,
     use_group_calibration=False,
     group_calibration_scale=0.0,
     graph_zero_weight=0.03,
@@ -5238,7 +5241,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V14: SINGLE-HEAD DIRECT + SCOT OPTION + HORIZON + GL/CATEGORY SHRINKAGE CALIB")
+    print("EXPOSURE MODEL V17 FIXED: V15_PKG + GRAPH/RANK-DRIVEN LONG-HORIZON CORRECTION")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -5314,6 +5317,9 @@ def run_exposure_v2(
         use_category_calibration=use_category_calibration,
         category_calibration_scale=category_calibration_scale,
         category_shrinkage_k=category_shrinkage_k,
+        use_long_horizon_correction=use_long_horizon_correction,
+        long_horizon_start=long_horizon_start,
+        long_horizon_correction_scale=long_horizon_correction_scale,
         use_group_calibration=use_group_calibration,
         group_calibration_scale=group_calibration_scale,
         use_encoder_self_attn=use_encoder_self_attn,
@@ -5782,6 +5788,7 @@ def summarize_gl_diagnostics(gl_diag, min_asins=30):
 def run_exposure_v2_final_scot_5000(
     data_raw1,
     scot_df,
+    n_asins=5000,
     seed=42,
     history=13,
     horizon=20,
@@ -5830,7 +5837,7 @@ def run_exposure_v2_final_scot_5000(
     return run_exposure_v2(
         data_raw1=data_raw1,
         scot_df=scot_df,
-        n_asins=5000,
+        n_asins=n_asins,
         seed=seed,
         history=history,
         horizon=horizon,
