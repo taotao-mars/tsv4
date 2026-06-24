@@ -14,6 +14,7 @@
 #
 # Core features emphasized:
 #   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand, ind_promotion, our_price, holiday/event indicators
+#   pkg_height, pkg_length, pkg_width, pkg_weight -> volume/weight/shape edge comparability
 #   dynamic category rank / magnitude hierarchy features by origin_week
 #
 # Usage is at the bottom. Designed for Jupyter:
@@ -189,7 +190,21 @@ def _prepare_joint_data(data_raw1, scot_df=None, n_asins=5000, seed=42):
     ])
     out["promo_event_index"] = np.maximum(out["ind_promotion"].astype(float), out["event_index"].astype(float))
 
-    print("Dynamic rank v4 uses our_price as primary price signal.")
+    # Package physical-comparability features. These are static/current-known product attributes,
+    # used later as EDGE features, not future target information.
+    # User data columns are expected to be: pkg_height, pkg_length, pkg_width, pkg_weight.
+    for c in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight"]:
+        if c not in out.columns:
+            out[c] = np.nan
+        out[c] = _safe_numeric(out[c], np.nan).clip(lower=0.0)
+    out["pkg_volume"] = (out["pkg_height"] * out["pkg_length"] * out["pkg_width"]).replace([np.inf, -np.inf], np.nan)
+    out["log_pkg_height"] = np.log1p(out["pkg_height"].fillna(0.0))
+    out["log_pkg_length"] = np.log1p(out["pkg_length"].fillna(0.0))
+    out["log_pkg_width"] = np.log1p(out["pkg_width"].fillna(0.0))
+    out["log_pkg_weight"] = np.log1p(out["pkg_weight"].fillna(0.0))
+    out["log_pkg_volume"] = np.log1p(out["pkg_volume"].fillna(0.0))
+
+    print("Dynamic rank v5 uses our_price + package size/weight edge features.")
     print(f"Holiday indicator cols: {len([c for c in out.columns if c.startswith('holiday_indicator_')])} | distance cols: {len([c for c in out.columns if c.startswith('distance_')])}")
 
     return out.sort_values(["asin", "order_week"]).reset_index(drop=True)
@@ -431,6 +446,20 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
         row["log_list_price_last"] = row["log_our_price_last"]       # backward-compatible alias
         row["log_price_mean"] = row["log_our_price_mean"]
 
+        # Package size/weight: use median historical value as ASIN physical profile.
+        # These are used as pairwise edge features to avoid connecting physically incomparable products.
+        for pc in ["pkg_height", "pkg_length", "pkg_width", "pkg_weight", "pkg_volume",
+                   "log_pkg_height", "log_pkg_length", "log_pkg_width", "log_pkg_weight", "log_pkg_volume"]:
+            if pc in g.columns:
+                vals = pd.to_numeric(g[pc], errors="coerce").replace([np.inf, -np.inf], np.nan)
+                row[pc] = float(vals.median()) if vals.notna().any() else 0.0
+            else:
+                row[pc] = 0.0
+        row["pkg_complete"] = float(
+            row.get("pkg_height", 0.0) > 0 and row.get("pkg_length", 0.0) > 0 and
+            row.get("pkg_width", 0.0) > 0 and row.get("pkg_weight", 0.0) > 0
+        )
+
         # Current-origin known features. These are not future realized DPH/demand targets.
         if asin in current_idx.index:
             cur = current_idx.loc[asin]
@@ -561,6 +590,36 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     feat["log_list_price_signed_gap_j_minus_i"] = feat["log_our_price_signed_gap_j_minus_i"]
     feat["same_price_tier_soft"] = float(abs(lj - li) <= 0.25)
     feat["price_tier_gap_large"] = float(abs(lj - li) >= 0.75)
+
+    # Package physical-comparability relation. These are edge-level pairwise gaps.
+    # They prevent category-only edges from linking physically very different products.
+    pch_i = float(row_i.get("log_pkg_height", 0.0)); pch_j = float(row_j.get("log_pkg_height", 0.0))
+    pcl_i = float(row_i.get("log_pkg_length", 0.0)); pcl_j = float(row_j.get("log_pkg_length", 0.0))
+    pcw_i = float(row_i.get("log_pkg_width", 0.0));  pcw_j = float(row_j.get("log_pkg_width", 0.0))
+    pcwt_i = float(row_i.get("log_pkg_weight", 0.0)); pcwt_j = float(row_j.get("log_pkg_weight", 0.0))
+    pcv_i = float(row_i.get("log_pkg_volume", 0.0)); pcv_j = float(row_j.get("log_pkg_volume", 0.0))
+    feat["pkg_height_log_gap"] = abs(pch_j - pch_i)
+    feat["pkg_length_log_gap"] = abs(pcl_j - pcl_i)
+    feat["pkg_width_log_gap"] = abs(pcw_j - pcw_i)
+    feat["pkg_weight_log_gap"] = abs(pcwt_j - pcwt_i)
+    feat["pkg_volume_log_gap"] = abs(pcv_j - pcv_i)
+    feat["pkg_distance"] = float(np.sqrt(
+        feat["pkg_height_log_gap"]**2 + feat["pkg_length_log_gap"]**2 +
+        feat["pkg_width_log_gap"]**2 + feat["pkg_weight_log_gap"]**2
+    ))
+    feat["pkg_complete_pair"] = float(row_i.get("pkg_complete", 0.0) > 0.5 and row_j.get("pkg_complete", 0.0) > 0.5)
+    feat["pkg_size_similar_strict"] = float(
+        feat["pkg_complete_pair"] > 0.5 and
+        feat["pkg_height_log_gap"] <= 0.35 and feat["pkg_length_log_gap"] <= 0.35 and
+        feat["pkg_width_log_gap"] <= 0.35 and feat["pkg_weight_log_gap"] <= 0.50 and
+        feat["pkg_volume_log_gap"] <= 0.70 and feat["pkg_distance"] <= 0.90
+    )
+    feat["pkg_size_similar_relaxed"] = float(
+        feat["pkg_complete_pair"] > 0.5 and
+        feat["pkg_height_log_gap"] <= 0.45 and feat["pkg_length_log_gap"] <= 0.45 and
+        feat["pkg_width_log_gap"] <= 0.45 and feat["pkg_weight_log_gap"] <= 0.65 and
+        feat["pkg_volume_log_gap"] <= 0.90 and feat["pkg_distance"] <= 1.10
+    )
 
     # promotion-level relation from ASIN profile
     pi = float(row_i.get("promo_rate", 0.0)); pj = float(row_j.get("promo_rate", 0.0))
@@ -762,7 +821,8 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
         edge_feat.get("same_hbt", 0) > 0.5 and
         edge_feat.get("same_top10_brand", 0) > 0.5 and
         edge_feat.get("same_price_tier_soft", 0) > 0.5 and
-        edge_feat.get("same_promo_regime_soft", 0) > 0.5
+        edge_feat.get("same_promo_regime_soft", 0) > 0.5 and
+        edge_feat.get("pkg_size_similar_strict", 0) > 0.5
     )
     active_overlap_good = np.mean([
         edge_feat.get("active_jaccard_total", 0),
@@ -798,7 +858,10 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
         edge_feat.get("price_tier_gap_large", 0) > 0.5 or
         edge_feat.get("promo_response_abs_gap", 0) > 0.50
     )
+    # Competitive edges should also be physically comparable; otherwise a broad category
+    # can create fake competition between products with very different size/weight.
     competitive = (
+        edge_feat.get("pkg_size_similar_relaxed", 0) > 0.5 and
         dominant_neighbor and
         regime_contrast and
         (abs_strength_gap >= 1.00 or edge_feat.get("funnel_strength_abs_gap", 0) >= 0.75 or promo_steal >= 0.10 or mean_neg_corr >= 0.10)
@@ -967,6 +1030,16 @@ def build_dynamic_pair_dataset(
                     "log_our_price_j": rj.get("log_our_price_current", rj.get("log_our_price_mean", rj.get("log_price_mean", 0.0))),
                     "log_list_price_i": ri.get("log_our_price_current", ri.get("log_our_price_mean", ri.get("log_price_mean", 0.0))),
                     "log_list_price_j": rj.get("log_our_price_current", rj.get("log_our_price_mean", rj.get("log_price_mean", 0.0))),
+                    "pkg_height_i": ri.get("pkg_height", 0.0),
+                    "pkg_height_j": rj.get("pkg_height", 0.0),
+                    "pkg_length_i": ri.get("pkg_length", 0.0),
+                    "pkg_length_j": rj.get("pkg_length", 0.0),
+                    "pkg_width_i": ri.get("pkg_width", 0.0),
+                    "pkg_width_j": rj.get("pkg_width", 0.0),
+                    "pkg_weight_i": ri.get("pkg_weight", 0.0),
+                    "pkg_weight_j": rj.get("pkg_weight", 0.0),
+                    "pkg_volume_i": ri.get("pkg_volume", 0.0),
+                    "pkg_volume_j": rj.get("pkg_volume", 0.0),
                     "promo_rate_i": ri.get("promo_rate", 0.0),
                     "promo_rate_j": rj.get("promo_rate", 0.0),
                     "promo_response_i": ri.get("promo_response_strength", 0.0),
@@ -1448,6 +1521,7 @@ def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
         "total_log_q90_abs_gap", "buybox_log_q90_abs_gap", "instock_log_q90_abs_gap", "demand_log_q90_abs_gap",
         "same_hbt", "same_top10_brand", "top10_brand_diff", "stronger_top10_competitor",
         "hist_corr_total", "hist_corr_buybox", "hist_corr_instock", "hist_corr_demand",
+        "pkg_distance", "pkg_volume_log_gap", "pkg_weight_log_gap", "pkg_size_similar_strict", "pkg_size_similar_relaxed",
         "funnel_strength_abs_gap", "active_strength_abs_gap",
         "log_our_price_abs_gap", "log_list_price_abs_gap", "same_price_tier_soft", "price_tier_gap_large", "both_low_eligibility", "j_event_i_not_current",
         "promo_rate_abs_gap", "promo_recent13_abs_gap", "same_promo_regime_soft",
@@ -1621,352 +1695,26 @@ def run_dynamic_gat_relation_test_scot5000(
 
 
 # ============================================================
-# RULE-BASED VS LEARNED-EDGE COMPARISON ADD-ON
+# V5 convenience runner: dynamic relation GAT test with package edge features
 # ============================================================
-# This section compares two edge scoring strategies on exactly the same
-# dynamic pair dataset:
-#   A) rule-based score from hand-crafted business priors
-#   B) learned EdgeMLP score trained from dynamic weak labels
-# It does NOT change exposure model. It is only a standalone diagnostic.
-# ============================================================
-
-
-def _temporal_pair_split(df, seed=42, time_col="origin_week"):
-    origins = sorted(pd.to_datetime(df[time_col].unique()))
-    if len(origins) >= 3:
-        split = int(len(origins) * 0.75)
-        train_origins = set(origins[:split])
-        test_origins = set(origins[split:])
-        tr = df[pd.to_datetime(df[time_col]).isin(train_origins)].copy()
-        te = df[pd.to_datetime(df[time_col]).isin(test_origins)].copy()
-    else:
-        tr = df.sample(frac=0.75, random_state=seed)
-        te = df.drop(tr.index).copy()
-    return tr, te
-
-
-def _sigmoid_np(x):
-    x = np.asarray(x, dtype=float)
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
-
-
-def _softmax3_np(a, b, c):
-    z = np.vstack([a, b, c]).T.astype(float)
-    z = z - np.max(z, axis=1, keepdims=True)
-    e = np.exp(z)
-    return e / np.maximum(e.sum(axis=1, keepdims=True), 1e-12)
-
-
-def score_edges_rule_based(pair_df):
-    """
-    Business-prior score. This is intentionally transparent and deterministic.
-
-    Output columns:
-      rule_score_neutral, rule_score_competitive, rule_score_positive,
-      rule_pred_label, rule_pred_label_name
-
-    Important: these scores only use historical/current edge features, not future labels.
-    """
-    df = pair_df.copy()
-
-    def col(c, default=0.0):
-        if c in df.columns:
-            return _safe_numeric(df[c]).replace([np.inf, -np.inf], 0.0).fillna(default).astype(float).values
-        return np.full(len(df), default, dtype=float)
-
-    # similarity / close signals
-    mean_gap = col("mean_abs_gap_all", 3.0)
-    same_hbt = col("same_hbt")
-    same_top10 = col("same_top10_brand")
-    same_price = col("same_price_tier_soft")
-    same_promo = col("same_promo_regime_soft")
-    promo_overlap = col("promo_any_overlap_jaccard")
-    active_jaccard = np.mean(np.vstack([
-        col("active_jaccard_total"), col("active_jaccard_buybox"), col("active_jaccard_instock"), col("active_jaccard_demand"),
-    ]), axis=0)
-    pos_corr = np.mean(np.vstack([
-        np.maximum(0, col("hist_corr_total")), np.maximum(0, col("hist_corr_buybox")),
-        np.maximum(0, col("hist_corr_instock")), np.maximum(0, col("hist_corr_demand")),
-    ]), axis=0)
-
-    # contrast / dominance signals
-    funnel_gap_abs = col("funnel_strength_abs_gap")
-    funnel_gap_signed = col("funnel_strength_signed_gap")
-    active_gap_signed = col("active_strength_signed_gap")
-    j_stronger_funnel = col("j_stronger_funnel")
-    stronger_top10 = col("stronger_top10_competitor")
-    hbt_diff = col("hbt_diff")
-    top10_diff = col("top10_brand_diff")
-    price_large = col("price_tier_gap_large")
-    promo_resp_gap = col("promo_response_abs_gap")
-    j_promo_stronger = col("j_promo_stronger_funnel")
-    promo_steal = np.mean(np.vstack([
-        col("promo_steal_j_to_i_total"), col("promo_steal_j_to_i_buybox"),
-        col("promo_steal_j_to_i_instock"), col("promo_steal_j_to_i_demand"),
-    ]), axis=0)
-    both_low = col("both_low_eligibility")
-
-    # positive: similar product regime + similar DPH/demand + overlap/correlation
-    pos_raw = (
-        -0.80
-        - 1.35 * mean_gap
-        - 0.25 * funnel_gap_abs
-        + 0.75 * same_hbt
-        + 0.65 * same_top10
-        + 0.45 * same_price
-        + 0.45 * same_promo
-        + 0.40 * active_jaccard
-        + 0.35 * pos_corr
-        + 0.25 * promo_overlap
-        - 0.35 * both_low
-    )
-
-    # competitive: same category candidate, but j is stronger / different regime / promo-price contrast.
-    # Directional: competitive means ASIN_j is a stronger/pressure neighbor for ASIN_i.
-    comp_raw = (
-        -1.00
-        + 0.95 * j_stronger_funnel
-        + 0.90 * stronger_top10
-        + 0.70 * funnel_gap_abs
-        + 0.35 * np.maximum(0.0, funnel_gap_signed)
-        + 0.25 * np.maximum(0.0, active_gap_signed)
-        + 0.45 * hbt_diff
-        + 0.45 * top10_diff
-        + 0.35 * price_large
-        + 0.25 * promo_resp_gap
-        + 0.40 * j_promo_stronger
-        + 0.55 * promo_steal
-    )
-
-    # neutral gets higher when neither similarity nor dominance is strong, and when both are low/inactive.
-    neutral_raw = (
-        0.20
-        + 0.80 * both_low
-        + 0.25 * np.clip(mean_gap, 0, 2.0)
-        - 0.40 * np.maximum(pos_raw, 0)
-        - 0.35 * np.maximum(comp_raw, 0)
-    )
-
-    probs = _softmax3_np(neutral_raw, comp_raw, pos_raw)
-    pred = np.argmax(probs, axis=1)
-    df["rule_score_neutral"] = probs[:, 0]
-    df["rule_score_competitive"] = probs[:, 1]
-    df["rule_score_positive"] = probs[:, 2]
-    df["rule_pred_label"] = pred.astype(int)
-    df["rule_pred_label_name"] = df["rule_pred_label"].map({0: "neutral", 1: "competitive", 2: "positive"})
-    return df
-
-
-def score_rank_rule_based(pair_df):
-    """
-    Sparse-aware/event-aware rule rank scorer.
-    Output class:
-      0 close_rank, 1 j_higher, 2 i_higher.
-    """
-    df = pair_df.copy()
-
-    def col(c, default=0.0):
-        if c in df.columns:
-            return _safe_numeric(df[c]).replace([np.inf, -np.inf], 0.0).fillna(default).astype(float).values
-        return np.full(len(df), default, dtype=float)
-
-    # positive means ASIN_j higher than ASIN_i.
-    dyn_gap = col("rank_composite_dynamic_signed_gap_j_minus_i")
-    funnel_gap = col("funnel_strength_signed_gap")
-    active_gap = col("active_strength_signed_gap")
-    promo_gap = col("promo_response_signed_gap_j_minus_i")
-    price_gap = col("log_our_price_signed_gap_j_minus_i")
-    event_gap = col("event_current_j_minus_i")
-    i_promo = col("i_promo_current")
-    j_promo = col("j_promo_current")
-    i_event = col("i_event_current")
-    j_event = col("j_event_current")
-    both_low = col("both_low_eligibility")
-    active_elig_gap = col("j_active_eligibility") - col("i_active_eligibility")
-
-    # A compact directional rank score.
-    signed_rank_score = (
-        2.6 * dyn_gap
-        + 0.55 * funnel_gap
-        + 0.35 * active_gap
-        + 0.25 * promo_gap
-        + 0.20 * active_elig_gap
-        + 0.15 * event_gap
-        + 0.08 * price_gap
-        + 0.20 * (j_promo - i_promo)
-        + 0.15 * (j_event - i_event)
-    )
-
-    event_pair = np.maximum.reduce([i_promo, j_promo, i_event, j_event])
-    # Normal weeks: wider close band. Event/promo weeks: allow rank to separate.
-    close_margin = np.where(event_pair > 0.5, 0.12, 0.22)
-    close_margin = np.where(both_low > 0.5, 10.0, close_margin)  # force close for both inactive
-
-    pred = np.zeros(len(df), dtype=int)
-    pred[signed_rank_score > close_margin] = 1
-    pred[signed_rank_score < -close_margin] = 2
-
-    # Convert to soft scores for inspection.
-    j_score = _sigmoid_np(4.0 * (signed_rank_score - close_margin))
-    i_score = _sigmoid_np(4.0 * (-signed_rank_score - close_margin))
-    close_score = np.clip(1.0 - np.maximum(j_score, i_score), 0.0, 1.0)
-    s = close_score + j_score + i_score + 1e-12
-
-    df["rule_score_close_rank"] = close_score / s
-    df["rule_score_j_higher"] = j_score / s
-    df["rule_score_i_higher"] = i_score / s
-    df["rule_pred_rank_label"] = pred
-    df["rule_pred_rank_label_name"] = pd.Series(pred).map({0: "close_rank", 1: "j_higher", 2: "i_higher"}).values
-    df["rule_signed_rank_score"] = signed_rank_score
-    return df
-
-
-def _report_from_predictions(y_true, y_pred, names):
-    report = classification_report(y_true, y_pred, target_names=names, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(names))))
-    return report, cm
-
-
-def _compact_report_row(report, prefix):
-    rows = {"model": prefix}
-    rows["accuracy"] = report.get("accuracy", np.nan)
-    rows["macro_f1"] = report.get("macro avg", {}).get("f1-score", np.nan)
-    rows["weighted_f1"] = report.get("weighted avg", {}).get("f1-score", np.nan)
-    for key in report:
-        if key in ["accuracy", "macro avg", "weighted avg"]:
-            continue
-        if isinstance(report[key], dict):
-            rows[f"{key}_precision"] = report[key].get("precision", np.nan)
-            rows[f"{key}_recall"] = report[key].get("recall", np.nan)
-            rows[f"{key}_f1"] = report[key].get("f1-score", np.nan)
-    return rows
-
-
-def evaluate_rule_based_on_heldout(pair_df, seed=42):
-    """Evaluate deterministic rule scores using the same temporal heldout split."""
-    df_rule = score_edges_rule_based(pair_df)
-    df_rank_rule = score_rank_rule_based(pair_df)
-    _, te_rel = _temporal_pair_split(df_rule, seed=seed)
-    _, te_rank = _temporal_pair_split(df_rank_rule, seed=seed)
-
-    rel_report, rel_cm = _report_from_predictions(
-        te_rel["label"].values.astype(int),
-        te_rel["rule_pred_label"].values.astype(int),
-        ["neutral", "competitive", "positive"],
-    )
-    rank_report, rank_cm = _report_from_predictions(
-        te_rank["rank_label"].values.astype(int),
-        te_rank["rule_pred_rank_label"].values.astype(int),
-        ["close_rank", "j_higher", "i_higher"],
-    )
-    return {
-        "rule_scored_pair_df": df_rule,
-        "rule_rank_scored_pair_df": df_rank_rule,
-        "rule_relation_report": rel_report,
-        "rule_relation_confusion_matrix": rel_cm,
-        "rule_rank_report": rank_report,
-        "rule_rank_confusion_matrix": rank_cm,
-        "rule_relation_test_df": te_rel,
-        "rule_rank_test_df": te_rank,
-    }
-
-
-def compare_rule_vs_learned_edge_outputs(pair_df, learned_relation_out, learned_rank_out, rule_out, top_n=20, verbose=True):
-    """Create comparison tables and preview pairs."""
-    learned_rel_report = learned_relation_out["heldout_report"]
-    learned_rank_report = learned_rank_out["rank_heldout_report"]
-    rule_rel_report = rule_out["rule_relation_report"]
-    rule_rank_report = rule_out["rule_rank_report"]
-
-    relation_compare = pd.DataFrame([
-        _compact_report_row(rule_rel_report, "rule_based_relation"),
-        _compact_report_row(learned_rel_report, "learned_edge_relation"),
-    ])
-    rank_compare = pd.DataFrame([
-        _compact_report_row(rule_rank_report, "rule_based_rank"),
-        _compact_report_row(learned_rank_report, "learned_edge_rank"),
-    ])
-
-    # Agreement between rule and learned on all pairs.
-    merged_rel = learned_relation_out["scored_pair_df"][["origin_week", "asin_i", "asin_j", "category_code", "score_positive", "score_competitive", "pred_label", "pred_label_name", "label", "label_name"]].copy()
-    rule_cols = rule_out["rule_scored_pair_df"][["origin_week", "asin_i", "asin_j", "rule_score_positive", "rule_score_competitive", "rule_pred_label", "rule_pred_label_name"]]
-    merged_rel = merged_rel.merge(rule_cols, on=["origin_week", "asin_i", "asin_j"], how="left")
-    merged_rel["rule_learned_agree"] = (merged_rel["pred_label"] == merged_rel["rule_pred_label"]).astype(float)
-
-    merged_rank = learned_rank_out["rank_scored_pair_df"][["origin_week", "asin_i", "asin_j", "category_code", "score_close_rank", "score_j_higher", "score_i_higher", "pred_rank_label", "pred_rank_label_name", "rank_label", "rank_label_name", "future_rank_gap_j_minus_i"]].copy()
-    rule_rank_cols = rule_out["rule_rank_scored_pair_df"][["origin_week", "asin_i", "asin_j", "rule_score_close_rank", "rule_score_j_higher", "rule_score_i_higher", "rule_pred_rank_label", "rule_pred_rank_label_name", "rule_signed_rank_score"]]
-    merged_rank = merged_rank.merge(rule_rank_cols, on=["origin_week", "asin_i", "asin_j"], how="left")
-    merged_rank["rule_learned_rank_agree"] = (merged_rank["pred_rank_label"] == merged_rank["rule_pred_rank_label"]).astype(float)
-
-    # Interesting pairs where learned disagrees with rule.
-    learned_pos_rule_not = merged_rel[(merged_rel["pred_label"] == 2) & (merged_rel["rule_pred_label"] != 2)].sort_values("score_positive", ascending=False).head(top_n)
-    learned_comp_rule_not = merged_rel[(merged_rel["pred_label"] == 1) & (merged_rel["rule_pred_label"] != 1)].sort_values("score_competitive", ascending=False).head(top_n)
-    rule_pos_learned_not = merged_rel[(merged_rel["rule_pred_label"] == 2) & (merged_rel["pred_label"] != 2)].sort_values("rule_score_positive", ascending=False).head(top_n)
-    rule_comp_learned_not = merged_rel[(merged_rel["rule_pred_label"] == 1) & (merged_rel["pred_label"] != 1)].sort_values("rule_score_competitive", ascending=False).head(top_n)
-
-    if verbose:
-        print("\n" + "="*88)
-        print("RULE-BASED VS LEARNED-EDGE: RELATION HELDOUT REPORT")
-        print("="*88)
-        print(relation_compare.to_string(index=False))
-        print("\nRule relation confusion matrix [neutral, competitive, positive]:")
-        print(rule_out["rule_relation_confusion_matrix"])
-        print("\nLearned relation confusion matrix [neutral, competitive, positive]:")
-        print(learned_relation_out["confusion_matrix"])
-
-        print("\n" + "="*88)
-        print("RULE-BASED VS LEARNED-EDGE: RANK HELDOUT REPORT")
-        print("="*88)
-        print(rank_compare.to_string(index=False))
-        print("\nRule rank confusion matrix [close_rank, j_higher, i_higher]:")
-        print(rule_out["rule_rank_confusion_matrix"])
-        print("\nLearned rank confusion matrix [close_rank, j_higher, i_higher]:")
-        print(learned_rank_out["rank_confusion_matrix"])
-
-        print("\nAgreement relation:", float(merged_rel["rule_learned_agree"].mean()))
-        print("Agreement rank:", float(merged_rank["rule_learned_rank_agree"].mean()))
-
-        preview_cols = [c for c in ["origin_week", "asin_i", "asin_j", "category_code", "label_name", "pred_label_name", "rule_pred_label_name", "score_positive", "rule_score_positive", "score_competitive", "rule_score_competitive"] if c in merged_rel.columns]
-        print("\n=== Learned positive but rule not positive ===")
-        print(learned_pos_rule_not[preview_cols].head(10).to_string(index=False))
-        print("\n=== Learned competitive but rule not competitive ===")
-        print(learned_comp_rule_not[preview_cols].head(10).to_string(index=False))
-        print("\n=== Rule positive but learned not positive ===")
-        print(rule_pos_learned_not[preview_cols].head(10).to_string(index=False))
-        print("\n=== Rule competitive but learned not competitive ===")
-        print(rule_comp_learned_not[preview_cols].head(10).to_string(index=False))
-
-    return {
-        "relation_compare": relation_compare,
-        "rank_compare": rank_compare,
-        "merged_relation_scores": merged_rel,
-        "merged_rank_scores": merged_rank,
-        "learned_pos_rule_not": learned_pos_rule_not,
-        "learned_comp_rule_not": learned_comp_rule_not,
-        "rule_pos_learned_not": rule_pos_learned_not,
-        "rule_comp_learned_not": rule_comp_learned_not,
-    }
-
-
-def run_rule_vs_learned_edge_compare_scot5000(
+def run_gat_relation_test_scot5000_pkg_v5(
     data_raw1,
     scot_df=None,
     n_asins=5000,
-    seed=42,
     history_min_weeks=13,
     label_horizon=4,
     lookback_weeks=52,
+    max_pairs_per_category=1500,
     max_origins=12,
-    max_pairs_per_category=1200,
-    epochs=30,
-    batch_size=512,
+    relation_epochs=30,
+    rank_epochs=30,
+    seed=42,
 ):
     """
-    Fair comparison using one dynamic pair dataset:
-      - Rule-based edge score and rank score
-      - Learned EdgeMLP relation classifier and learned rank classifier
+    Run standalone dynamic relation/rank GAT edge test using:
+      exposure/demand history + our_price + promo/event + package size/weight edge gaps.
 
-    Use this before deciding whether to put learned-edge graph back into exposure model.
+    Outputs include pair_df with pkg gaps and relation/rank model diagnostics.
     """
     df = _prepare_joint_data(data_raw1, scot_df=scot_df, n_asins=n_asins, seed=seed)
     pair_df, profile_df = build_dynamic_pair_dataset(
@@ -1978,95 +1726,49 @@ def run_rule_vs_learned_edge_compare_scot5000(
         max_origins=max_origins,
         seed=seed,
     )
-    if pair_df.empty:
-        raise ValueError("No pair data constructed. Check category sizes / history length / data columns.")
+    print("\nPair dataset label distribution:")
+    print(pair_df["label_name"].value_counts(dropna=False).to_string())
+    if "pkg_size_similar_strict" in pair_df.columns:
+        print("\nPackage comparability in pair_df:")
+        print(pair_df[["pkg_complete_pair", "pkg_size_similar_strict", "pkg_size_similar_relaxed"]].mean().to_string())
+        print("\nLabel distribution by strict package-similar flag:")
+        print(pd.crosstab(pair_df["pkg_size_similar_strict"], pair_df["label_name"], normalize="index").round(3).to_string())
 
-    print("\nPair relation label distribution:")
-    print(pair_df["label_name"].value_counts().to_string())
-    print("\nPair dynamic-rank label distribution:")
-    print(pair_df["rank_label_name"].value_counts().to_string())
+    rel_result = train_relation_classifier(pair_df, epochs=relation_epochs, seed=seed)
+    print("\nHeldout relation report:")
+    print(pd.DataFrame(rel_result["heldout_report"]).T.to_string())
 
-    print("\n" + "=" * 88)
-    print("EVALUATE RULE-BASED EDGE/RANK SCORES")
-    print("=" * 88)
-    rule_out = evaluate_rule_based_on_heldout(pair_df, seed=seed)
+    rank_result = train_pairwise_rank_classifier(pair_df, epochs=rank_epochs, seed=seed)
+    print("\nHeldout rank report:")
+    print(pd.DataFrame(rank_result["rank_heldout_report"]).T.to_string())
 
-    print("\n" + "=" * 88)
-    print("TRAIN LEARNED EDGE RELATION CLASSIFIER")
-    print("=" * 88)
-    learned_rel = train_relation_classifier(
-        pair_df,
-        epochs=epochs,
-        batch_size=batch_size,
-        seed=seed,
-        verbose=True,
-    )
-
-    print("\n" + "=" * 88)
-    print("TRAIN LEARNED PAIRWISE DYNAMIC RANK CLASSIFIER")
-    print("=" * 88)
-    learned_rank = train_pairwise_rank_classifier(
-        pair_df,
-        epochs=epochs,
-        batch_size=batch_size,
-        seed=seed,
-        verbose=True,
-    )
-
-    compare = compare_rule_vs_learned_edge_outputs(
-        pair_df,
-        learned_relation_out=learned_rel,
-        learned_rank_out=learned_rank,
-        rule_out=rule_out,
-        verbose=True,
-    )
-
-    # Existing diagnostics for learned scores; useful for pair-level sanity checks.
-    learned_relation_diag = diagnose_relation_scores(learned_rel["scored_pair_df"], verbose=False)
-    learned_rank_diag = diagnose_dynamic_rank_scores(learned_rank["rank_scored_pair_df"], profile_df=profile_df, verbose=False)
+    relation_diag = diagnose_relation_scores(rel_result["scored_pair_df"], top_n=30, verbose=True)
+    rank_diag = diagnose_dynamic_rank_scores(rank_result["rank_scored_pair_df"], profile_df=profile_df, top_n=30, verbose=True)
 
     return {
-        "joint_df": df,
-        "profile_df": profile_df,
+        "df": df,
         "pair_df": pair_df,
-        "rule_out": rule_out,
-        "learned_relation_out": learned_rel,
-        "learned_rank_out": learned_rank,
-        "comparison": compare,
-        "relation_compare": compare["relation_compare"],
-        "rank_compare": compare["rank_compare"],
-        "merged_relation_scores": compare["merged_relation_scores"],
-        "merged_rank_scores": compare["merged_rank_scores"],
-        "learned_relation_diagnostics": learned_relation_diag,
-        "learned_rank_diagnostics": learned_rank_diag,
-        "top_positive_pairs": learned_relation_diag["top_positive_pairs"],
-        "top_competitive_pairs": learned_relation_diag["top_competitive_pairs"],
-        "top_j_higher_pairs": learned_rank_diag["top_j_higher_pairs"],
-        "top_i_higher_pairs": learned_rank_diag["top_i_higher_pairs"],
+        "profile_df": profile_df,
+        "relation_result": rel_result,
+        "rank_result": rank_result,
+        "relation_diag": relation_diag,
+        "rank_diag": rank_diag,
     }
 
 
-# ============================================================
-# FINAL USAGE FOR RULE VS LEARNED COMPARISON
-# ============================================================
-# In Jupyter, after data_raw1 and scot_df exist:
-#
-# %run -i gat_relation_rule_vs_learned_edge_compare_scot5000_v1.py
-#
-# compare_result = run_rule_vs_learned_edge_compare_scot5000(
+# Example usage in Jupyter:
+# %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v5_OURPRICE_PKG.py
+# gat_pkg_result = run_gat_relation_test_scot5000_pkg_v5(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     n_asins=5000,
 #     history_min_weeks=13,
 #     label_horizon=4,
 #     lookback_weeks=52,
+#     max_pairs_per_category=1500,
 #     max_origins=12,
-#     max_pairs_per_category=1200,
-#     epochs=30,
-#     batch_size=512,
+#     relation_epochs=30,
+#     rank_epochs=30,
 # )
-#
-# relation_compare = compare_result["relation_compare"]
-# rank_compare = compare_result["rank_compare"]
-# merged_relation_scores = compare_result["merged_relation_scores"]
-# merged_rank_scores = compare_result["merged_rank_scores"]
+# pair_df_pkg = gat_pkg_result["pair_df"]
+# scored_pair_df_pkg = gat_pkg_result["relation_result"]["scored_pair_df"]
