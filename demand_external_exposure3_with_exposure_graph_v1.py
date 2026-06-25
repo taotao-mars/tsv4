@@ -34,6 +34,7 @@ _DEMAND_EXPOSURE_GRAPH_CONTEXT_COLS = []
 _DEMAND_EXPOSURE_GRAPH_CONTEXT_DIM = 0
 _DEMAND_USE_EXPOSURE_GRAPH_ENCODER_FUSION = True
 _DEMAND_EXPOSURE_GRAPH_ENCODER_SCALE = 0.05
+_DEMAND_KNOWN_PROMO_CONTEXT_COLS = []
 
 
 # =====================================================
@@ -462,6 +463,62 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     # ------------------------------------------------------------
     data_raw = data_raw.copy()
     data_raw["order_week"] = pd.to_datetime(data_raw["order_week"], errors="coerce")
+
+    # ------------------------------------------------------------
+    # Known-future promotion / discount context for DEMAND.
+    # Assumption for this ablation: future promotion schedule and intensity
+    # are known at forecast origin, so horizon-specific values may enter
+    # future_context and the context-conditioned z generator.
+    # These are separate from the exposure hats and from exposure graph context.
+    # ------------------------------------------------------------
+    known_promo_cols = []
+
+    def _num_raw(col, default=0.0):
+        if col in data_raw.columns:
+            return pd.to_numeric(data_raw[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=data_raw.index, dtype=float)
+
+    if "ind_promotion" in data_raw.columns:
+        data_raw["known_future_ind_promotion"] = _num_raw("ind_promotion").clip(0.0, 1.0)
+        known_promo_cols.append("known_future_ind_promotion")
+
+    if "promotion_ratio" in data_raw.columns:
+        data_raw["known_future_promo_ratio"] = _num_raw("promotion_ratio").clip(lower=0.0, upper=5.0)
+        known_promo_cols.append("known_future_promo_ratio")
+
+    if "promotion_amount" in data_raw.columns:
+        data_raw["known_future_promo_amount_log"] = np.log1p(_num_raw("promotion_amount").clip(lower=0.0))
+        known_promo_cols.append("known_future_promo_amount_log")
+
+    if "promotion_pricing_amount" in data_raw.columns:
+        data_raw["known_future_promo_price_amount_log"] = np.log1p(_num_raw("promotion_pricing_amount").clip(lower=0.0))
+        known_promo_cols.append("known_future_promo_price_amount_log")
+
+    # A robust promo-presence indicator even if ind_promotion is sparse/missing.
+    promo_presence = pd.Series(0.0, index=data_raw.index, dtype=float)
+    if "ind_promotion" in data_raw.columns:
+        promo_presence = np.maximum(promo_presence, _num_raw("ind_promotion").clip(0.0, 1.0))
+    if "promotion_ratio" in data_raw.columns:
+        promo_presence = np.maximum(promo_presence, (_num_raw("promotion_ratio") > 0).astype(float))
+    if "promotion_amount" in data_raw.columns:
+        promo_presence = np.maximum(promo_presence, (_num_raw("promotion_amount") > 0).astype(float))
+    if "promotion_pricing_amount" in data_raw.columns:
+        promo_presence = np.maximum(promo_presence, (_num_raw("promotion_pricing_amount") > 0).astype(float))
+    data_raw["known_future_any_promo"] = pd.Series(promo_presence, index=data_raw.index).astype(float).clip(0.0, 1.0)
+    known_promo_cols.append("known_future_any_promo")
+
+    for src_col, dst_col in [
+        ("promotion_type", "known_future_promo_type_code"),
+        ("pricing_type", "known_future_pricing_type_code"),
+    ]:
+        if src_col in data_raw.columns:
+            codes, uniques = pd.factorize(data_raw[src_col].astype(str).fillna("MISSING"))
+            denom = max(len(uniques) - 1, 1)
+            data_raw[dst_col] = codes.astype(float) / denom
+            known_promo_cols.append(dst_col)
+
+    known_promo_cols = list(dict.fromkeys(known_promo_cols))
+
     data_raw["order_month"] = data_raw["order_week"].dt.month.astype(float)
     data_raw["month_sin"] = np.sin(2 * np.pi * data_raw["order_month"] / 12.0)
     data_raw["month_cos"] = np.cos(2 * np.pi * data_raw["order_month"] / 12.0)
@@ -499,8 +556,9 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     # Include holiday indicators, raw distance features, explicit season features,
     # and major-event proximity features.
-    context_cols = ["our_price"] + holiday_cols + distance_cols + seasonal_cols + proximity_cols
+    context_cols = ["our_price"] + holiday_cols + distance_cols + seasonal_cols + proximity_cols + known_promo_cols
     context_cols = list(dict.fromkeys(context_cols))
+    globals()["_DEMAND_KNOWN_PROMO_CONTEXT_COLS"] = list(known_promo_cols)
 
     base_cols = ["asin", "order_week", "fbi_demand", "scot_oos"]
 
@@ -734,6 +792,8 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print("History in_stock_dph: raw historical value, no lag shift")
     print("Future context excludes in_stock_dph")
     print("Future context includes distance_* calendar features")
+    print(f"Known future promo/context cols: {known_promo_cols}")
+    print("Context-conditioned z uses full future_context, including known promo/date, graph context, and external hats when attached")
     print("External exposure safe mode: demand uses external predicted DPH hats only")
     print("Safe historical DPH proxies: total/buy_box/in_stock last/mean4/mean13")
     print("History encoder includes DPH funnel features")
@@ -1895,6 +1955,46 @@ def demand_exposure_graph_validation_diagnostics(
     return {"summary": out, "graph_context_cols": graph_context_cols, "stored_graph_cols": graph_cols}
 
 
+def demand_known_promo_context_diagnostics(result, verbose=True):
+    """Check whether demand model received known-future promotion/date context and whether z can condition on it."""
+    context_cols = list(result.get("context_cols", []))
+    known_cols = [c for c in context_cols if str(c).startswith("known_future_")]
+    holiday_cols = [c for c in context_cols if str(c).startswith("holiday_indicator_")]
+    date_cols = [c for c in context_cols if c in {"order_month", "month_sin", "month_cos", "season_winter", "season_spring", "season_summer", "season_fall"}]
+    graph_cols = list(globals().get("_DEMAND_EXPOSURE_GRAPH_CONTEXT_COLS", []))
+    n_graph = int(globals().get("_DEMAND_EXPOSURE_GRAPH_CONTEXT_DIM", 0))
+
+    out = pd.DataFrame([{
+        "context_dim": int(result.get("context_dim", len(context_cols))),
+        "n_known_promo_cols": len(known_cols),
+        "n_date_seasonality_cols": len(date_cols),
+        "n_holiday_cols": len(holiday_cols),
+        "n_exposure_graph_cols": n_graph,
+        "external_hats_last3": True,
+        "z_generator_conditioning": "phi + flattened future_context",
+        "known_promo_enters_z": len(known_cols) > 0,
+        "graph_enters_z": n_graph > 0,
+        "exposure_hats_enter_z": True,
+    }])
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("DEMAND KNOWN-PROMO / CONTEXT-Z CHECK")
+        print("=" * 100)
+        print(out.T)
+        print("Known promo cols:", known_cols)
+        print("Date/seasonality cols:", date_cols)
+        print("Holiday cols preview:", holiday_cols[:20], "..." if len(holiday_cols) > 20 else "")
+        if graph_cols:
+            print("Exposure graph cols preview:", graph_cols[:20], "..." if len(graph_cols) > 20 else "")
+        print("\nInterpretation:")
+        print("- Demand receives exposure hats as the last 3 future_context columns.")
+        print("- Demand receives exposure graph/rank context immediately before the hats.")
+        print("- Known future promo/date/holiday features are part of future_context and therefore condition z_generator.")
+
+    return {"summary": out, "known_promo_cols": known_cols, "date_cols": date_cols, "holiday_cols": holiday_cols, "graph_context_cols": graph_cols}
+
+
 def add_demand_validation_checks_to_result(result, verbose=True):
     """
     Add the three slide-ready demand validation checks to a result dict:
@@ -1908,6 +2008,7 @@ def add_demand_validation_checks_to_result(result, verbose=True):
     result["demand_nb_distribution_diagnostics"] = demand_nb_distribution_diagnostics(forecast_df, verbose=verbose)
     result["demand_zero_active_diagnostics"] = demand_active_zero_diagnostics(forecast_df, verbose=verbose)
     result["demand_exposure_graph_validation_diagnostics"] = demand_exposure_graph_validation_diagnostics(result, verbose=verbose)
+    result["demand_known_promo_context_diagnostics"] = demand_known_promo_context_diagnostics(result, verbose=verbose)
     return result
 
 
@@ -2801,7 +2902,11 @@ def run_nb_all_sample_scot_intersection(
         "intersect_asin_df": intersect_asin_df,
         "removed_extreme": removed_extreme,
         "extreme_cap": extreme_cap,
+        "context_cols": context_cols,
+        "context_dim": context_dim,
     }
+
+    result = add_demand_validation_checks_to_result(result, verbose=True)
 
     if run_wape:
         result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
@@ -3269,7 +3374,7 @@ def run_external_exposure3_in_old_decoder_style(
     This function injects the three hats into the demand model's future context.
     """
     print("\n" + "=" * 100)
-    print("DEMAND MODEL WITH EXTERNAL EXPOSURE HATS")
+    print("DEMAND MODEL WITH EXTERNAL EXPOSURE HATS + GRAPH + KNOWN PROMO CONTEXT-Z")
     print("=" * 100)
     print("exposure_mode:", exposure_mode)
 
