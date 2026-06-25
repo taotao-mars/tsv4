@@ -2,7 +2,7 @@
 # Dynamic ASIN relation test for 5000 + SCOT joint ASINs
 # ------------------------------------------------------------
 # Goal:
-#   Test whether same-category ASIN-ASIN relations can be learned dynamically
+#   Test whether category + package-comparable ASIN relations can be learned dynamically
 #   at each order_week / forecast origin.
 #
 # Key design:
@@ -16,7 +16,7 @@
 #   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand, ind_promotion, our_price, holiday/event indicators
 #   pkg_height, pkg_length, pkg_width, pkg_weight -> volume/weight/shape edge comparability
 #   known future promotion schedule/intensity features (oracle ablation)
-#   dynamic category rank / magnitude hierarchy features by origin_week
+#   dynamic package-local peer rank / magnitude hierarchy features by origin_week
 #
 # Usage is at the bottom. Designed for Jupyter:
 #   %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v4_OURPRICE_EVENT_SPARSE.py
@@ -973,7 +973,7 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
 
 
 def _future_rank_map(profile_df, future_dict):
-    """Compute future label-window within-category rank for diagnostics/training target."""
+    """Compute future strength. Category rank is retained only as a diagnostic."""
     if profile_df is None or profile_df.empty:
         return {}
     tmp = profile_df[["asin", "category_code"]].copy()
@@ -993,6 +993,110 @@ def _future_rank_map(profile_df, future_dict):
     tmp["future_cat_rank"] = tmp.groupby("category_code")["future_strength"].transform(_safe_percentile_rank)
     return tmp.set_index("asin")[["future_strength", "future_cat_rank"]].to_dict("index")
 
+
+def _package_pair_is_comparable(row_i, row_j, mode="relaxed"):
+    """Static package gate used before a pair can enter relation/rank testing."""
+    complete = (
+        float(row_i.get("pkg_complete", 0.0)) > 0.5 and
+        float(row_j.get("pkg_complete", 0.0)) > 0.5
+    )
+    if not complete:
+        return False
+
+    dh = abs(float(row_j.get("log_pkg_height", 0.0)) - float(row_i.get("log_pkg_height", 0.0)))
+    dl = abs(float(row_j.get("log_pkg_length", 0.0)) - float(row_i.get("log_pkg_length", 0.0)))
+    dw = abs(float(row_j.get("log_pkg_width", 0.0)) - float(row_i.get("log_pkg_width", 0.0)))
+    dwt = abs(float(row_j.get("log_pkg_weight", 0.0)) - float(row_i.get("log_pkg_weight", 0.0)))
+    dv = abs(float(row_j.get("log_pkg_volume", 0.0)) - float(row_i.get("log_pkg_volume", 0.0)))
+    distance = float(np.sqrt(dh**2 + dl**2 + dw**2 + dwt**2))
+
+    if str(mode).lower() == "strict":
+        return dh <= 0.35 and dl <= 0.35 and dw <= 0.35 and dwt <= 0.50 and dv <= 0.70 and distance <= 0.90
+    if str(mode).lower() != "relaxed":
+        raise ValueError("package_match_mode must be 'strict' or 'relaxed'")
+    return dh <= 0.45 and dl <= 0.45 and dw <= 0.45 and dwt <= 0.65 and dv <= 0.90 and distance <= 1.10
+
+
+def _build_package_peer_context(cat_prof, future_rank_map, package_match_mode="relaxed"):
+    """
+    Build a package-comparability matrix inside one category.
+
+    For pair (i, j), its ranking reference set is intersection(N_i, N_j).
+    Therefore i and j are always ranked against exactly the same local peers.
+    """
+    cp = cat_prof.reset_index(drop=True).copy()
+    asins = cp["asin"].astype(str).tolist()
+    n = len(cp)
+    comparable = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ok = _package_pair_is_comparable(cp.iloc[i], cp.iloc[j], mode=package_match_mode)
+            comparable[i, j] = ok
+            comparable[j, i] = ok
+    # A complete-package ASIN belongs to its own neighborhood.
+    for i in range(n):
+        comparable[i, i] = float(cp.iloc[i].get("pkg_complete", 0.0)) > 0.5
+
+    future_strength = np.asarray([
+        float(future_rank_map.get(a, {}).get("future_strength", 0.0)) for a in asins
+    ], dtype=float)
+    return {
+        "profile": cp,
+        "asins": asins,
+        "asin_to_pos": {a: i for i, a in enumerate(asins)},
+        "comparable": comparable,
+        "future_strength": future_strength,
+    }
+
+
+def _peer_percentiles(values, peer_mask):
+    values = np.asarray(values, dtype=float)
+    idx = np.flatnonzero(peer_mask)
+    out = np.full(len(values), 0.5, dtype=float)
+    if len(idx) == 0:
+        return out
+    ranks = _safe_percentile_rank(pd.Series(values[idx])).to_numpy(dtype=float)
+    out[idx] = ranks
+    return out
+
+
+def _inject_local_peer_rank_features(edge_feat, peer_ctx, i, j, peer_mask):
+    """Replace broad category-rank edge features with package-local peer ranks."""
+    cp = peer_ctx["profile"]
+    specs = {
+        "recent13_total": ("total_log_recent13_mean", False),
+        "recent13_buybox": ("buybox_log_recent13_mean", False),
+        "recent13_instock": ("instock_log_recent13_mean", False),
+        "recent13_demand": ("demand_log_recent13_mean", False),
+        "long52_total": ("total_log_long52_mean", False),
+        "momentum": ("dyn_momentum_raw", False),
+        "promo_boost": ("dyn_promo_boost_raw", False),
+        "known_promo": ("dyn_known_promo_raw", False),
+        "event_boost": ("dyn_event_boost_raw", False),
+        "active_eligibility": ("dyn_active_eligibility_raw", False),
+        "zero_good": ("dyn_zero_penalty_raw", True),
+        "dynamic_strength": ("dynamic_strength_raw", False),
+        "composite_dynamic": ("dynamic_strength_raw", False),
+    }
+    for short, (src, invert) in specs.items():
+        vals = pd.to_numeric(cp.get(src, pd.Series(0.0, index=cp.index)), errors="coerce").fillna(0.0).to_numpy()
+        rr = _peer_percentiles(vals, peer_mask)
+        if invert:
+            rr = 1.0 - rr
+        ri, rj = float(rr[i]), float(rr[j])
+        edge_feat[f"rank_{short}_i"] = ri
+        edge_feat[f"rank_{short}_j"] = rj
+        edge_feat[f"rank_{short}_signed_gap_j_minus_i"] = rj - ri
+        edge_feat[f"rank_{short}_abs_gap"] = abs(rj - ri)
+        edge_feat[f"j_higher_rank_{short}"] = float(rj > ri + 0.10)
+
+    gap = float(edge_feat.get("rank_composite_dynamic_signed_gap_j_minus_i", 0.0))
+    edge_feat["j_higher_dynamic_rank"] = float(gap > 0.10)
+    edge_feat["i_higher_dynamic_rank"] = float(gap < -0.10)
+    edge_feat["dynamic_rank_abs_gap"] = abs(gap)
+    edge_feat["pkg_peer_count"] = float(np.sum(peer_mask))
+    return edge_feat
+
 def build_dynamic_pair_dataset(
     df,
     origin_weeks=None,
@@ -1003,6 +1107,8 @@ def build_dynamic_pair_dataset(
     max_origins=12,
     seed=42,
     known_promo_horizon=20,
+    package_match_mode="relaxed",
+    min_pkg_peer_size=3,
 ):
     rng = np.random.default_rng(seed)
     all_weeks = sorted(pd.to_datetime(df["order_week"].dropna().unique()))
@@ -1046,33 +1152,34 @@ def build_dynamic_pair_dataset(
         origin_pairs = 0
 
         for cat in usable_cats:
-            asins = prof.loc[prof["category_code"] == cat, "asin"].astype(str).values
-            n = len(asins)
-            # all pairs if small, random sample if large
-            possible = n * (n - 1)
-            cap = min(max_pairs_per_category, possible)
-            if possible <= max_pairs_per_category:
-                pairs = [(a, b) for a in asins for b in asins if a != b]
-            else:
-                pairs = []
-                seen = set()
-                attempts = 0
-                while len(pairs) < cap and attempts < cap * 10:
-                    a, b = rng.choice(asins, size=2, replace=False)
-                    key = (a, b)
-                    if key not in seen:
-                        pairs.append(key)
-                        seen.add(key)
-                    attempts += 1
+            cat_prof = prof.loc[prof["category_code"] == cat].copy()
+            peer_ctx = _build_package_peer_context(cat_prof, fut_rank, package_match_mode=package_match_mode)
+            asins = np.asarray(peer_ctx["asins"], dtype=object)
+            comp = peer_ctx["comparable"]
+            eligible_pos = np.argwhere(comp & ~np.eye(len(asins), dtype=bool))
+            if len(eligible_pos) == 0:
+                continue
+            if len(eligible_pos) > max_pairs_per_category:
+                take = rng.choice(len(eligible_pos), size=max_pairs_per_category, replace=False)
+                eligible_pos = eligible_pos[take]
+            pairs = [(str(asins[i]), str(asins[j]), int(i), int(j)) for i, j in eligible_pos]
 
-            for a, b in pairs:
+            for a, b, pos_i, pos_j in pairs:
+                # Common-neighbor intersection gives both ASINs one identical rank reference set.
+                peer_mask = comp[pos_i] & comp[pos_j]
+                if int(np.sum(peer_mask)) < int(min_pkg_peer_size):
+                    continue
                 ri = prof_idx.loc[a]
                 rj = prof_idx.loc[b]
                 ef = _edge_features(ri, rj, seqs.get(a), seqs.get(b))
+                ef = _inject_local_peer_rank_features(ef, peer_ctx, pos_i, pos_j, peer_mask)
                 y = _weak_relation_label(ef, fut.get(a), fut.get(b))
                 fri = fut_rank.get(a, {"future_strength": 0.0, "future_cat_rank": 0.5})
                 frj = fut_rank.get(b, {"future_strength": 0.0, "future_cat_rank": 0.5})
-                future_rank_gap = float(frj.get("future_cat_rank", 0.5) - fri.get("future_cat_rank", 0.5))
+                future_peer_ranks = _peer_percentiles(peer_ctx["future_strength"], peer_mask)
+                future_peer_rank_i = float(future_peer_ranks[pos_i])
+                future_peer_rank_j = float(future_peer_ranks[pos_j])
+                future_rank_gap = future_peer_rank_j - future_peer_rank_i
                 # Sparse-aware + event-aware rank label:
                 # - if both ASINs are effectively inactive and no current promo/event signal, keep them close.
                 # - normal weeks use a wider close band to avoid fake ordering among many zeros.
@@ -1102,8 +1209,13 @@ def build_dynamic_pair_dataset(
                     "rank_label_name": rank_label_name,
                     "future_strength_i": float(fri.get("future_strength", 0.0)),
                     "future_strength_j": float(frj.get("future_strength", 0.0)),
-                    "future_cat_rank_i": float(fri.get("future_cat_rank", 0.5)),
-                    "future_cat_rank_j": float(frj.get("future_cat_rank", 0.5)),
+                    "future_category_rank_i_diagnostic": float(fri.get("future_cat_rank", 0.5)),
+                    "future_category_rank_j_diagnostic": float(frj.get("future_cat_rank", 0.5)),
+                    "future_peer_rank_i": future_peer_rank_i,
+                    "future_peer_rank_j": future_peer_rank_j,
+                    # Backward-compatible aliases now intentionally contain package-peer ranks.
+                    "future_cat_rank_i": future_peer_rank_i,
+                    "future_cat_rank_j": future_peer_rank_j,
                     "future_rank_gap_j_minus_i": future_rank_gap,
                     "hbt_i": ri["hbt"],
                     "hbt_j": rj["hbt"],
@@ -1111,8 +1223,8 @@ def build_dynamic_pair_dataset(
                     "top10_j": rj["ind_top10_brand"],
                     "funnel_strength_i": ri["funnel_strength"],
                     "funnel_strength_j": rj["funnel_strength"],
-                    "dynamic_rank_i": ri.get("cat_rank_composite_dynamic", 0.5),
-                    "dynamic_rank_j": rj.get("cat_rank_composite_dynamic", 0.5),
+                    "dynamic_rank_i": ef.get("rank_composite_dynamic_i", 0.5),
+                    "dynamic_rank_j": ef.get("rank_composite_dynamic_j", 0.5),
                     "dynamic_strength_raw_i": ri.get("dynamic_strength_raw", 0.0),
                     "dynamic_strength_raw_j": rj.get("dynamic_strength_raw", 0.0),
                     "ind_promotion_current_i": ri.get("ind_promotion_current", 0.0),
@@ -1217,7 +1329,10 @@ def train_relation_classifier(pair_df, epochs=30, batch_size=512, lr=1e-3, seed=
         "rank_label", "rank_label_name",
         "future_strength_i", "future_strength_j", "future_cat_rank_i", "future_cat_rank_j", "future_rank_gap_j_minus_i",
     }
-    feat_cols = [c for c in pair_df.columns if c not in exclude and pd.api.types.is_numeric_dtype(pair_df[c])]
+    feat_cols = [
+        c for c in pair_df.columns
+        if c not in exclude and not c.startswith("future_") and pd.api.types.is_numeric_dtype(pair_df[c])
+    ]
     df = pair_df.copy()
     for c in feat_cols:
         df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -1358,7 +1473,10 @@ def train_pairwise_rank_classifier(pair_df, epochs=30, batch_size=512, lr=1e-3, 
         "rank_label", "rank_label_name",
         "future_strength_i", "future_strength_j", "future_cat_rank_i", "future_cat_rank_j", "future_rank_gap_j_minus_i",
     }
-    feat_cols = [c for c in pair_df.columns if c not in exclude and pd.api.types.is_numeric_dtype(pair_df[c])]
+    feat_cols = [
+        c for c in pair_df.columns
+        if c not in exclude and not c.startswith("future_") and pd.api.types.is_numeric_dtype(pair_df[c])
+    ]
     df = pair_df.copy()
     for c in feat_cols:
         df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -1681,6 +1799,8 @@ def run_dynamic_gat_relation_test_scot5000(
     epochs=30,
     batch_size=512,
     known_promo_horizon=20,
+    package_match_mode="relaxed",
+    min_pkg_peer_size=3,
 ):
     df = _prepare_joint_data(data_raw1, scot_df=scot_df, n_asins=n_asins, seed=seed)
     pair_df, profile_df = build_dynamic_pair_dataset(
@@ -1692,6 +1812,8 @@ def run_dynamic_gat_relation_test_scot5000(
         max_origins=max_origins,
         seed=seed,
         known_promo_horizon=known_promo_horizon,
+        package_match_mode=package_match_mode,
+        min_pkg_peer_size=min_pkg_peer_size,
     )
     if pair_df.empty:
         raise ValueError("No pair data constructed. Check category sizes / history length / data columns.")
@@ -1804,7 +1926,7 @@ def run_dynamic_gat_relation_test_scot5000(
 # ============================================================
 # V6 convenience runner: dynamic relation GAT test with package + known promo edge features
 # ============================================================
-def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
+def run_gat_relation_test_scot5000_pkg_peer_rank_v7(
     data_raw1,
     scot_df=None,
     n_asins=5000,
@@ -1817,11 +1939,18 @@ def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
     rank_epochs=30,
     seed=42,
     known_promo_horizon=20,
+    package_match_mode="relaxed",
+    min_pkg_peer_size=3,
 ):
     """
-    Run standalone dynamic relation/rank GAT edge test using:
+    Run standalone dynamic relation/rank edge test using:
       exposure/demand history + our_price + promo/event + package size/weight edge gaps
       + known future promotion schedule/intensity edge gaps.
+
+    V7 ranking policy:
+      - only category + package-comparable pairs enter the tests;
+      - pair (i,j) is ranked inside intersection(package_neighbors_i, package_neighbors_j);
+      - future outcomes are used only to construct labels, never model inputs.
 
     Outputs include pair_df with pkg gaps and relation/rank model diagnostics.
     """
@@ -1835,6 +1964,8 @@ def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
         max_origins=max_origins,
         seed=seed,
         known_promo_horizon=known_promo_horizon,
+        package_match_mode=package_match_mode,
+        min_pkg_peer_size=min_pkg_peer_size,
     )
     print("\nPair dataset label distribution:")
     print(pair_df["label_name"].value_counts(dropna=False).to_string())
@@ -1843,6 +1974,10 @@ def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
         print(pair_df[["pkg_complete_pair", "pkg_size_similar_strict", "pkg_size_similar_relaxed"]].mean().to_string())
         print("\nLabel distribution by strict package-similar flag:")
         print(pd.crosstab(pair_df["pkg_size_similar_strict"], pair_df["label_name"], normalize="index").round(3).to_string())
+    print(f"\nPackage-aware pair/rank policy: mode={package_match_mode}, min_common_peers={min_pkg_peer_size}")
+    if "pkg_peer_count" in pair_df.columns:
+        print("Common package-peer count distribution:")
+        print(pair_df["pkg_peer_count"].describe().round(2).to_string())
     known_cols = [c for c in [
         "known_promo_nextH_rate_abs_gap", "known_promo_long13_20_rate_abs_gap",
         "known_promo_ratio_max_abs_gap", "same_known_promo_schedule_soft",
@@ -1877,8 +2012,8 @@ def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
 
 
 # Example usage in Jupyter:
-# %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v6_OURPRICE_PKG_KNOWNPROMO.py
-# gat_pkg_result = run_gat_relation_test_scot5000_pkg_knownpromo_v6(
+# %run -i gat_relation_test_scot5000_PKG_PEER_RANK_v7.py
+# gat_pkg_result = run_gat_relation_test_scot5000_pkg_peer_rank_v7(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     n_asins=5000,
@@ -1889,6 +2024,8 @@ def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
 #     max_origins=12,
 #     relation_epochs=30,
 #     rank_epochs=30,
+#     package_match_mode="relaxed",
+#     min_pkg_peer_size=3,
 # )
 # pair_df_pkg = gat_pkg_result["pair_df"]
 # scored_pair_df_pkg = gat_pkg_result["relation_result"]["scored_pair_df"]
