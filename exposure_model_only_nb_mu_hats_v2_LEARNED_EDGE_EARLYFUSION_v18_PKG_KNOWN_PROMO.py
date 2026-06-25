@@ -2141,8 +2141,25 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 nn.ReLU(),
                 nn.Linear(d_model, d_model),
             )
+            # V19: explicit context-conditioned latent regime generator.
+            # Instead of drawing z from an unconditional N(0,I), infer z from
+            # the encoder summary and horizon-level known future context.
+            # Because future_context already includes known promo/date/holiday and
+            # graph_emb_* columns, z is conditioned on h_t, G, and c_{t+h}.
+            self.z_context_net = nn.Sequential(
+                nn.Linear(d_model + context_dim, max(d_model, hidden)),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(max(d_model, hidden), max(d_model // 2, self.z_dim * 2)),
+                nn.ReLU(),
+            )
+            self.z_mu_head = nn.Linear(max(d_model // 2, self.z_dim * 2), self.z_dim)
+            self.z_logstd_head = nn.Linear(max(d_model // 2, self.z_dim * 2), self.z_dim)
         else:
             self.z_proj = None
+            self.z_context_net = None
+            self.z_mu_head = None
+            self.z_logstd_head = None
 
         # future_context + horizon position encoding -> hidden
         self.input_proj = nn.Sequential(
@@ -2258,10 +2275,28 @@ class TCNDecoderWithCrossAttn(nn.Module):
         z_out = self.post_norm(q + attn_out)  # [B,H,D]
 
         # One latent z per ASIN-window; repeat across horizon to learn joint path regime.
+        # V19: when z is not explicitly provided, generate z from q_phi(z | h_t, G, c_{t+h}).
+        # - h_t: pooled encoder/cross-attended history state
+        # - G: graph information is already in enc_out via early fusion and in future_context via graph_emb_*
+        # - c_{t+h}: known future context, including date/holiday/known promo fields
         z_emb = None
+        z_mu = None
+        z_logstd = None
         if self.use_enn:
             if z is None:
-                z = torch.randn(B, self.z_dim, device=future_context.device, dtype=future_context.dtype)
+                enc_summary = enc_out.mean(dim=1)              # [B,D]
+                ctx_summary = future_context.mean(dim=1)       # [B,C]
+                z_hidden = self.z_context_net(torch.cat([enc_summary, ctx_summary], dim=-1))
+                z_mu = self.z_mu_head(z_hidden)
+                z_logstd = self.z_logstd_head(z_hidden).clamp(-4.0, 2.0)
+                if self.training:
+                    eps = torch.randn_like(z_mu)
+                    z = z_mu + eps * torch.exp(z_logstd)
+                else:
+                    z = z_mu
+            else:
+                z_mu = z
+                z_logstd = torch.zeros_like(z)
             z_emb = self.z_proj(z)                         # [B,D]
             z_rep = z_emb[:, None, :].expand(B, H, -1)      # [B,H,D]
         else:
@@ -2354,6 +2389,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "gate": gate,
                 "residual": residual,
                 "z": z,
+                "z_mu": z_mu if z_mu is not None else torch.full((B, self.z_dim), float("nan"), device=future_context.device, dtype=future_context.dtype),
+                "z_logstd": z_logstd if z_logstd is not None else torch.full((B, self.z_dim), float("nan"), device=future_context.device, dtype=future_context.dtype),
                 "attn_weights": attn_w,
             }
         return log_hat
@@ -2547,7 +2584,7 @@ class ExposureForecastModelV2(nn.Module):
             self.graph_context_cols = [f"graph_emb_{i}" for i in range(self.graph_dim)]
             if context_cols is not None:
                 context_cols = list(context_cols) + self.graph_context_cols
-            print(f"V15 LearnedEdge EarlyFusion DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
+            print(f"V19 ContextZ + LearnedEdge EarlyFusion DualRelationalGAT enabled: graph_dim={self.graph_dim} | nodes={node_np.shape[0]} | node_feat_dim={node_np.shape[1]} | edge_feat_dim={self.edge_feat_dim} | msg_scale={graph_message_scale} | learned_edge={self.use_learned_edge_score} | learned_scale={self.learned_edge_score_scale} | rule_prior_scale={self.rule_edge_prior_scale}")
             print(f"Dynamic rank node features: dim={self.rank_feat_dim} | rank_correction={self.use_rank_correction} | scale={self.rank_correction_scale}")
             print(f"Category-only graph v12: sparse/event-aware dynamic rank + long-horizon floor + horizon + GL/category shrinkage calibration.")
         else:
@@ -2658,7 +2695,7 @@ class ExposureForecastModelV2(nn.Module):
             self.graph_encoder_gate = None
             self.graph_encoder_norm = None
 
-        print(f"V15 graph encoder fusion: {self.use_graph_encoder_fusion} | scale={self.graph_encoder_scale}")
+        print(f"V19 graph encoder fusion: {self.use_graph_encoder_fusion} | scale={self.graph_encoder_scale}")
 
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
@@ -2713,6 +2750,8 @@ class ExposureForecastModelV2(nn.Module):
         print(f"Mag head feat dim:    {len(mag_feat_indices)}")
         print("Graph direct-to-mag-head feat dim: 0 (v7 keeps graph out of mag features)")
         print(f"Graph delta head: {self.use_graph_head} | graph_head_scale={self.graph_head_scale}")
+
+        print("V19 context-conditioned z: z ~ q_phi(z | encoder_summary, graph_emb, known_future_context); known promo/date enter z via future_context.")
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
