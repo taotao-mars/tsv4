@@ -15,6 +15,7 @@
 # Core features emphasized:
 #   total_dph, buy_box_dph, in_stock_dph, fbi_demand, hbt, ind_top10_brand, ind_promotion, our_price, holiday/event indicators
 #   pkg_height, pkg_length, pkg_width, pkg_weight -> volume/weight/shape edge comparability
+#   known future promotion schedule/intensity features (oracle ablation)
 #   dynamic category rank / magnitude hierarchy features by origin_week
 #
 # Usage is at the bottom. Designed for Jupyter:
@@ -177,6 +178,21 @@ def _prepare_joint_data(data_raw1, scot_df=None, n_asins=5000, seed=42):
     else:
         out["ind_promotion"] = 0.0
 
+    # Known-future promotion intensity features for oracle/upper-bound graph diagnostics.
+    # These should be used only when the business forecast origin knows the promotion schedule.
+    for c in ["promotion_ratio", "promotion_amount", "promotion_pricing_amount"]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = _safe_numeric(out[c]).clip(lower=0.0)
+    out["log_promotion_amount"] = np.log1p(out["promotion_amount"].fillna(0.0))
+    out["log_promotion_pricing_amount"] = np.log1p(out["promotion_pricing_amount"].fillna(0.0))
+    if "promotion_type" in out.columns:
+        promo_type = _safe_str_col(out, "promotion_type", default="NO_PROMO")
+        out["promotion_type_code"] = pd.factorize(promo_type)[0].astype(float)
+        out["promotion_type_code"] = out["promotion_type_code"].where(out["ind_promotion"] > 0.5, 0.0)
+    else:
+        out["promotion_type_code"] = 0.0
+
     if "ind_prime_week" in out.columns:
         out["ind_prime_week"] = _safe_numeric(out["ind_prime_week"]).clip(0, 1)
     else:
@@ -204,7 +220,7 @@ def _prepare_joint_data(data_raw1, scot_df=None, n_asins=5000, seed=42):
     out["log_pkg_weight"] = np.log1p(out["pkg_weight"].fillna(0.0))
     out["log_pkg_volume"] = np.log1p(out["pkg_volume"].fillna(0.0))
 
-    print("Dynamic rank v5 uses our_price + package size/weight edge features.")
+    print("Dynamic rank v6 uses our_price + package size/weight + KNOWN FUTURE PROMO edge features.")
     print(f"Holiday indicator cols: {len([c for c in out.columns if c.startswith('holiday_indicator_')])} | distance cols: {len([c for c in out.columns if c.startswith('distance_')])}")
 
     return out.sort_values(["asin", "order_week"]).reset_index(drop=True)
@@ -349,10 +365,20 @@ def _add_category_dynamic_ranks(prof):
         0.15 * prof.get("event_recent13_rate", 0.0)
     )
     prof["dyn_promo_boost_raw"] = (
-        0.40 * prof.get("ind_promotion_current", 0.0) +
-        0.20 * prof.get("promo_recent13_rate", 0.0) +
-        0.20 * prof.get("promo_response_strength", 0.0) +
-        0.20 * prof["dyn_event_boost_raw"]
+        0.35 * prof.get("ind_promotion_current", 0.0) +
+        0.15 * prof.get("promo_recent13_rate", 0.0) +
+        0.15 * prof.get("promo_response_strength", 0.0) +
+        0.15 * prof.get("known_promo_nextH_rate", 0.0) +
+        0.10 * prof.get("known_promo_long13_20_rate", 0.0) +
+        0.05 * prof.get("known_promo_ratio_max", 0.0) +
+        0.05 * prof["dyn_event_boost_raw"]
+    )
+    prof["dyn_known_promo_raw"] = (
+        0.35 * prof.get("known_promo_nextH_rate", 0.0) +
+        0.25 * prof.get("known_promo_long13_20_rate", 0.0) +
+        0.20 * prof.get("known_promo_ratio_max", 0.0) +
+        0.10 * prof.get("known_promo_amount_log_max", 0.0) +
+        0.10 * prof.get("known_promo_price_amount_log_max", 0.0)
     )
     prof["dyn_active_eligibility_raw"] = prof.get("active_eligibility_raw", 0.0)
     prof["dyn_business_prior_raw"] = (
@@ -384,6 +410,7 @@ def _add_category_dynamic_ranks(prof):
         "cat_rank_long52_total": "total_log_long52_mean",
         "cat_rank_momentum": "dyn_momentum_raw",
         "cat_rank_promo_boost": "dyn_promo_boost_raw",
+        "cat_rank_known_promo": "dyn_known_promo_raw",
         "cat_rank_event_boost": "dyn_event_boost_raw",
         "cat_rank_active_eligibility": "dyn_active_eligibility_raw",
         "cat_rank_zero_good": "dyn_zero_penalty_raw",  # inverted below
@@ -406,19 +433,24 @@ def _add_category_dynamic_ranks(prof):
         0.15 * prof["cat_rank_recent13_demand"] +
         0.09 * prof["cat_rank_momentum"] +
         0.04 * prof["cat_rank_promo_boost"] +
-        0.04 * prof["cat_rank_event_boost"] +
+        0.04 * prof.get("cat_rank_known_promo", 0.5) +
+        0.03 * prof["cat_rank_event_boost"] +
         0.05 * prof["cat_rank_active_eligibility"] +
         0.03 * prof["cat_rank_zero_good"]
     ).clip(0.0, 1.0)
 
     return prof
 
-def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
+def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13, known_promo_horizon=20):
     """Build ASIN node features using only weeks < origin_week."""
     origin_week = pd.to_datetime(origin_week)
     hist = df[df["order_week"] < origin_week].copy()
     current = df[df["order_week"] == origin_week].copy()
     current_idx = current.sort_values("order_week").groupby("asin").tail(1).set_index("asin") if len(current) else pd.DataFrame()
+    # Future promo schedule assumed known for this diagnostic.  This is NOT target leakage
+    # only under the oracle/known-promotion assumption; otherwise treat it as an ablation.
+    future_weeks = sorted(df[df["order_week"] >= origin_week]["order_week"].dropna().unique())[:known_promo_horizon]
+    future_known = df[df["order_week"].isin(future_weeks)].copy() if len(future_weeks) else pd.DataFrame()
     if hist.empty:
         return pd.DataFrame()
 
@@ -494,6 +526,42 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
         row["promo_event_recent13_rate"] = float(g["promo_event_index"].tail(13).mean()) if "promo_event_index" in g.columns and len(g) else row["promo_recent13_rate"]
         row["hist_len"] = float(len(g))
 
+        # Known future promo schedule/intensity over the forecast horizon.
+        # This lets the graph diagnostic test whether future promo information improves
+        # relation/rank learning beyond historical promo regime.
+        if not future_known.empty:
+            fg = future_known[future_known["asin"].astype(str) == str(asin)].sort_values("order_week")
+        else:
+            fg = pd.DataFrame()
+        if len(fg) > 0:
+            promo_seq = _safe_numeric(fg.get("ind_promotion", pd.Series(0, index=fg.index))).values.astype(float)
+            ratio_seq = _safe_numeric(fg.get("promotion_ratio", pd.Series(0, index=fg.index))).values.astype(float)
+            amt_seq = _safe_numeric(fg.get("log_promotion_amount", pd.Series(0, index=fg.index))).values.astype(float)
+            price_amt_seq = _safe_numeric(fg.get("log_promotion_pricing_amount", pd.Series(0, index=fg.index))).values.astype(float)
+            ptype_seq = _safe_numeric(fg.get("promotion_type_code", pd.Series(0, index=fg.index))).values.astype(float)
+        else:
+            promo_seq = np.zeros(known_promo_horizon, dtype=float)
+            ratio_seq = np.zeros(known_promo_horizon, dtype=float)
+            amt_seq = np.zeros(known_promo_horizon, dtype=float)
+            price_amt_seq = np.zeros(known_promo_horizon, dtype=float)
+            ptype_seq = np.zeros(known_promo_horizon, dtype=float)
+        def _first_active_horizon(a):
+            idx = np.where(np.asarray(a) > 0.5)[0]
+            return float(idx[0] + 1) if len(idx) else float(known_promo_horizon + 1)
+        row["known_promo_nextH_rate"] = float(np.mean(promo_seq)) if len(promo_seq) else 0.0
+        row["known_promo_next4_rate"] = float(np.mean(promo_seq[:min(4, len(promo_seq))])) if len(promo_seq) else 0.0
+        row["known_promo_next13_rate"] = float(np.mean(promo_seq[:min(13, len(promo_seq))])) if len(promo_seq) else 0.0
+        row["known_promo_long13_20_rate"] = float(np.mean(promo_seq[12:20])) if len(promo_seq) >= 13 else 0.0
+        row["known_promo_any_nextH"] = float(np.max(promo_seq) > 0.5) if len(promo_seq) else 0.0
+        row["known_promo_first_horizon"] = _first_active_horizon(promo_seq)
+        row["known_promo_ratio_mean"] = float(np.mean(ratio_seq)) if len(ratio_seq) else 0.0
+        row["known_promo_ratio_max"] = float(np.max(ratio_seq)) if len(ratio_seq) else 0.0
+        row["known_promo_amount_log_mean"] = float(np.mean(amt_seq)) if len(amt_seq) else 0.0
+        row["known_promo_amount_log_max"] = float(np.max(amt_seq)) if len(amt_seq) else 0.0
+        row["known_promo_price_amount_log_mean"] = float(np.mean(price_amt_seq)) if len(price_amt_seq) else 0.0
+        row["known_promo_price_amount_log_max"] = float(np.max(price_amt_seq)) if len(price_amt_seq) else 0.0
+        row["known_promo_type_code_mean"] = float(np.mean(ptype_seq)) if len(ptype_seq) else 0.0
+
         for c in SIGNAL_COLS:
             row.update(_series_summary_features(g[c].values, SIGNAL_PREFIX[c]))
 
@@ -526,8 +594,10 @@ def build_dynamic_node_profile(df, origin_week, min_hist_weeks=13):
             0.25 * (1.0 - row.get("buybox_recent13_zero_rate", 1.0)) +
             0.25 * (1.0 - row.get("instock_recent13_zero_rate", 1.0)) +
             0.15 * (1.0 - row.get("demand_recent13_zero_rate", 1.0)) +
-            0.05 * row.get("ind_promotion_current", 0.0) +
-            0.05 * row.get("event_index_current", 0.0)
+            0.04 * row.get("ind_promotion_current", 0.0) +
+            0.04 * row.get("event_index_current", 0.0) +
+            0.04 * row.get("known_promo_nextH_rate", 0.0) +
+            0.03 * row.get("known_promo_long13_20_rate", 0.0)
         )
         row["both_zero_like_score"] = 1.0 - row["active_eligibility_raw"]
         rows.append(row)
@@ -637,6 +707,27 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     feat["promo_response_abs_gap"] = abs(float(row_j.get("promo_response_strength", 0.0)) - float(row_i.get("promo_response_strength", 0.0)))
     feat["promo_response_signed_gap_j_minus_i"] = float(row_j.get("promo_response_strength", 0.0)) - float(row_i.get("promo_response_strength", 0.0))
 
+    # Known future promotion schedule/intensity pair features (oracle ablation).
+    known_promo_cols = [
+        "known_promo_nextH_rate", "known_promo_next4_rate", "known_promo_next13_rate",
+        "known_promo_long13_20_rate", "known_promo_ratio_mean", "known_promo_ratio_max",
+        "known_promo_amount_log_mean", "known_promo_amount_log_max",
+        "known_promo_price_amount_log_mean", "known_promo_price_amount_log_max",
+        "known_promo_type_code_mean",
+    ]
+    for kc in known_promo_cols:
+        ki = float(row_i.get(kc, 0.0)); kj = float(row_j.get(kc, 0.0))
+        feat[f"{kc}_abs_gap"] = abs(kj - ki)
+        feat[f"{kc}_signed_gap_j_minus_i"] = kj - ki
+    feat["both_known_promo_nextH"] = float(row_i.get("known_promo_any_nextH", 0.0) > 0.5 and row_j.get("known_promo_any_nextH", 0.0) > 0.5)
+    feat["j_known_promo_i_not"] = float(row_j.get("known_promo_any_nextH", 0.0) > 0.5 and row_i.get("known_promo_any_nextH", 0.0) <= 0.5)
+    feat["same_known_promo_schedule_soft"] = float(
+        abs(float(row_j.get("known_promo_nextH_rate", 0.0)) - float(row_i.get("known_promo_nextH_rate", 0.0))) <= 0.20 and
+        abs(float(row_j.get("known_promo_long13_20_rate", 0.0)) - float(row_i.get("known_promo_long13_20_rate", 0.0))) <= 0.20 and
+        abs(float(row_j.get("known_promo_ratio_max", 0.0)) - float(row_i.get("known_promo_ratio_max", 0.0))) <= 0.15
+    )
+    feat["known_promo_first_horizon_abs_gap"] = abs(float(row_j.get("known_promo_first_horizon", 21.0)) - float(row_i.get("known_promo_first_horizon", 21.0)))
+
     # direct DPH/demand gap features
     gap_cols = []
     for prefix in ["total", "buybox", "instock", "demand"]:
@@ -662,7 +753,7 @@ def _edge_features(row_i, row_j, seq_i=None, seq_j=None):
     # Dynamic magnitude hierarchy features: category-relative rank at origin_week.
     rank_cols = [
         "cat_rank_recent13_total", "cat_rank_recent13_buybox", "cat_rank_recent13_instock", "cat_rank_recent13_demand",
-        "cat_rank_long52_total", "cat_rank_momentum", "cat_rank_promo_boost", "cat_rank_event_boost", "cat_rank_active_eligibility", "cat_rank_zero_good", "cat_rank_dynamic_strength",
+        "cat_rank_long52_total", "cat_rank_momentum", "cat_rank_promo_boost", "cat_rank_known_promo", "cat_rank_event_boost", "cat_rank_active_eligibility", "cat_rank_zero_good", "cat_rank_dynamic_strength",
         "cat_rank_composite_dynamic",
     ]
     for rc in rank_cols:
@@ -822,6 +913,7 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
         edge_feat.get("same_top10_brand", 0) > 0.5 and
         edge_feat.get("same_price_tier_soft", 0) > 0.5 and
         edge_feat.get("same_promo_regime_soft", 0) > 0.5 and
+        edge_feat.get("same_known_promo_schedule_soft", 0) > 0.5 and
         edge_feat.get("pkg_size_similar_strict", 0) > 0.5
     )
     active_overlap_good = np.mean([
@@ -856,7 +948,9 @@ def _weak_relation_label(edge_feat, fut_i=None, fut_j=None):
         edge_feat.get("hbt_diff", 0) > 0.5 or
         edge_feat.get("top10_brand_diff", 0) > 0.5 or
         edge_feat.get("price_tier_gap_large", 0) > 0.5 or
-        edge_feat.get("promo_response_abs_gap", 0) > 0.50
+        edge_feat.get("promo_response_abs_gap", 0) > 0.50 or
+        edge_feat.get("known_promo_nextH_rate_abs_gap", 0) > 0.35 or
+        edge_feat.get("known_promo_ratio_max_abs_gap", 0) > 0.25
     )
     # Competitive edges should also be physically comparable; otherwise a broad category
     # can create fake competition between products with very different size/weight.
@@ -908,6 +1002,7 @@ def build_dynamic_pair_dataset(
     max_pairs_per_category=1500,
     max_origins=12,
     seed=42,
+    known_promo_horizon=20,
 ):
     rng = np.random.default_rng(seed)
     all_weeks = sorted(pd.to_datetime(df["order_week"].dropna().unique()))
@@ -933,7 +1028,7 @@ def build_dynamic_pair_dataset(
     print(f"Dynamic origins: {len(origin_weeks)}")
 
     for oi, origin in enumerate(origin_weeks, 1):
-        prof = build_dynamic_node_profile(df, origin, min_hist_weeks=history_min_weeks)
+        prof = build_dynamic_node_profile(df, origin, min_hist_weeks=history_min_weeks, known_promo_horizon=known_promo_horizon)
         if prof.empty:
             continue
         prof["origin_week"] = origin
@@ -1044,6 +1139,14 @@ def build_dynamic_pair_dataset(
                     "promo_rate_j": rj.get("promo_rate", 0.0),
                     "promo_response_i": ri.get("promo_response_strength", 0.0),
                     "promo_response_j": rj.get("promo_response_strength", 0.0),
+                    "known_promo_nextH_rate_i": ri.get("known_promo_nextH_rate", 0.0),
+                    "known_promo_nextH_rate_j": rj.get("known_promo_nextH_rate", 0.0),
+                    "known_promo_long13_20_rate_i": ri.get("known_promo_long13_20_rate", 0.0),
+                    "known_promo_long13_20_rate_j": rj.get("known_promo_long13_20_rate", 0.0),
+                    "known_promo_ratio_max_i": ri.get("known_promo_ratio_max", 0.0),
+                    "known_promo_ratio_max_j": rj.get("known_promo_ratio_max", 0.0),
+                    "known_promo_amount_log_max_i": ri.get("known_promo_amount_log_max", 0.0),
+                    "known_promo_amount_log_max_j": rj.get("known_promo_amount_log_max", 0.0),
                 }
                 row.update(ef)
                 pair_rows.append(row)
@@ -1417,7 +1520,7 @@ def diagnose_dynamic_rank_scores(rank_scored_pair_df, profile_df=None, top_n=30,
         "rank_momentum_signed_gap_j_minus_i", "rank_promo_boost_signed_gap_j_minus_i", "rank_zero_good_signed_gap_j_minus_i",
         "j_promo_current", "i_promo_current", "j_promo_i_not_current", "both_promo_current",
         "funnel_strength_signed_gap", "active_strength_signed_gap",
-        "promo_response_signed_gap_j_minus_i", "log_our_price_signed_gap_j_minus_i", "log_list_price_signed_gap_j_minus_i", "event_index_current_j", "active_eligibility_abs_gap",
+        "promo_response_signed_gap_j_minus_i", "known_promo_nextH_rate_signed_gap_j_minus_i", "known_promo_long13_20_rate_signed_gap_j_minus_i", "known_promo_ratio_max_signed_gap_j_minus_i", "same_known_promo_schedule_soft", "both_known_promo_nextH", "j_known_promo_i_not", "log_our_price_signed_gap_j_minus_i", "log_list_price_signed_gap_j_minus_i", "event_index_current_j", "active_eligibility_abs_gap",
     ] if c in df.columns]
     corr_rows = []
     for c in corr_cols:
@@ -1525,6 +1628,8 @@ def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
         "funnel_strength_abs_gap", "active_strength_abs_gap",
         "log_our_price_abs_gap", "log_list_price_abs_gap", "same_price_tier_soft", "price_tier_gap_large", "both_low_eligibility", "j_event_i_not_current",
         "promo_rate_abs_gap", "promo_recent13_abs_gap", "same_promo_regime_soft",
+        "known_promo_nextH_rate_abs_gap", "known_promo_long13_20_rate_abs_gap", "known_promo_ratio_max_abs_gap",
+        "same_known_promo_schedule_soft", "both_known_promo_nextH", "j_known_promo_i_not",
         "promo_overlap_rate", "promo_any_overlap_jaccard", "promo_response_abs_gap",
         "promo_steal_j_to_i_total", "promo_steal_j_to_i_buybox", "promo_steal_j_to_i_instock", "promo_steal_j_to_i_demand",
         "active_jaccard_total", "active_jaccard_buybox", "active_jaccard_instock", "active_jaccard_demand",
@@ -1544,7 +1649,7 @@ def diagnose_relation_scores(scored_pair_df, top_n=30, verbose=True):
         print("\n=== Top feature correlations with scores ===")
         print(score_feature_corr.head(30).to_string(index=False))
         print("\n=== Top positive pairs preview ===")
-        cols = [c for c in ["origin_week", "asin_i", "asin_j", "category_code", "score_positive", "score_competitive", "hbt_i", "hbt_j", "top10_i", "top10_j", "same_hbt", "same_top10_brand", "log_our_price_abs_gap", "same_price_tier_soft", "promo_rate_abs_gap", "event_index_current_i", "event_index_current_j", "active_eligibility_i", "active_eligibility_j", "promo_overlap_rate", "promo_response_abs_gap", "total_log_q90_abs_gap", "buybox_log_q90_abs_gap", "instock_log_q90_abs_gap", "demand_log_q90_abs_gap"] if c in top_pos.columns]
+        cols = [c for c in ["origin_week", "asin_i", "asin_j", "category_code", "score_positive", "score_competitive", "hbt_i", "hbt_j", "top10_i", "top10_j", "same_hbt", "same_top10_brand", "log_our_price_abs_gap", "same_price_tier_soft", "promo_rate_abs_gap", "known_promo_nextH_rate_abs_gap", "known_promo_long13_20_rate_abs_gap", "known_promo_ratio_max_abs_gap", "same_known_promo_schedule_soft", "event_index_current_i", "event_index_current_j", "active_eligibility_i", "active_eligibility_j", "promo_overlap_rate", "promo_response_abs_gap", "total_log_q90_abs_gap", "buybox_log_q90_abs_gap", "instock_log_q90_abs_gap", "demand_log_q90_abs_gap"] if c in top_pos.columns]
         print(top_pos[cols].head(10).to_string(index=False))
         print("\n=== Top competitive pairs preview ===")
         print(top_comp[cols].head(10).to_string(index=False))
@@ -1575,6 +1680,7 @@ def run_dynamic_gat_relation_test_scot5000(
     max_pairs_per_category=1500,
     epochs=30,
     batch_size=512,
+    known_promo_horizon=20,
 ):
     df = _prepare_joint_data(data_raw1, scot_df=scot_df, n_asins=n_asins, seed=seed)
     pair_df, profile_df = build_dynamic_pair_dataset(
@@ -1585,6 +1691,7 @@ def run_dynamic_gat_relation_test_scot5000(
         max_pairs_per_category=max_pairs_per_category,
         max_origins=max_origins,
         seed=seed,
+        known_promo_horizon=known_promo_horizon,
     )
     if pair_df.empty:
         raise ValueError("No pair data constructed. Check category sizes / history length / data columns.")
@@ -1695,9 +1802,9 @@ def run_dynamic_gat_relation_test_scot5000(
 
 
 # ============================================================
-# V5 convenience runner: dynamic relation GAT test with package edge features
+# V6 convenience runner: dynamic relation GAT test with package + known promo edge features
 # ============================================================
-def run_gat_relation_test_scot5000_pkg_v5(
+def run_gat_relation_test_scot5000_pkg_knownpromo_v6(
     data_raw1,
     scot_df=None,
     n_asins=5000,
@@ -1709,10 +1816,12 @@ def run_gat_relation_test_scot5000_pkg_v5(
     relation_epochs=30,
     rank_epochs=30,
     seed=42,
+    known_promo_horizon=20,
 ):
     """
     Run standalone dynamic relation/rank GAT edge test using:
-      exposure/demand history + our_price + promo/event + package size/weight edge gaps.
+      exposure/demand history + our_price + promo/event + package size/weight edge gaps
+      + known future promotion schedule/intensity edge gaps.
 
     Outputs include pair_df with pkg gaps and relation/rank model diagnostics.
     """
@@ -1725,6 +1834,7 @@ def run_gat_relation_test_scot5000_pkg_v5(
         max_pairs_per_category=max_pairs_per_category,
         max_origins=max_origins,
         seed=seed,
+        known_promo_horizon=known_promo_horizon,
     )
     print("\nPair dataset label distribution:")
     print(pair_df["label_name"].value_counts(dropna=False).to_string())
@@ -1733,6 +1843,16 @@ def run_gat_relation_test_scot5000_pkg_v5(
         print(pair_df[["pkg_complete_pair", "pkg_size_similar_strict", "pkg_size_similar_relaxed"]].mean().to_string())
         print("\nLabel distribution by strict package-similar flag:")
         print(pd.crosstab(pair_df["pkg_size_similar_strict"], pair_df["label_name"], normalize="index").round(3).to_string())
+    known_cols = [c for c in [
+        "known_promo_nextH_rate_abs_gap", "known_promo_long13_20_rate_abs_gap",
+        "known_promo_ratio_max_abs_gap", "same_known_promo_schedule_soft",
+        "both_known_promo_nextH", "j_known_promo_i_not"
+    ] if c in pair_df.columns]
+    if known_cols:
+        print("\nKnown-future promo edge features in pair_df:")
+        print(pair_df[known_cols].mean().round(4).to_string())
+        print("\nLabel distribution by same known-promo-schedule flag:")
+        print(pd.crosstab(pair_df["same_known_promo_schedule_soft"], pair_df["label_name"], normalize="index").round(3).to_string())
 
     rel_result = train_relation_classifier(pair_df, epochs=relation_epochs, seed=seed)
     print("\nHeldout relation report:")
@@ -1757,8 +1877,8 @@ def run_gat_relation_test_scot5000_pkg_v5(
 
 
 # Example usage in Jupyter:
-# %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v5_OURPRICE_PKG.py
-# gat_pkg_result = run_gat_relation_test_scot5000_pkg_v5(
+# %run -i gat_relation_test_scot5000_DYNAMIC_RANK_MAG_v6_OURPRICE_PKG_KNOWNPROMO.py
+# gat_pkg_result = run_gat_relation_test_scot5000_pkg_knownpromo_v6(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
 #     n_asins=5000,
