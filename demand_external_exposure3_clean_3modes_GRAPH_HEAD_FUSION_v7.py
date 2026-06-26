@@ -1042,8 +1042,17 @@ class TCN_ENN(nn.Module):
             i for i, c in enumerate(ctx_cols)
             if (str(c).startswith("graph_peer_") or str(c) in {"graph_same_hbt_peer_rate", "graph_top10_peer_rate"})
         ]
-        self.graph_fusion_scale = 0.20
+        # SAFE v8: graph was too aggressive in v7. Keep it as a small residual signal.
+        #   - normalize graph feature vector before projection
+        #   - use smaller fusion scale
+        #   - scale graph delta on mu/alpha
+        #   - initialize final graph-delta layer at zero, so the model starts from the original baseline
+        #   - feed graph to z_generator only weakly, avoiding double-counting graph through both context and head
+        self.graph_fusion_scale = 0.05
+        self.graph_delta_scale = 0.03
+        self.graph_to_z_scale = 0.25
         if len(self.graph_feat_indices) > 0:
+            self.graph_input_norm = nn.LayerNorm(len(self.graph_feat_indices))
             self.graph_proj = nn.Sequential(
                 nn.Linear(len(self.graph_feat_indices), d_model),
                 nn.ReLU(),
@@ -1055,11 +1064,16 @@ class TCN_ENN(nn.Module):
                 nn.Linear(d_model, 64), nn.ReLU(), nn.Dropout(0.10),
                 nn.Linear(64, 2 * horizon),
             )
+            # zero-start residual correction: at epoch 0, graph does not perturb mu/alpha base.
+            final_layer = self.graph_base_delta_head[-1]
+            nn.init.zeros_(final_layer.weight)
+            nn.init.zeros_(final_layer.bias)
         else:
+            self.graph_input_norm = None
             self.graph_proj = None
             self.graph_norm = None
             self.graph_base_delta_head = None
-        print(f"Demand graph-head fusion feat dim: {len(self.graph_feat_indices)}")
+        print(f"Demand SAFE graph-head fusion feat dim: {len(self.graph_feat_indices)} | fusion_scale={self.graph_fusion_scale} | delta_scale={self.graph_delta_scale} | graph_to_z_scale={self.graph_to_z_scale}")
 
         self.z_generator = ContextZGenerator(d_model, context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
@@ -1074,15 +1088,26 @@ class TCN_ENN(nn.Module):
         # Compatibility shim for older diagnostics. Do not augment anything.
         return future_context, self._external_exposure_log_hat(future_context)
 
+    def _make_context_for_z(self, future_context):
+        # Avoid double counting graph: z still sees graph, but weaker than date/promo/exposure hats.
+        if len(self.graph_feat_indices) == 0:
+            return future_context
+        ctx = future_context.clone()
+        ctx[:, :, self.graph_feat_indices] = ctx[:, :, self.graph_feat_indices] * self.graph_to_z_scale
+        return ctx
+
     def _graph_fuse(self, h_t, future_context):
         if self.graph_proj is None or len(self.graph_feat_indices) == 0:
             return h_t, None, None, None
         graph_x = future_context[:, :, self.graph_feat_indices]
+        graph_x = torch.nan_to_num(graph_x, nan=0.0, posinf=0.0, neginf=0.0)
+        # Normalize per horizon row, then average projected graph embedding across horizon.
+        graph_x = self.graph_input_norm(graph_x)
         graph_emb_h = self.graph_proj(graph_x).mean(dim=1)
         h_fused = self.graph_norm(h_t + self.graph_fusion_scale * graph_emb_h)
         d_mu = d_alpha = None
         if self.graph_base_delta_head is not None:
-            delta = self.graph_base_delta_head(h_fused)
+            delta = self.graph_base_delta_head(h_fused) * self.graph_delta_scale
             d_mu, d_alpha = delta[:, :self.horizon], delta[:, self.horizon:]
         return h_fused, graph_emb_h, d_mu, d_alpha
 
@@ -1093,7 +1118,8 @@ class TCN_ENN(nn.Module):
             mu_base = F.softplus(torch.log(mu_base + 1e-6) + graph_mu_delta)
             alpha_base = F.softplus(torch.log(alpha_base + 1e-6) + graph_alpha_delta) + 1e-4
         phi = h_fused.detach()
-        z_mean, z_std = self.z_generator(phi, future_context)
+        future_context_z = self._make_context_for_z(future_context)
+        z_mean, z_std = self.z_generator(phi, future_context_z)
 
         z_reg = 0.001 * (z_mean**2 + z_std**2).mean()
 
@@ -3162,8 +3188,9 @@ demand_result_all3 = run_demand_with_predicted_exposure_all3(
 # ============================================================
 # PACKAGE-AWARE ASIN RELATION GRAPH CONTEXT + KNOWN PROMO + GRAPH-HEAD-FUSION PATCH
 # Added by ChatGPT: package-comparable peer graph features.
-# v7: graph is projected from future_context, fused with encoder latent h_t,
-#     used by z_generator/epinet, and added as a graph-conditioned final-head correction.
+# v8 SAFE: graph is projected from future_context, fused with encoder latent h_t,
+#     used weakly by z_generator/epinet, and added as a zero-start small residual
+#     graph-conditioned final-head correction.
 # Design:
 #   - graph neighbors = same category_code + relaxed package-size/weight comparable
 #   - graph features are computed at forecast origin from historical values only
@@ -3579,5 +3606,5 @@ def summarize_graph_context_from_demand_result(result):
     return {"graph_cols": present, "n_graph_cols": len(present), "context_dim": len(cols), "last3": cols[-3:] if len(cols) >= 3 else cols}
 
 # Usage:
-# %run -i demand_external_exposure3_clean_3modes_GRAPH_KNOWNPROMO_v5.py
+# %run -i demand_external_exposure3_clean_3modes_GRAPH_HEAD_FUSION_SAFE_v8.py
 # demand_results_graph = run_demand_with_predicted_exposure_all_modes_graph(data_raw1=data_raw1, scot_df=scot_df, exposure_result_or_hat=exposure_result, n_asins=5000, epochs=60, history=52, horizon=20)
