@@ -918,6 +918,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  peak_delta_scale=0.35,
                  router_delta_scale=0.18,
                  router_num_experts=4,
+                 use_peak_cross_attn=True,
+                 peak_cross_attn_scale=0.05,
                  use_enn=True,
                  z_dim=8,
                  residual_scale=2.0,
@@ -935,6 +937,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.peak_delta_scale = float(peak_delta_scale)
         self.router_delta_scale = float(router_delta_scale)
         self.router_num_experts = int(router_num_experts)
+        self.use_peak_cross_attn = bool(use_peak_cross_attn)
+        self.peak_cross_attn_scale = float(peak_cross_attn_scale)
         self.use_enn = bool(use_enn)
         self.z_dim = int(z_dim)
         self.residual_scale = float(residual_scale)
@@ -971,6 +975,44 @@ class TCNDecoderWithCrossAttn(nn.Module):
             batch_first=True,
         )
         self.post_norm = nn.LayerNorm(d_model)
+
+        # v25: SPADE-style decoder-side peak cross-attention residual.
+        # The standard decoder cross-attn lets every horizon query history. This extra branch
+        # builds a peak-focused query from the horizon decoder state plus known future promo/
+        # holiday/event and graph context, then attends over encoder states. It is zero-start
+        # and low-scale, so the model initially behaves like v24 and only learns peak-specific
+        # history matching if useful.
+        peak_q_in_dim = d_model + max(peak_feat_dim, 0) + max(graph_feat_dim, 0)
+        if self.use_peak_cross_attn:
+            self.peak_query_proj = nn.Sequential(
+                nn.Linear(peak_q_in_dim, d_model),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+            )
+            self.peak_cross_attn = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=n_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.peak_cross_gate = nn.Sequential(
+                nn.Linear(peak_q_in_dim, d_model),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+            self.peak_cross_norm = nn.LayerNorm(d_model)
+            # Zero-start residual: v25 begins as v24.
+            nn.init.zeros_(self.peak_cross_attn.out_proj.weight)
+            nn.init.zeros_(self.peak_cross_attn.out_proj.bias)
+            nn.init.zeros_(self.peak_cross_gate[-1].weight)
+            nn.init.constant_(self.peak_cross_gate[-1].bias, -2.0)
+        else:
+            self.peak_query_proj = None
+            self.peak_cross_attn = None
+            self.peak_cross_gate = None
+            self.peak_cross_norm = None
 
         # Graph-head fusion: graph features are ASIN/origin/horizon context, not raw TCN timesteps.
         # We project package-aware peer context to d_model, fuse with the cross-attended encoder state,
@@ -1034,6 +1076,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         )
 
         # v24: magnitude/sparsity soft router.
+        # v25: decoder-side SPADE-style peak cross-attention residual.
         # This is a small residual mixture over regimes, not a replacement of the normal path.
         # Experts are interpreted diagnostically as: sparse, normal, peak, high_mag.
         # The router sees the same representation available to the final head, including
@@ -1088,10 +1131,43 @@ class TCNDecoderWithCrossAttn(nn.Module):
         z_out = self.post_norm(q + attn_out)  # [B,H,D]
 
         graph_emb = None
+        graph_feats = None
         if self.graph_proj is not None and self.graph_feat_indices:
             graph_feats = future_context[:, :, self.graph_feat_indices]
             graph_emb = self.graph_proj(graph_feats)
             z_out = self.graph_norm(z_out + self.graph_fusion_scale * graph_emb)
+
+        peak_feats = None
+        if self.peak_feat_indices and len(self.peak_feat_indices) > 0:
+            peak_feats = future_context[:, :, self.peak_feat_indices]
+
+        # v25 decoder-side peak cross-attention residual.
+        # Q = horizon decoder state + known future peak features + graph context.
+        # K,V = full encoder history. This lets future promo/holiday/peer peak context
+        # explicitly retrieve analogous historical active/peak states.
+        peak_cross_out = None
+        peak_cross_gate = None
+        peak_cross_attn_w = None
+        if self.use_peak_cross_attn and self.peak_cross_attn is not None:
+            peak_q_parts = [q]
+            if peak_feats is not None:
+                peak_q_parts.append(peak_feats)
+            elif self.peak_feat_dim > 0:
+                peak_q_parts.append(torch.zeros(B, H, self.peak_feat_dim, device=future_context.device, dtype=future_context.dtype))
+            if graph_feats is not None:
+                peak_q_parts.append(graph_feats)
+            elif self.graph_feat_dim > 0:
+                peak_q_parts.append(torch.zeros(B, H, self.graph_feat_dim, device=future_context.device, dtype=future_context.dtype))
+            peak_q_in = torch.cat(peak_q_parts, dim=-1)
+            peak_q = self.peak_query_proj(peak_q_in)
+            peak_cross_out, peak_cross_attn_w = self.peak_cross_attn(
+                peak_q, enc_out, enc_out,
+                need_weights=return_aux,
+            )
+            peak_cross_gate = torch.sigmoid(self.peak_cross_gate(peak_q_in))
+            z_out = self.peak_cross_norm(
+                z_out + self.peak_cross_attn_scale * peak_cross_gate * peak_cross_out
+            )
 
         # One latent z per ASIN-window; repeat across horizon to learn joint path regime.
         z_emb = None
@@ -1134,9 +1210,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
             mag_feats = future_context[:, :, self.mag_feat_indices]
             direct_parts.append(mag_feats)
 
-        peak_feats = None
-        if self.peak_feat_indices and len(self.peak_feat_indices) > 0:
-            peak_feats = future_context[:, :, self.peak_feat_indices]
+        # peak_feats was already built above for decoder-side peak cross-attention.
 
         direct_in = torch.cat(direct_parts, dim=-1)
         residual = self.direct_head(direct_in)  # [-1, 1]
@@ -1210,6 +1284,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "router_weights": router_weights,
                 "router_delta_log": router_delta,
                 "router_residual_log": router_residual_log,
+                "peak_cross_gate": peak_cross_gate,
+                "peak_cross_out": peak_cross_out,
+                "peak_cross_attn_weights": peak_cross_attn_w,
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -2348,7 +2425,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: TCN Full-Seq Encoder + Cross-Attn + SINGLE-HEAD DIRECT")
+    print("EXPOSURE MODEL V25: Encoder SparsePeakAttn + Decoder PeakCrossAttn + Router")
     print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
     print("=" * 100)
 
