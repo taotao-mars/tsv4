@@ -916,6 +916,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  peak_feat_indices=None,
                  peak_feat_dim=0,
                  peak_delta_scale=0.35,
+                 router_delta_scale=0.18,
+                 router_num_experts=4,
                  use_enn=True,
                  z_dim=8,
                  residual_scale=2.0,
@@ -931,6 +933,8 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.peak_feat_indices = peak_feat_indices or []
         self.peak_feat_dim = int(peak_feat_dim or 0)
         self.peak_delta_scale = float(peak_delta_scale)
+        self.router_delta_scale = float(router_delta_scale)
+        self.router_num_experts = int(router_num_experts)
         self.use_enn = bool(use_enn)
         self.z_dim = int(z_dim)
         self.residual_scale = float(residual_scale)
@@ -1028,10 +1032,40 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden // 2, 3),
         )
-        # Zero-start residual: v23 begins as v22 and learns peak lift only if useful.
-        for _m in [self.peak_gate_head[-1], self.peak_delta_head[-1]]:
+
+        # v24: magnitude/sparsity soft router.
+        # This is a small residual mixture over regimes, not a replacement of the normal path.
+        # Experts are interpreted diagnostically as: sparse, normal, peak, high_mag.
+        # The router sees the same representation available to the final head, including
+        # history encoder state, graph embedding, known future promo/event context, and z.
+        self.router_gate_head = nn.Sequential(
+            nn.Linear(peak_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, self.router_num_experts),
+        )
+        self.router_delta_head = nn.Sequential(
+            nn.Linear(peak_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, self.router_num_experts * 3),
+        )
+
+        # Zero-start residual: v24 begins as v23 and learns routing correction only if useful.
+        for _m in [self.peak_gate_head[-1], self.peak_delta_head[-1], self.router_delta_head[-1]]:
             nn.init.zeros_(_m.weight)
             nn.init.zeros_(_m.bias)
+
+        # Mild prior toward the normal expert at initialization; delta is zero-start, so predictions
+        # are unchanged at step 0, but diagnostics are interpretable from the beginning.
+        nn.init.zeros_(self.router_gate_head[-1].weight)
+        nn.init.zeros_(self.router_gate_head[-1].bias)
+        if self.router_num_experts >= 2:
+            with torch.no_grad():
+                self.router_gate_head[-1].bias[1] = 1.0
 
     def forward(self, enc_out, future_context, return_aux=False, z=None):
         B, H, _ = future_context.shape
@@ -1123,6 +1157,14 @@ class TCNDecoderWithCrossAttn(nn.Module):
         peak_gate = torch.sigmoid(self.peak_gate_head(peak_in))
         peak_delta_log = F.softplus(self.peak_delta_head(peak_in)) * self.peak_delta_scale
 
+        # Soft magnitude/sparsity router.
+        # router_weights: [B,H,K], K={sparse, normal, peak, high_mag} by convention.
+        router_logits = self.router_gate_head(peak_in)
+        router_weights = F.softmax(router_logits, dim=-1)
+        router_delta = self.router_delta_head(peak_in).view(B, H, self.router_num_experts, 3)
+        router_delta = torch.tanh(router_delta) * self.router_delta_scale
+        router_residual_log = torch.sum(router_weights.unsqueeze(-1) * router_delta, dim=2)
+
         # Anchor-residual magnitude log forecast.
         if self.anchor_indices is not None:
             ti, bi, ii = self.anchor_indices
@@ -1135,8 +1177,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
         else:
             raw_log_mag = residual * self.residual_scale
 
-        # Positive peak lift in log space; zero-start + gated, so it is conservative.
-        raw_log_mag = raw_log_mag + peak_gate * peak_delta_log
+        # Positive peak lift plus zero-start routed magnitude/sparsity residual in log space.
+        # The router is deliberately small; it should calibrate sparse/normal/peak/high regimes
+        # without overpowering the base exposure path.
+        raw_log_mag = raw_log_mag + peak_gate * peak_delta_log + router_residual_log
 
         log_mag = F.softplus(raw_log_mag)
         mag_level = torch.expm1(log_mag).clamp(min=0.0)
@@ -1162,6 +1206,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "residual": residual,
                 "peak_gate": peak_gate,
                 "peak_delta_log": peak_delta_log,
+                "router_logits": router_logits,
+                "router_weights": router_weights,
+                "router_delta_log": router_delta,
+                "router_residual_log": router_residual_log,
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -2787,7 +2835,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
+    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION + ROUTER")
     print("=" * 100)
 
     if use_scot_intersection:
