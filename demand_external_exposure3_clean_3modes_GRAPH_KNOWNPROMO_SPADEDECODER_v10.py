@@ -971,7 +971,7 @@ class DecoderPeakCrossAttention(nn.Module):
     """SPADE-style decoder-side peak cross-attention for demand.
 
     Future horizon context queries historical demand encoder states.
-    This module is intentionally light-weight: it produces a residual state, not a full replacement decoder.
+    This module provides the peak-attention state used by a gated full peak decoder path.
     """
     def __init__(self, d_model=32, context_dim=2, horizon=20, n_heads=4, dropout=0.1,
                  active_bias=0.50, peak_bias=0.75):
@@ -1064,8 +1064,12 @@ class TCN_ENN(nn.Module):
         self.z_generator = ContextZGenerator(d_model, context_dim, d_z, horizon)
         self.epinet = Epinet(d_model, d_z, horizon, prior_scale)
 
-        # SPADE-style decoder-side peak attention.
-        # It does NOT replace the original v5 demand head; it only adds a small log-mu residual.
+        # SPADE-style gated full peak decoder path.
+        # Unlike v10, this is not a tiny 0.03 residual. It learns an explicit
+        # positive peak component and adds it to the normal demand path:
+        #   mu_final = mu_normal + peak_gate * mu_peak
+        # This is closer to SPADE's non-peak + peak decomposition, while keeping
+        # the original v5 normal path intact.
         self.peak_decoder = DecoderPeakCrossAttention(
             d_model=d_model,
             context_dim=context_dim,
@@ -1073,16 +1077,26 @@ class TCN_ENN(nn.Module):
             n_heads=4,
             dropout=0.1,
         )
-        self.decoder_delta_head = nn.Sequential(
-            nn.Linear(d_model + context_dim + d_z, 64),
+        peak_in_dim = d_model + context_dim + d_z
+        self.peak_mu_head = nn.Sequential(
+            nn.Linear(peak_in_dim, 64),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(64, horizon),
+            nn.Linear(64, 1),
         )
-        # Conservative zero-start: the model starts as original v5, then learns decoder residual if useful.
-        nn.init.zeros_(self.decoder_delta_head[-1].weight)
-        nn.init.zeros_(self.decoder_delta_head[-1].bias)
-        self.decoder_residual_scale = 0.03
+        self.peak_gate_head = nn.Sequential(
+            nn.Linear(peak_in_dim, 64),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1),
+        )
+        # Stable initialization: starts close to the original v5 normal path,
+        # but the peak path is full-scale once learned.
+        nn.init.zeros_(self.peak_mu_head[-1].weight)
+        nn.init.constant_(self.peak_mu_head[-1].bias, -4.0)   # softplus ~= 0.018
+        nn.init.zeros_(self.peak_gate_head[-1].weight)
+        nn.init.constant_(self.peak_gate_head[-1].bias, -1.5) # sigmoid ~= 0.18
+        self.peak_decoder_scale = 1.0
 
     def _external_exposure_log_hat(self, future_context):
         if future_context.shape[-1] >= 3:
@@ -1094,18 +1108,21 @@ class TCN_ENN(nn.Module):
         # Compatibility shim for older diagnostics. Do not augment anything.
         return future_context, self._external_exposure_log_hat(future_context)
 
-    def _decoder_delta(self, H_enc, future_context, b_t, peak_score, z):
-        """Return horizon-level log-mu residual [B,H].
+    def _peak_decoder_component(self, H_enc, future_context, b_t, peak_score, z):
+        """Return full SPADE-style peak component and gate, both [B,H].
 
-        Future context + sampled z query historical demand states using SPADE-style
-        peak cross-attention. The output is intentionally small and zero-start.
+        The peak component is positive and additive in count space:
+            mu_final = mu_normal + gate * mu_peak
+        This lets the decoder contribute a real peak forecast, not only a tiny
+        residual correction.
         """
         dec_h = self.peak_decoder(H_enc, future_context, b_t=b_t, peak_score=peak_score)  # [B,H,D]
         B, H, _ = dec_h.shape
         z_h = z.unsqueeze(1).expand(-1, H, -1)
         dec_in = torch.cat([dec_h, future_context, z_h], dim=-1)
-        raw = self.decoder_delta_head(dec_in).diagonal(dim1=1, dim2=2)
-        return self.decoder_residual_scale * raw
+        peak_mu = F.softplus(self.peak_mu_head(dec_in).squeeze(-1))
+        peak_gate = torch.sigmoid(self.peak_gate_head(dec_in).squeeze(-1))
+        return self.peak_decoder_scale * peak_mu, peak_gate
 
     def forward(self, x, future_context, nZ=8, *args, **kwargs):
         H_enc, h_t, b_t, peak_score = self.encoder.encode(x)
@@ -1121,9 +1138,9 @@ class TCN_ENN(nn.Module):
             eps = torch.randn_like(z_mean)
             z = z_mean + z_std * eps
             mu_e, al_e = self.epinet(phi, z)
-            dec_delta = self._decoder_delta(H_enc, future_context, b_t, peak_score, z)
-            # Decoder residual is added in log/softplus pre-activation space.
-            mu = F.softplus(mu_base + mu_e + dec_delta)
+            mu_normal = F.softplus(mu_base + mu_e)
+            peak_mu, peak_gate = self._peak_decoder_component(H_enc, future_context, b_t, peak_score, z)
+            mu = mu_normal + peak_gate * peak_mu
             alpha = F.softplus(alpha_base + al_e) + 1e-4
             preds.append((mu, alpha))
 
@@ -1144,8 +1161,9 @@ class TCN_ENN(nn.Module):
                 eps = torch.randn_like(z_mean)
                 z = z_mean + z_std * eps
                 mu_e, al_e = self.epinet(phi, z)
-                dec_delta = self._decoder_delta(H_enc, future_context, b_t, peak_score, z)
-                mu = F.softplus(mu_base + mu_e + dec_delta)
+                mu_normal = F.softplus(mu_base + mu_e)
+                peak_mu, peak_gate = self._peak_decoder_component(H_enc, future_context, b_t, peak_score, z)
+                mu = mu_normal + peak_gate * peak_mu
                 alpha = F.softplus(alpha_base + al_e) + 1e-4
                 dist = torch.distributions.NegativeBinomial(
                     total_count=(1.0 / alpha).clamp(min=1e-4),
@@ -2004,6 +2022,178 @@ def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
     return out
 
 
+
+# =====================================================
+# 10b. Sparse-group horizon decay diagnostics
+# =====================================================
+
+def _attach_zero_group_to_forecast_df_for_horizon_diag(forecast_df, asin_stats=None, data_raw1=None, zero_thresholds=(0.4, 0.7)):
+    """Attach zero_rate / zero_group to forecast_df for horizon-level diagnostics."""
+    out = forecast_df.copy()
+    out["asin"] = out["asin"].astype(str)
+
+    if "zero_group" in out.columns and "zero_rate" in out.columns:
+        return out
+
+    stats = None
+    if asin_stats is not None and len(asin_stats) > 0:
+        stats = asin_stats.copy()
+    elif data_raw1 is not None and "asin" in data_raw1.columns and "fbi_demand" in data_raw1.columns:
+        tmp = data_raw1.copy()
+        tmp["asin"] = tmp["asin"].astype(str)
+        stats = (
+            tmp.groupby("asin", as_index=False)
+            .agg(zero_rate=("fbi_demand", lambda x: (pd.to_numeric(x, errors="coerce").fillna(0) == 0).mean()))
+        )
+        low, high = zero_thresholds
+        def _assign(z):
+            if z < low:
+                return "low_sparse"
+            elif z < high:
+                return "mid_sparse"
+            return "high_sparse"
+        stats["zero_group"] = stats["zero_rate"].apply(_assign)
+
+    if stats is None or len(stats) == 0:
+        print("No asin_stats/data_raw1 available. Sparse horizon diagnostics skipped.")
+        return out
+
+    stats["asin"] = stats["asin"].astype(str)
+    keep = [c for c in ["asin", "zero_rate", "zero_group"] if c in stats.columns]
+    out = out.merge(stats[keep].drop_duplicates("asin"), on="asin", how="left")
+    return out
+
+
+def summarize_sparse_horizon_decay(
+    forecast_df,
+    asin_stats=None,
+    data_raw1=None,
+    pred_cols=("p50_amxl", "p70_amxl"),
+    true_col="fbi_demand",
+    horizon_col="fcst_week_index",
+    zero_thresholds=(0.4, 0.7),
+    print_table=True,
+):
+    """Check whether predictions decay from h=1 to h=20 by sparse group.
+
+    Returns:
+      by_horizon: group x horizon true/pred/gap/WAPE table
+      decay_summary: group-level h1/h20 decay and average gap summary
+
+    Interpretation:
+      pred_decay_pct < 0 means prediction declines over horizon.
+      gap_mean = pred_mean - true_mean. Negative means under-prediction.
+    """
+    df = _attach_zero_group_to_forecast_df_for_horizon_diag(
+        forecast_df, asin_stats=asin_stats, data_raw1=data_raw1, zero_thresholds=zero_thresholds
+    )
+    if "zero_group" not in df.columns:
+        return {"by_horizon": pd.DataFrame(), "decay_summary": pd.DataFrame()}
+
+    df = df.copy()
+    df[horizon_col] = pd.to_numeric(df[horizon_col], errors="coerce").astype("Int64")
+    df[true_col] = pd.to_numeric(df[true_col], errors="coerce").fillna(0.0)
+    for c in pred_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    rows = []
+    group_cols = ["zero_group", horizon_col]
+    for (zg, h), g in df.groupby(group_cols, dropna=False):
+        base = {
+            "zero_group": zg,
+            "horizon": int(h) if pd.notna(h) else np.nan,
+            "n_rows": len(g),
+            "n_asins": g["asin"].nunique() if "asin" in g.columns else np.nan,
+            "true_mean": g[true_col].mean(),
+            "true_sum": g[true_col].sum(),
+            "true_active_rate": (g[true_col] > 0).mean(),
+        }
+        for c in pred_cols:
+            if c not in g.columns:
+                continue
+            err = g[c] - g[true_col]
+            denom = g[true_col].sum()
+            base[f"{c}_mean"] = g[c].mean()
+            base[f"{c}_gap_mean"] = err.mean()
+            base[f"{c}_abs_gap_mean"] = err.abs().mean()
+            base[f"{c}_ratio_mean"] = g[c].mean() / max(g[true_col].mean(), 1e-8)
+            base[f"{c}_wape"] = err.abs().sum() / denom if denom > 0 else np.nan
+            base[f"{c}_underbias"] = np.maximum(g[true_col] - g[c], 0).sum() / denom if denom > 0 else np.nan
+            base[f"{c}_overbias"] = np.maximum(g[c] - g[true_col], 0).sum() / denom if denom > 0 else np.nan
+        rows.append(base)
+
+    by_h = pd.DataFrame(rows).sort_values(["zero_group", "horizon"]).reset_index(drop=True)
+
+    summary_rows = []
+    for zg, g in by_h.groupby("zero_group", dropna=False):
+        gg = g.sort_values("horizon")
+        if len(gg) == 0:
+            continue
+        h1 = gg[gg["horizon"] == gg["horizon"].min()].iloc[0]
+        hT = gg[gg["horizon"] == gg["horizon"].max()].iloc[0]
+        row = {
+            "zero_group": zg,
+            "h_start": int(h1["horizon"]),
+            "h_end": int(hT["horizon"]),
+            "true_h1_mean": h1["true_mean"],
+            "true_hEnd_mean": hT["true_mean"],
+            "true_decay_pct": (hT["true_mean"] - h1["true_mean"]) / max(abs(h1["true_mean"]), 1e-8),
+            "true_active_h1": h1["true_active_rate"],
+            "true_active_hEnd": hT["true_active_rate"],
+        }
+        x = gg["horizon"].astype(float).values
+        if len(x) >= 2:
+            row["true_slope_per_h"] = float(np.polyfit(x, gg["true_mean"].astype(float).values, 1)[0])
+        for c in pred_cols:
+            mean_col = f"{c}_mean"
+            gap_col = f"{c}_gap_mean"
+            wape_col = f"{c}_wape"
+            ub_col = f"{c}_underbias"
+            ob_col = f"{c}_overbias"
+            if mean_col not in gg.columns:
+                continue
+            row[f"{c}_h1_mean"] = h1[mean_col]
+            row[f"{c}_hEnd_mean"] = hT[mean_col]
+            row[f"{c}_decay_pct"] = (hT[mean_col] - h1[mean_col]) / max(abs(h1[mean_col]), 1e-8)
+            row[f"{c}_avg_gap"] = gg[gap_col].mean() if gap_col in gg.columns else np.nan
+            row[f"{c}_avg_abs_gap"] = gg[f"{c}_abs_gap_mean"].mean() if f"{c}_abs_gap_mean" in gg.columns else np.nan
+            row[f"{c}_avg_wape"] = gg[wape_col].mean() if wape_col in gg.columns else np.nan
+            row[f"{c}_avg_underbias"] = gg[ub_col].mean() if ub_col in gg.columns else np.nan
+            row[f"{c}_avg_overbias"] = gg[ob_col].mean() if ob_col in gg.columns else np.nan
+            if len(x) >= 2:
+                row[f"{c}_slope_per_h"] = float(np.polyfit(x, gg[mean_col].astype(float).values, 1)[0])
+                row[f"{c}_decays"] = bool(row[f"{c}_slope_per_h"] < 0)
+        summary_rows.append(row)
+
+    summary = pd.DataFrame(summary_rows)
+
+    if print_table:
+        print("\n" + "=" * 100)
+        print("SPARSE-GROUP HORIZON DECAY / GAP DIAGNOSTICS")
+        print("=" * 100)
+        show_cols = [
+            "zero_group", "true_h1_mean", "true_hEnd_mean", "true_decay_pct", "true_slope_per_h",
+            "p50_amxl_h1_mean", "p50_amxl_hEnd_mean", "p50_amxl_decay_pct", "p50_amxl_slope_per_h",
+            "p50_amxl_avg_gap", "p50_amxl_avg_wape", "p50_amxl_avg_underbias", "p50_amxl_decays",
+            "p70_amxl_h1_mean", "p70_amxl_hEnd_mean", "p70_amxl_decay_pct", "p70_amxl_slope_per_h",
+            "p70_amxl_avg_gap", "p70_amxl_avg_wape", "p70_amxl_avg_underbias", "p70_amxl_decays",
+        ]
+        show_cols = [c for c in show_cols if c in summary.columns]
+        print(summary[show_cols].round(4).to_string(index=False))
+
+        print("\nBy-horizon compact view:")
+        compact_cols = [
+            "zero_group", "horizon", "true_mean", "true_active_rate",
+            "p50_amxl_mean", "p50_amxl_gap_mean", "p50_amxl_wape",
+            "p70_amxl_mean", "p70_amxl_gap_mean", "p70_amxl_wape",
+        ]
+        compact_cols = [c for c in compact_cols if c in by_h.columns]
+        print(by_h[compact_cols].round(4).to_string(index=False))
+
+    return {"by_horizon": by_h, "decay_summary": summary}
+
+
 # =====================================================
 # 10. Real SCOT alignment and WAPE
 # =====================================================
@@ -2342,6 +2532,19 @@ def run_nb_high_sparse_from_sample_scot_intersection(
         "removed_extreme": removed_extreme,
         "extreme_cap": extreme_cap,
     }
+
+    # Horizon-level sparse group diagnostics: checks h=1..H decay and pred-vs-true gaps
+    # for low_sparse / mid_sparse / high_sparse ASINs.
+    result["sparse_horizon_outputs"] = summarize_sparse_horizon_decay(
+        forecast_df=forecast_df,
+        asin_stats=asin_stats,
+        data_raw1=data_raw1,
+        pred_cols=("p50_amxl", "p70_amxl"),
+        true_col="fbi_demand",
+        horizon_col="fcst_week_index",
+        zero_thresholds=zero_thresholds,
+        print_table=True,
+    )
 
     if run_wape:
         result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
@@ -3547,5 +3750,5 @@ def summarize_graph_context_from_demand_result(result):
     return {"graph_cols": present, "n_graph_cols": len(present), "context_dim": len(cols), "last3": cols[-3:] if len(cols) >= 3 else cols}
 
 # Usage:
-# %run -i demand_external_exposure3_clean_3modes_GRAPH_KNOWNPROMO_v5.py
+# %run -i demand_external_exposure3_clean_3modes_GRAPH_KNOWNPROMO_FULLPEAKDECODER_v11.py
 # demand_results_graph = run_demand_with_predicted_exposure_all_modes_graph(data_raw1=data_raw1, scot_df=scot_df, exposure_result_or_hat=exposure_result, n_asins=5000, epochs=60, history=52, horizon=20)
