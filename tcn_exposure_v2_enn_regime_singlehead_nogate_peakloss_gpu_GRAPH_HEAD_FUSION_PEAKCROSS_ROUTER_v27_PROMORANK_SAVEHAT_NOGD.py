@@ -1,5 +1,5 @@
 # ============================================================
-# TCN Exposure Model V2
+# TCN Exposure Model V2 - v27.1 rank-gate + lift diagnostics
 # Single-head direct update + category_code static features:
 #   - remove two-head p_active^gamma * magnitude combination
 #   - predict log1p(total/buy_box/in_stock DPH) directly with one exposure head
@@ -916,6 +916,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  peak_feat_indices=None,
                  peak_feat_dim=0,
                  peak_delta_scale=0.35,
+                 rank_gate_scale=0.06,
                  router_delta_scale=0.18,
                  router_num_experts=4,
                  use_peak_cross_attn=True,
@@ -935,6 +936,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.peak_feat_indices = peak_feat_indices or []
         self.peak_feat_dim = int(peak_feat_dim or 0)
         self.peak_delta_scale = float(peak_delta_scale)
+        self.rank_gate_scale = float(rank_gate_scale)
         self.router_delta_scale = float(router_delta_scale)
         self.router_num_experts = int(router_num_experts)
         self.use_peak_cross_attn = bool(use_peak_cross_attn)
@@ -1075,6 +1077,20 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Linear(hidden // 2, 3),
         )
 
+        # v27.1: learned rank/promo gate correction.
+        # This does NOT directly set exposure level. It only makes a small, zero-start
+        # correction to the peak gate, so promo-adjusted rank can help open/close peak lift
+        # when it explains future exposure lift.
+        self.rank_gate_head = nn.Sequential(
+            nn.Linear(peak_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 3),
+        )
+
         # v24: magnitude/sparsity soft router.
         # v25: decoder-side SPADE-style peak cross-attention residual.
         # This is a small residual mixture over regimes, not a replacement of the normal path.
@@ -1098,7 +1114,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         )
 
         # Zero-start residual: v24 begins as v23 and learns routing correction only if useful.
-        for _m in [self.peak_gate_head[-1], self.peak_delta_head[-1], self.router_delta_head[-1]]:
+        for _m in [self.peak_gate_head[-1], self.peak_delta_head[-1], self.rank_gate_head[-1], self.router_delta_head[-1]]:
             nn.init.zeros_(_m.weight)
             nn.init.zeros_(_m.bias)
 
@@ -1235,7 +1251,16 @@ class TCNDecoderWithCrossAttn(nn.Module):
         if peak_feats is not None:
             peak_parts.append(peak_feats)
         peak_in = torch.cat(peak_parts, dim=-1)
-        peak_gate = torch.sigmoid(self.peak_gate_head(peak_in))
+        peak_gate_base = torch.sigmoid(self.peak_gate_head(peak_in))
+
+        # v27.1 rank gate: zero-start small correction around the base peak gate.
+        # rank_gate_delta is in [-rank_gate_scale, +rank_gate_scale]. At initialization
+        # it is exactly 0, so v27.1 starts as v27 and learns only if useful.
+        rank_gate_logit = self.rank_gate_head(peak_in)
+        rank_gate_delta = torch.tanh(rank_gate_logit) * self.rank_gate_scale
+        rank_gate = torch.sigmoid(rank_gate_logit)
+        peak_gate = torch.clamp(peak_gate_base + rank_gate_delta, 0.0, 1.0)
+
         peak_delta_log = F.softplus(self.peak_delta_head(peak_in)) * self.peak_delta_scale
 
         # Soft magnitude/sparsity router.
@@ -1286,6 +1311,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "gate": gate,
                 "residual": residual,
                 "peak_gate": peak_gate,
+                "peak_gate_base": peak_gate_base,
+                "rank_gate": rank_gate,
+                "rank_gate_delta": rank_gate_delta,
                 "peak_delta_log": peak_delta_log,
                 "router_logits": router_logits,
                 "router_weights": router_weights,
@@ -1472,6 +1500,7 @@ class ExposureForecastModelV2(nn.Module):
             peak_feat_indices=peak_feat_indices,
             peak_feat_dim=len(peak_feat_indices),
             peak_delta_scale=0.35,
+            rank_gate_scale=0.06,
             use_enn=use_enn,
             z_dim=z_dim,
             residual_scale=residual_scale,
@@ -1844,7 +1873,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             b = batch_to_device(b, device)
             # MC inference over ENN z. Median is more robust than mean for exposure hats,
             # because mean can be pulled up by high-regime samples.
-            preds, pacts, gates = [], [], []
+            preds, pacts, gates, rank_gates, rank_gate_deltas = [], [], [], [], []
             last_aux = None
             K = max(int(mc_samples), 1)
             for _ in range(K):
@@ -1853,10 +1882,14 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 preds.append(torch.expm1(aux["log_hat"]).clamp(min=0.0))
                 pacts.append(aux["p_active"])
                 gates.append(aux.get("gate", torch.full_like(aux["p_active"], float("nan"))))
+                rank_gates.append(aux.get("rank_gate", torch.full_like(aux["p_active"], float("nan"))))
+                rank_gate_deltas.append(aux.get("rank_gate_delta", torch.full_like(aux["p_active"], float("nan"))))
 
             pred_stack = torch.stack(preds, dim=0)   # [K,B,H,3]
             pact_stack = torch.stack(pacts, dim=0)
             gate_stack = torch.stack(gates, dim=0)
+            rank_gate_stack = torch.stack(rank_gates, dim=0)
+            rank_gate_delta_stack = torch.stack(rank_gate_deltas, dim=0)
 
             # Keep MC quantiles so we can inspect whether exposure hats also need an upper shift.
             pred_q50_t = torch.quantile(pred_stack, 0.50, dim=0)
@@ -1867,10 +1900,14 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 pred_t = pred_stack.mean(dim=0)
                 pact_t = pact_stack.mean(dim=0)
                 gate_t = gate_stack.mean(dim=0)
+                rank_gate_t = rank_gate_stack.mean(dim=0)
+                rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
             else:
                 pred_t = pred_stack.median(dim=0).values
                 pact_t = pact_stack.mean(dim=0)
                 gate_t = gate_stack.median(dim=0).values
+                rank_gate_t = rank_gate_stack.mean(dim=0)
+                rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
 
             pred = pred_t.cpu().numpy()
             pred_q50 = pred_q50_t.cpu().numpy()
@@ -1879,6 +1916,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             pact = pact_t.cpu().numpy()
             gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
             gate_np = gate_t.cpu().numpy()
+            rank_gate_np = rank_gate_t.cpu().numpy()
+            rank_gate_delta_np = rank_gate_delta_t.cpu().numpy()
 
             if apply_funnel_constraint:
                 for arr in [pred, pred_q50, pred_q70, pred_q90]:
@@ -1894,6 +1933,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 "graph_peer_known_promo_h",
                 "graph_own_vs_peer_promo_delta_h",
                 "graph_promo_adjusted_rank_prior_h",
+                "hist_instock_dph_mean13_log",
             ]
             for i in range(B):
                 for h in range(H):
@@ -1935,6 +1975,12 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                         "gate_total":        gate_np[i, h, 0],
                         "gate_buy_box":      gate_np[i, h, 1],
                         "gate_instock":      gate_np[i, h, 2],
+                        "rank_gate_total":        rank_gate_np[i, h, 0],
+                        "rank_gate_buy_box":      rank_gate_np[i, h, 1],
+                        "rank_gate_instock":      rank_gate_np[i, h, 2],
+                        "rank_gate_delta_total":  rank_gate_delta_np[i, h, 0],
+                        "rank_gate_delta_buy_box":rank_gate_delta_np[i, h, 1],
+                        "rank_gate_delta_instock":rank_gate_delta_np[i, h, 2],
                         **({col: float(ctx_np[i, h, ctx_idx[col]])
                             for col in rank_diag_cols
                             if ctx_np is not None and col in ctx_idx}),
@@ -1990,6 +2036,101 @@ def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
                 rows.append(row)
     return pred_df.merge(pd.DataFrame(rows), on=["asin", "order_week", "horizon"], how="left")
 
+
+
+def diagnose_rank_gate_future_lift(pred_df):
+    """
+    v27.1 diagnostic: rank/promo gate should explain future lift, not only absolute level.
+    Uses only columns already stored in forecast_df.
+    """
+    need = ["true_instock_dph", "pred_instock_dph", "hist_instock_dph_mean13_log"]
+    missing = [c for c in need if c not in pred_df.columns]
+    if missing:
+        print("\nRANK-GATE FUTURE-LIFT DIAGNOSTIC skipped. Missing columns:", missing)
+        return {}
+
+    df = pred_df.copy()
+    hist = np.expm1(pd.to_numeric(df["hist_instock_dph_mean13_log"], errors="coerce").fillna(0.0).values)
+    y = pd.to_numeric(df["true_instock_dph"], errors="coerce").fillna(0.0).values
+    p = pd.to_numeric(df["pred_instock_dph"], errors="coerce").fillna(0.0).values
+    df["true_lift_log"] = np.log1p(y) - np.log1p(hist)
+    df["pred_lift_log"] = np.log1p(p) - np.log1p(hist)
+    df["true_lift_positive"] = (df["true_lift_log"] > 0).astype(int)
+
+    signal_cols = [
+        "graph_peer_rank_prior",
+        "graph_promo_adjusted_rank_prior_h",
+        "graph_own_vs_peer_promo_delta_h",
+        "rank_gate_instock",
+        "rank_gate_delta_instock",
+    ]
+    signal_cols = [c for c in signal_cols if c in df.columns]
+    rows = []
+    for c in signal_cols:
+        svals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        ok = svals.notna() & np.isfinite(df["true_lift_log"])
+        if ok.sum() < 10:
+            continue
+        rows.append({
+            "signal": c,
+            "mean": float(svals[ok].mean()),
+            "std": float(svals[ok].std()),
+            "spearman_with_true_lift": _safe_spearman(df.loc[ok, "true_lift_log"], svals[ok]),
+            "spearman_with_pred_lift": _safe_spearman(df.loc[ok, "pred_lift_log"], svals[ok]),
+            "lift_positive_AUC": _auc(df.loc[ok, "true_lift_positive"].astype(int).values, svals[ok].values),
+        })
+    lift_summary = pd.DataFrame(rows)
+
+    gate_bucket_df = pd.DataFrame()
+    if "rank_gate_delta_instock" in df.columns:
+        x = pd.to_numeric(df["rank_gate_delta_instock"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if x.notna().sum() >= 20 and x.nunique(dropna=True) > 3:
+            try:
+                df["rank_gate_bucket"] = pd.qcut(x, q=5, duplicates="drop")
+                b_rows = []
+                for bucket, g in df.dropna(subset=["rank_gate_bucket"]).groupby("rank_gate_bucket", observed=True):
+                    yy = g["true_instock_dph"].values.astype(float)
+                    pp = g["pred_instock_dph"].values.astype(float)
+                    b_rows.append({
+                        "rank_gate_bucket": str(bucket),
+                        "rows": int(len(g)),
+                        "gate_delta_mean": float(g["rank_gate_delta_instock"].mean()),
+                        "true_lift_log_mean": float(g["true_lift_log"].mean()),
+                        "pred_lift_log_mean": float(g["pred_lift_log"].mean()),
+                        "true_mean": float(np.mean(yy)),
+                        "pred_mean": float(np.mean(pp)),
+                        "ratio": float(np.mean(pp) / (np.mean(yy) + 1e-8)),
+                        "WAPE": float(_wape(yy, pp)),
+                        "active_rate": float(np.mean(yy > 0)),
+                    })
+                gate_bucket_df = pd.DataFrame(b_rows)
+            except Exception:
+                gate_bucket_df = pd.DataFrame()
+
+    print("\n" + "=" * 100)
+    print("RANK-GATE FUTURE-LIFT DIAGNOSTIC: IN_STOCK_DPH")
+    print("=" * 100)
+    print("Goal: rank/promo signals should explain future exposure lift over hist_mean13, not only absolute exposure level.")
+    if len(lift_summary):
+        print(lift_summary.round(4).to_string(index=False))
+    else:
+        print("No usable rank/gate lift signals.")
+
+    print("\nRANK-GATE BUCKETS BY ROW / HORIZON")
+    if len(gate_bucket_df):
+        print(gate_bucket_df.round(4).to_string(index=False))
+    else:
+        print("No rank-gate bucket table available, likely because rank_gate_delta is still near zero or constant.")
+
+    if len(lift_summary) and "rank_gate_delta_instock" in lift_summary["signal"].values:
+        rg = lift_summary[lift_summary["signal"] == "rank_gate_delta_instock"].iloc[0]
+        print(f"\nRank-gate delta signal: Spearman(true_lift)={rg['spearman_with_true_lift']:.4f}, lift_AUC={rg['lift_positive_AUC']:.4f}")
+        if (rg["spearman_with_true_lift"] > 0.03) or (rg["lift_positive_AUC"] > 0.55):
+            print("Judgment: rank gate is learning useful lift information.")
+        else:
+            print("Judgment: rank gate is not clearly useful yet; keep scale small and compare downstream demand.")
+
+    return {"lift_summary": lift_summary, "rank_gate_buckets": gate_bucket_df}
 
 def print_exposure_diagnostics(pred_df):
     """
@@ -2058,7 +2199,7 @@ def print_exposure_diagnostics(pred_df):
             print(f"\np_active_instock monotonically increasing: {is_monotone}")
 
     # ── gamma / gate诊断 ─────────────────────────────────────
-    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock"] if c in pred_df.columns]
+    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock", "rank_gate_instock", "rank_gate_delta_instock"] if c in pred_df.columns]
     if gamma_gate_cols:
         print("\n" + "=" * 100)
         print("GAMMA / GATE BY HORIZON: IN_STOCK")
@@ -2070,6 +2211,10 @@ def print_exposure_diagnostics(pred_df):
                 row["gamma_instock_mean"] = g["gamma_instock"].mean()
             if "gate_instock" in g.columns:
                 row["gate_instock_mean"] = g["gate_instock"].mean()
+            if "rank_gate_instock" in g.columns:
+                row["rank_gate_instock_mean"] = g["rank_gate_instock"].mean()
+            if "rank_gate_delta_instock" in g.columns:
+                row["rank_gate_delta_instock_mean"] = g["rank_gate_delta_instock"].mean()
             if "p_active_instock" in g.columns:
                 row["p_active_instock_mean"] = g["p_active_instock"].mean()
             row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
@@ -2150,6 +2295,7 @@ def print_exposure_diagnostics(pred_df):
     print(final_summary.round(4).to_string(index=False))
 
     rank_diagnostics = diagnose_promo_adjusted_rank(pred_df, target="in_stock")
+    rank_gate_lift_diagnostics = diagnose_rank_gate_future_lift(pred_df)
 
     return {
         "model": model_tbl,
@@ -2157,6 +2303,7 @@ def print_exposure_diagnostics(pred_df):
         "p_active_by_horizon": pa_df,
         "final_summary": final_summary,
         "promo_adjusted_rank": rank_diagnostics,
+        "rank_gate_future_lift": rank_gate_lift_diagnostics,
     }
 
 
