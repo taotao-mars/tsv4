@@ -1313,6 +1313,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "peak_gate": peak_gate,
                 "peak_gate_base": peak_gate_base,
                 "rank_gate": rank_gate,
+                "rank_gate_logit": rank_gate_logit,
                 "rank_gate_delta": rank_gate_delta,
                 "peak_delta_log": peak_delta_log,
                 "router_logits": router_logits,
@@ -1516,6 +1517,18 @@ class ExposureForecastModelV2(nn.Module):
 # Loss：Hurdle BCE + Magnitude Huber + Mean Penalty
 # ============================================================
 
+
+def _pinball_loss(pred, true, tau):
+    """Pinball / quantile loss on level-space predictions."""
+    err = true - pred
+    return torch.maximum(float(tau) * err, (float(tau) - 1.0) * err)
+
+
+def _safe_context_anchor(future_context, idx, fallback):
+    if future_context is not None and idx is not None and idx >= 0:
+        return future_context[:, :, int(idx)]
+    return fallback
+
 def exposure_hurdle_loss(
     log_hat,        # [B,H,3] direct log1p prediction
     true_total,     # [B,H]
@@ -1552,6 +1565,19 @@ def exposure_hurdle_loss(
     peak_quantile=0.80,
     zero_fp_threshold=50.0,
     zero_fp_temperature=20.0,
+    # v27.2: direct q50/q70 pinball auxiliary loss on exposure levels.
+    # Channel-specific weights keep total_dph light and focus on buy_box/in_stock.
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    # v27.2: auxiliary future-lift target for the learned rank gate.
+    rank_gate_lift_weight=0.03,
+    rank_gate_logit=None,
+    future_context=None,
+    rank_lift_anchor_indices=None,
 ):
     """
     Single-head direct exposure loss with channel-specific zero awareness.
@@ -1699,6 +1725,41 @@ def exposure_hurdle_loss(
     peak_under = F.relu(torch.log1p(true_instock_y) - torch.log1p(pred_instock))
     peak_under_loss = (peak_under * high_mask).sum() / high_mask.sum().clamp_min(1.0)
 
+
+    # 8) v27.2 Direct q50/q70 pinball auxiliary loss.
+    # This explicitly aligns the point exposure hats with median-like and P70-like objectives.
+    # q70 is asymmetric: underforecast is penalized by 0.7, overforecast by 0.3.
+    q50_w = torch.tensor([q50_weight_total, q50_weight_buy, q50_weight_instock],
+                         dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+    q70_w = torch.tensor([q70_weight_total, q70_weight_buy, q70_weight_instock],
+                         dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+    q50_pin = _pinball_loss(pred_level, true, tau=0.5)
+    q70_pin = _pinball_loss(pred_level, true, tau=0.7)
+    q50_loss = (q50_pin * sample_w * q50_w).mean()
+    q70_loss = (q70_pin * sample_w * q70_w).mean()
+
+    # 9) v27.2 Rank-gate future-lift auxiliary loss.
+    # The rank gate should learn whether each future horizon is likely to lift above the
+    # origin historical mean13 exposure level. It is still low-weight and does not directly
+    # set exposure level.
+    rank_lift_loss = torch.tensor(0.0, dtype=log_hat.dtype, device=log_hat.device)
+    if rank_gate_logit is not None and future_context is not None and rank_lift_anchor_indices is not None:
+        try:
+            ti, bi, ii = rank_lift_anchor_indices
+            anchors = torch.stack([
+                _safe_context_anchor(future_context, ti, target_log[..., 0].detach()),
+                _safe_context_anchor(future_context, bi, target_log[..., 1].detach()),
+                _safe_context_anchor(future_context, ii, target_log[..., 2].detach()),
+            ], dim=-1)
+            # Positive lift label: true log exposure is above the origin/history mean13 log anchor.
+            lift_label = (target_log.detach() > anchors.detach()).float()
+            lift_bce = F.binary_cross_entropy_with_logits(rank_gate_logit, lift_label, reduction="none")
+            # Emphasize buy_box/in_stock slightly because they matter more downstream.
+            rank_w = torch.tensor([0.40, 0.80, 1.00], dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+            rank_lift_loss = (lift_bce * horizon_w * rank_w).mean()
+        except Exception:
+            rank_lift_loss = torch.tensor(0.0, dtype=log_hat.dtype, device=log_hat.device)
+
     return (
         mag_weight * direct_loss
         + mean_weight * mean_loss
@@ -1712,6 +1773,9 @@ def exposure_hurdle_loss(
         + peak_weight * peak_loss
         + topk_peak_weight * topk_peak_loss
         + peak_under_weight * peak_under_loss
+        + q50_loss
+        + q70_loss
+        + rank_gate_lift_weight * rank_lift_loss
     )
 
 # ============================================================
@@ -1742,11 +1806,20 @@ def train_exposure_model_v2(
     peak_quantile=0.80,
     zero_fp_threshold=50.0,
     zero_fp_temperature=20.0,
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    rank_gate_lift_weight=0.03,
+    rank_lift_anchor_indices=None,
     device=None,
 ):
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
+    print(f"v27.2 q-pinball weights | q50=(total {q50_weight_total}, buy {q50_weight_buy}, instock {q50_weight_instock}) | q70=(total {q70_weight_total}, buy {q70_weight_buy}, instock {q70_weight_instock}) | rank_lift={rank_gate_lift_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
@@ -1789,6 +1862,16 @@ def train_exposure_model_v2(
                 peak_quantile=peak_quantile,
                 zero_fp_threshold=zero_fp_threshold,
                 zero_fp_temperature=zero_fp_temperature,
+                q50_weight_total=q50_weight_total,
+                q50_weight_buy=q50_weight_buy,
+                q50_weight_instock=q50_weight_instock,
+                q70_weight_total=q70_weight_total,
+                q70_weight_buy=q70_weight_buy,
+                q70_weight_instock=q70_weight_instock,
+                rank_gate_lift_weight=rank_gate_lift_weight,
+                rank_gate_logit=aux.get("rank_gate_logit", None),
+                future_context=b["future_context"],
+                rank_lift_anchor_indices=rank_lift_anchor_indices,
             )
             opt.zero_grad()
             loss.backward()
@@ -2631,9 +2714,23 @@ def run_exposure_v2(
         dropout=dropout,
         context_cols=context_cols,
         use_encoder_self_attn=use_encoder_self_attn,
+        q50_weight_total=q50_weight_total,
+        q50_weight_buy=q50_weight_buy,
+        q50_weight_instock=q50_weight_instock,
+        q70_weight_total=q70_weight_total,
+        q70_weight_buy=q70_weight_buy,
+        q70_weight_instock=q70_weight_instock,
+        rank_gate_lift_weight=rank_gate_lift_weight,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    _col_idx = {c: i for i, c in enumerate(context_cols)}
+    rank_lift_anchor_indices = [
+        _col_idx.get("hist_total_dph_mean13_log", -1),
+        _col_idx.get("hist_buy_box_dph_mean13_log", -1),
+        _col_idx.get("hist_instock_dph_mean13_log", -1),
+    ]
+    print(f"Rank-gate lift anchor indices: {rank_lift_anchor_indices}")
 
     train_exposure_model_v2(
         model=model, tr_ld=tr_ld, va_ld=va_ld,
@@ -2656,6 +2753,14 @@ def run_exposure_v2(
         peak_under_weight=peak_under_weight,
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
+        q50_weight_total=q50_weight_total,
+        q50_weight_buy=q50_weight_buy,
+        q50_weight_instock=q50_weight_instock,
+        q70_weight_total=q70_weight_total,
+        q70_weight_buy=q70_weight_buy,
+        q70_weight_instock=q70_weight_instock,
+        rank_gate_lift_weight=rank_gate_lift_weight,
+        rank_lift_anchor_indices=rank_lift_anchor_indices,
     )
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint, context_cols=context_cols)
@@ -2952,6 +3057,13 @@ def _train_one_exposure_window(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    rank_gate_lift_weight=0.03,
     dropout=0.20,
     use_encoder_self_attn=True,
 ):
@@ -3079,13 +3191,20 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    rank_gate_lift_weight=0.03,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V26: SINGLE-HEAD DIRECT + z-conditioned PeakCrossAttn + SAVEHAT")
+    print("EXPOSURE MODEL V27.2: RankGate + q50/q70 pinball aux + rank-lift aux + SAVEHAT")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -3130,6 +3249,13 @@ def run_exposure_v2(
         peak_under_weight=peak_under_weight,
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
+        q50_weight_total=q50_weight_total,
+        q50_weight_buy=q50_weight_buy,
+        q50_weight_instock=q50_weight_instock,
+        q70_weight_total=q70_weight_total,
+        q70_weight_buy=q70_weight_buy,
+        q70_weight_instock=q70_weight_instock,
+        rank_gate_lift_weight=rank_gate_lift_weight,
         dropout=dropout,
         use_encoder_self_attn=use_encoder_self_attn,
     )
@@ -3511,6 +3637,13 @@ def apply_exposure_hat_variant_for_demand(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    rank_gate_lift_weight=0.03,
 ):
     """
     Select which exposure hat columns will be written into the standard demand-readable
@@ -3732,6 +3865,13 @@ def run_exposure_v2_final_scot_5000(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
+    q50_weight_total=0.02,
+    q50_weight_buy=0.03,
+    q50_weight_instock=0.03,
+    q70_weight_total=0.02,
+    q70_weight_buy=0.06,
+    q70_weight_instock=0.08,
+    rank_gate_lift_weight=0.03,
 ):
     """
     Final single-window setup:
@@ -3754,6 +3894,13 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
+        q50_weight_total=q50_weight_total,
+        q50_weight_buy=q50_weight_buy,
+        q50_weight_instock=q50_weight_instock,
+        q70_weight_total=q70_weight_total,
+        q70_weight_buy=q70_weight_buy,
+        q70_weight_instock=q70_weight_instock,
+        rank_gate_lift_weight=rank_gate_lift_weight,
     )
     if save_hat_csv_path is not None:
         result["exposure_hat_csv_path"] = save_exposure_hat_for_demand_csv(
