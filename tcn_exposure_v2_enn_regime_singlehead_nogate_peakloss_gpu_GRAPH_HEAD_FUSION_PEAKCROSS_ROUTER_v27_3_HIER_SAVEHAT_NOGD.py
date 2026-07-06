@@ -3777,7 +3777,7 @@ def run_exposure_v2_final_scot_5000(
     patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
-    save_hat_csv_path=None,
+    save_hat_csv_path="exposure_hat_for_demand.csv",
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
@@ -3818,6 +3818,7 @@ def run_exposure_v2_final_scot_5000(
 # Usage
 # ============================================================
 # Final setup: 5000 sample + SCOT intersection + latest 20-week holdout.
+# This AUTOSAVE version saves default CSV to: exposure_hat_for_demand.csv
 # Training samples are sliding windows; validation/test is the final 20-week window.
 #
 # %run -i tcn_exposure_v2_single_head_direct_gl_diag.py
