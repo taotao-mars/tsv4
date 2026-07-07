@@ -931,6 +931,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  router_delta_scale=0.18,
                  router_num_experts=4,
                  ratio_residual_scale=0.50,
+                 peer_anchor_indices=None,
+                 peer_total_anchor_weight=0.25,
+                 peer_ratio_anchor_weight=0.35,
                  use_peak_cross_attn=True,
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
@@ -952,6 +955,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.router_delta_scale = float(router_delta_scale)
         self.router_num_experts = int(router_num_experts)
         self.ratio_residual_scale = float(ratio_residual_scale)
+        self.peer_anchor_indices = peer_anchor_indices
+        self.peer_total_anchor_weight = float(peer_total_anchor_weight)
+        self.peer_ratio_anchor_weight = float(peer_ratio_anchor_weight)
         self.use_peak_cross_attn = bool(use_peak_cross_attn)
         self.peak_cross_attn_scale = float(peak_cross_attn_scale)
         self.use_enn = bool(use_enn)
@@ -1314,6 +1320,26 @@ class TCNDecoderWithCrossAttn(nn.Module):
             buy_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
             instock_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
 
+        # v27.5 peer-scale anchor:
+        # Own historical anchors are stable but can be too low/high for sparse ASINs.
+        # Peer anchors provide the absolute scale from similar ASINs; rank/promo remains a residual signal.
+        peer_total_anchor_log = None
+        peer_buy_anchor_log = None
+        peer_instock_anchor_log = None
+        if self.peer_anchor_indices is not None:
+            try:
+                pti, pbi, pii = self.peer_anchor_indices
+                peer_total_anchor_log = future_context[:, :, pti:pti+1]
+                peer_buy_anchor_log = future_context[:, :, pbi:pbi+1]
+                peer_instock_anchor_log = future_context[:, :, pii:pii+1]
+                wt = max(0.0, min(1.0, self.peer_total_anchor_weight))
+                # Blend in log space for the total scale anchor.
+                total_anchor_log = (1.0 - wt) * total_anchor_log + wt * peer_total_anchor_log
+            except Exception:
+                peer_total_anchor_log = None
+                peer_buy_anchor_log = None
+                peer_instock_anchor_log = None
+
         raw_total_log = total_anchor_log + total_residual * self.residual_scale
         raw_total_log = raw_total_log + peak_gate[:, :, 0:1] * peak_delta_log[:, :, 0:1] + router_residual_log[:, :, 0:1]
         log_total = F.softplus(raw_total_log)
@@ -1326,6 +1352,19 @@ class TCNDecoderWithCrossAttn(nn.Module):
         hist_instock = torch.expm1(instock_anchor_log).clamp(min=0.0)
         buy_anchor_ratio = torch.where(hist_total > eps, (hist_buy / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
         instock_anchor_ratio = torch.where(hist_total > eps, (hist_instock / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
+
+        # v27.5: peer-ratio anchor from similar ASINs. This anchors absolute child/total scale,
+        # while learned rank/promo residuals can still make horizon-specific adjustments.
+        if peer_total_anchor_log is not None and peer_buy_anchor_log is not None and peer_instock_anchor_log is not None:
+            peer_total = torch.expm1(peer_total_anchor_log).clamp(min=0.0)
+            peer_buy = torch.expm1(peer_buy_anchor_log).clamp(min=0.0)
+            peer_instock = torch.expm1(peer_instock_anchor_log).clamp(min=0.0)
+            peer_buy_ratio = torch.where(peer_total > eps, (peer_buy / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), buy_anchor_ratio)
+            peer_instock_ratio = torch.where(peer_total > eps, (peer_instock / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), instock_anchor_ratio)
+            wr = max(0.0, min(1.0, self.peer_ratio_anchor_weight))
+            buy_anchor_ratio = ((1.0 - wr) * buy_anchor_ratio + wr * peer_buy_ratio).clamp(1e-4, 1.0 - 1e-4)
+            instock_anchor_ratio = ((1.0 - wr) * instock_anchor_ratio + wr * peer_instock_ratio).clamp(1e-4, 1.0 - 1e-4)
+
         ratio_anchor_logit = torch.logit(torch.cat([buy_anchor_ratio, instock_anchor_ratio], dim=-1).clamp(1e-4, 1.0 - 1e-4))
 
         # Learned ASIN/horizon-specific ratio deviations.
@@ -1460,7 +1499,10 @@ class ExposureForecastModelV2(nn.Module):
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0,
-                 ratio_residual_scale=0.50, gate_temperature=1.0):
+                 ratio_residual_scale=0.50,
+                 peer_total_anchor_weight=0.25,
+                 peer_ratio_anchor_weight=0.35,
+                 gate_temperature=1.0):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1488,6 +1530,18 @@ class ExposureForecastModelV2(nn.Module):
             print(f"Anchor indices (mean13): {anchor_indices}")
         except KeyError as e:
             print(f"Warning: anchor column not found: {e}")
+
+        # v27.5 peer-scale anchor indices: similar-ASIN scale anchors in log1p space.
+        peer_anchor_indices = None
+        try:
+            peer_anchor_indices = [
+                col_idx["graph_peer_total_mean13_log"],
+                col_idx["graph_peer_buybox_mean13_log"],
+                col_idx["graph_peer_instock_mean13_log"],
+            ]
+            print(f"Peer anchor indices (graph peer mean13): {peer_anchor_indices} | total_w={peer_total_anchor_weight} | ratio_w={peer_ratio_anchor_weight}")
+        except KeyError as e:
+            print(f"Warning: peer anchor column not found: {e}")
 
         # active head专属特征索引
         active_feat_indices = []
@@ -1557,6 +1611,9 @@ class ExposureForecastModelV2(nn.Module):
             z_dim=z_dim,
             residual_scale=residual_scale,
             ratio_residual_scale=ratio_residual_scale,
+            peer_anchor_indices=peer_anchor_indices,
+            peer_total_anchor_weight=peer_total_anchor_weight,
+            peer_ratio_anchor_weight=peer_ratio_anchor_weight,
             gate_temperature=gate_temperature,
         )
 
@@ -1693,7 +1750,7 @@ def exposure_hurdle_loss(
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    # 4b) v27.4 ratio calibration for the hierarchical child channels.
+    # 4b) v27.5 peer-anchor ratio calibration for the hierarchical child channels.
     # When total is accurate but buy_box/in_stock are systematically high, the error
     # comes from the learned child ratios. These losses keep the dynamic ratios anchored
     # without weakening the total head or zero/active discrimination.
@@ -1843,7 +1900,7 @@ def train_exposure_model_v2(
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"v27.4 ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
+    print(f"v27.5 peer-anchor ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | peer_total_w={getattr(model.decoder, 'peer_total_anchor_weight', float('nan')):.3f} | peer_ratio_w={getattr(model.decoder, 'peer_ratio_anchor_weight', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
