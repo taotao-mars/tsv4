@@ -930,7 +930,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  rank_gate_scale=0.06,
                  router_delta_scale=0.18,
                  router_num_experts=4,
-                 ratio_residual_scale=0.75,
+                 ratio_residual_scale=0.50,
                  use_peak_cross_attn=True,
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
@@ -1459,7 +1459,8 @@ class ExposureForecastModelV2(nn.Module):
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None, use_encoder_self_attn=True,
-                 use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0):
+                 use_enn=True, z_dim=8, residual_scale=2.0,
+                 ratio_residual_scale=0.50, gate_temperature=1.0):
         super().__init__()
         self.use_enn = use_enn
         self.z_dim = int(z_dim)
@@ -1604,8 +1605,8 @@ def exposure_hurdle_loss(
     peak_quantile=0.80,
     zero_fp_threshold=50.0,
     zero_fp_temperature=20.0,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
 ):
     """
     Single-head direct exposure loss with channel-specific zero awareness.
@@ -1692,7 +1693,7 @@ def exposure_hurdle_loss(
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    # 4b) v27.4b LIGHT ratio calibration for the hierarchical child channels.
+    # 4b) v27.4 ratio calibration for the hierarchical child channels.
     # When total is accurate but buy_box/in_stock are systematically high, the error
     # comes from the learned child ratios. These losses keep the dynamic ratios anchored
     # without weakening the total head or zero/active discrimination.
@@ -1835,14 +1836,14 @@ def train_exposure_model_v2(
     peak_quantile=0.80,
     zero_fp_threshold=50.0,
     zero_fp_temperature=20.0,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
     device=None,
 ):
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"v27.4b LIGHT ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
+    print(f"v27.4 ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
@@ -2772,14 +2773,14 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.4b: HIER_RATIO_CAL_LIGHT + TOTALDIAG + SAVEHAT")
+    print("EXPOSURE MODEL V27.4: HIER_RATIO_CAL + TOTALDIAG + SAVEHAT")
     print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
     print("=" * 100)
 
@@ -3134,9 +3135,9 @@ def _train_one_exposure_window(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
     dropout=0.20,
     use_encoder_self_attn=True,
 ):
@@ -3267,16 +3268,16 @@ def run_exposure_v2(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.4b: HIER + LIGHT ratio shrink/calibration + TOTALDIAG + LOCAL CSV")
+    print("EXPOSURE MODEL V27.4: HIER + ratio shrink/calibration + TOTALDIAG + LOCAL CSV")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -3383,9 +3384,9 @@ def run_exposure_v2_rolling(
     peak_under_weight=0.08,
     peak_topk=3,
     peak_quantile=0.80,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
     dropout=0.20,
     use_scot_intersection=True,
     use_encoder_self_attn=True,
@@ -3708,9 +3709,9 @@ def apply_exposure_hat_variant_for_demand(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
 ):
     """
     Select which exposure hat columns will be written into the standard demand-readable
@@ -3817,9 +3818,9 @@ def save_exposure_hat_for_demand_csv(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
 ):
     """
     Save all exposure hats into one CSV so demand can read it directly later.
@@ -3935,9 +3936,9 @@ def run_exposure_v2_final_scot_5000(
     hat_variant_for_demand="base",
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
-    ratio_residual_scale=0.75,
-    ratio_mean_weight=0.02,
-    active_mean_weight=0.01,
+    ratio_residual_scale=0.50,
+    ratio_mean_weight=0.05,
+    active_mean_weight=0.03,
 ):
     """
     Final single-window setup:
