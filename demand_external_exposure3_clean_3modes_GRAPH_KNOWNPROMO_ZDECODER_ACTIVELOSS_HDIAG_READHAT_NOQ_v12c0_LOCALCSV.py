@@ -1546,8 +1546,13 @@ def train(
         vl = 0.0
         with torch.no_grad():
             for b in va_ld:
-                p50, p70 = model.predict(b["x"], b["future_context"], M=50)
-                vl += tail_weighted_negbin_nll(b["y"], mu_mean, alpha_mean, beta_tail=beta_tail).item()
+                # v12c0 LOCALCSV FIX:
+                # predict() returns only sampled quantiles (p50/p70).
+                # Validation NLL needs mu/alpha, so use forward() and average over z samples.
+                preds_val, _, _ = model(b["x"], b["future_context"], nZ=8)
+                mu_mean_val = torch.stack([mu for mu, _ in preds_val], dim=1).mean(dim=1)
+                alpha_mean_val = torch.stack([alpha for _, alpha in preds_val], dim=1).mean(dim=1)
+                vl += tail_weighted_negbin_nll(b["y"], mu_mean_val, alpha_mean_val, beta_tail=beta_tail).item()
         vl /= max(1, len(va_ld))
 
         improved = vl < best_val
