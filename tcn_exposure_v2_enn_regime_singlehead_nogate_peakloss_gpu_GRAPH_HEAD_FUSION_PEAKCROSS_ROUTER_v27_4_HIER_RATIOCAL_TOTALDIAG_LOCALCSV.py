@@ -934,6 +934,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  peer_anchor_indices=None,
                  peer_total_anchor_weight=0.25,
                  peer_ratio_anchor_weight=0.35,
+                 peer_uncertainty_power=1.0,
+                 peer_consistency_floor=0.25,
+                 peer_min_level=1e-3,
+                 peer_reliability_tau=1.0,
                  use_peak_cross_attn=True,
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
@@ -958,6 +962,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.peer_anchor_indices = peer_anchor_indices
         self.peer_total_anchor_weight = float(peer_total_anchor_weight)
         self.peer_ratio_anchor_weight = float(peer_ratio_anchor_weight)
+        self.peer_uncertainty_power = float(peer_uncertainty_power)
+        self.peer_consistency_floor = float(peer_consistency_floor)
+        self.peer_min_level = float(peer_min_level)
+        self.peer_reliability_tau = float(peer_reliability_tau)
         self.use_peak_cross_attn = bool(use_peak_cross_attn)
         self.peak_cross_attn_scale = float(peak_cross_attn_scale)
         self.use_enn = bool(use_enn)
@@ -1320,12 +1328,15 @@ class TCNDecoderWithCrossAttn(nn.Module):
             buy_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
             instock_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
 
-        # v27.5 peer-scale anchor:
+        # v27.6b active-aware + reliability-aware peer-scale anchor:
         # Own historical anchors are stable but can be too low/high for sparse ASINs.
         # Peer anchors provide the absolute scale from similar ASINs; rank/promo remains a residual signal.
         peer_total_anchor_log = None
         peer_buy_anchor_log = None
         peer_instock_anchor_log = None
+        peer_total_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+        peer_buy_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
+        peer_instock_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
         if self.peer_anchor_indices is not None:
             try:
                 pti, pbi, pii = self.peer_anchor_indices
@@ -1333,8 +1344,27 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 peer_buy_anchor_log = future_context[:, :, pbi:pbi+1]
                 peer_instock_anchor_log = future_context[:, :, pii:pii+1]
                 wt = max(0.0, min(1.0, self.peer_total_anchor_weight))
-                # Blend in log space for the total scale anchor.
-                total_anchor_log = (1.0 - wt) * total_anchor_log + wt * peer_total_anchor_log
+                # Active-aware peer anchor:
+                # - If the model is confident about total active/zero (p close to 0 or 1), trust own history more.
+                # - If active signal is uncertain (p close to 0.5), use reliable peer scale as a stabilizer.
+                # - If own and peer scales disagree strongly, reduce peer trust.
+                total_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 0:1].detach() - 0.5)).clamp(0.0, 1.0)
+                total_uncertainty = total_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
+                # Reliability-aware peer anchor:
+                #   - no usable peer scale -> reliability = 0
+                #   - own/peer scale very different -> reliability smoothly decreases
+                # This prevents unreliable or non-similar peers from pulling the ASIN toward a wrong scale.
+                own_total_level_for_rel = torch.expm1(total_anchor_log.detach()).clamp(min=0.0)
+                peer_total_level_for_rel = torch.expm1(peer_total_anchor_log.detach()).clamp(min=0.0)
+                peer_total_valid = (peer_total_level_for_rel > self.peer_min_level).to(future_context.dtype)
+                total_scale_dist = torch.abs(total_anchor_log.detach() - peer_total_anchor_log.detach())
+                total_reliability = peer_total_valid * torch.exp(-total_scale_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
+
+                total_consistency = torch.exp(-total_scale_dist).clamp(0.0, 1.0)
+                total_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * total_consistency
+                peer_total_effective_weight = (wt * total_uncertainty * total_consistency * total_reliability).clamp(0.0, wt)
+                # Blend in log space for the total scale anchor, but only when peer is useful/reliable.
+                total_anchor_log = (1.0 - peer_total_effective_weight) * total_anchor_log + peer_total_effective_weight * peer_total_anchor_log
             except Exception:
                 peer_total_anchor_log = None
                 peer_buy_anchor_log = None
@@ -1353,7 +1383,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         buy_anchor_ratio = torch.where(hist_total > eps, (hist_buy / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
         instock_anchor_ratio = torch.where(hist_total > eps, (hist_instock / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
 
-        # v27.5: peer-ratio anchor from similar ASINs. This anchors absolute child/total scale,
+        # v27.6b: active-aware + reliability-aware peer-ratio anchor from similar ASINs. This anchors absolute child/total scale,
         # while learned rank/promo residuals can still make horizon-specific adjustments.
         if peer_total_anchor_log is not None and peer_buy_anchor_log is not None and peer_instock_anchor_log is not None:
             peer_total = torch.expm1(peer_total_anchor_log).clamp(min=0.0)
@@ -1362,8 +1392,32 @@ class TCNDecoderWithCrossAttn(nn.Module):
             peer_buy_ratio = torch.where(peer_total > eps, (peer_buy / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), buy_anchor_ratio)
             peer_instock_ratio = torch.where(peer_total > eps, (peer_instock / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), instock_anchor_ratio)
             wr = max(0.0, min(1.0, self.peer_ratio_anchor_weight))
-            buy_anchor_ratio = ((1.0 - wr) * buy_anchor_ratio + wr * peer_buy_ratio).clamp(1e-4, 1.0 - 1e-4)
-            instock_anchor_ratio = ((1.0 - wr) * instock_anchor_ratio + wr * peer_instock_ratio).clamp(1e-4, 1.0 - 1e-4)
+            # Active-aware child-ratio peer weights. Strong child active/zero signal => lower peer weight.
+            buy_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 1:2].detach() - 0.5)).clamp(0.0, 1.0)
+            instock_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 2:3].detach() - 0.5)).clamp(0.0, 1.0)
+            buy_uncertainty = buy_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
+            instock_uncertainty = instock_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
+            buy_ratio_dist = torch.abs(torch.logit(buy_anchor_ratio.detach().clamp(1e-4, 1-1e-4)) - torch.logit(peer_buy_ratio.detach().clamp(1e-4, 1-1e-4)))
+            instock_ratio_dist = torch.abs(torch.logit(instock_anchor_ratio.detach().clamp(1e-4, 1-1e-4)) - torch.logit(peer_instock_ratio.detach().clamp(1e-4, 1-1e-4)))
+            buy_consistency = torch.exp(-buy_ratio_dist).clamp(0.0, 1.0)
+            instock_consistency = torch.exp(-instock_ratio_dist).clamp(0.0, 1.0)
+            buy_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * buy_consistency
+            instock_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * instock_consistency
+
+            # Peer reliability: only use peer ratio when the peer has a usable denominator and
+            # the peer child signal is not missing/degenerate. If no reliable similar peer is
+            # available, the effective peer weight becomes near zero and the anchor falls back
+            # to own history.
+            peer_total_valid = (peer_total > self.peer_min_level).to(future_context.dtype)
+            peer_buy_valid = ((peer_total > self.peer_min_level) & (peer_buy > self.peer_min_level)).to(future_context.dtype)
+            peer_instock_valid = ((peer_total > self.peer_min_level) & (peer_instock > self.peer_min_level)).to(future_context.dtype)
+            buy_reliability = peer_total_valid * peer_buy_valid * torch.exp(-buy_ratio_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
+            instock_reliability = peer_total_valid * peer_instock_valid * torch.exp(-instock_ratio_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
+
+            peer_buy_effective_weight = (wr * buy_uncertainty * buy_consistency * buy_reliability).clamp(0.0, wr)
+            peer_instock_effective_weight = (wr * instock_uncertainty * instock_consistency * instock_reliability).clamp(0.0, wr)
+            buy_anchor_ratio = ((1.0 - peer_buy_effective_weight) * buy_anchor_ratio + peer_buy_effective_weight * peer_buy_ratio).clamp(1e-4, 1.0 - 1e-4)
+            instock_anchor_ratio = ((1.0 - peer_instock_effective_weight) * instock_anchor_ratio + peer_instock_effective_weight * peer_instock_ratio).clamp(1e-4, 1.0 - 1e-4)
 
         ratio_anchor_logit = torch.logit(torch.cat([buy_anchor_ratio, instock_anchor_ratio], dim=-1).clamp(1e-4, 1.0 - 1e-4))
 
@@ -1412,6 +1466,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "peak_cross_gate": peak_cross_gate,
                 "peak_cross_out": peak_cross_out,
                 "peak_cross_attn_weights": peak_cross_attn_w,
+                "peer_total_effective_weight": peer_total_effective_weight,
+                "peer_buy_effective_weight": peer_buy_effective_weight,
+                "peer_instock_effective_weight": peer_instock_effective_weight,
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -1502,6 +1559,10 @@ class ExposureForecastModelV2(nn.Module):
                  ratio_residual_scale=0.50,
                  peer_total_anchor_weight=0.25,
                  peer_ratio_anchor_weight=0.35,
+                 peer_uncertainty_power=1.0,
+                 peer_consistency_floor=0.25,
+                 peer_min_level=1e-3,
+                 peer_reliability_tau=1.0,
                  gate_temperature=1.0):
         super().__init__()
         self.use_enn = use_enn
@@ -1531,7 +1592,7 @@ class ExposureForecastModelV2(nn.Module):
         except KeyError as e:
             print(f"Warning: anchor column not found: {e}")
 
-        # v27.5 peer-scale anchor indices: similar-ASIN scale anchors in log1p space.
+        # v27.6b active-aware + reliability-aware peer-scale anchor indices: similar-ASIN scale anchors in log1p space.
         peer_anchor_indices = None
         try:
             peer_anchor_indices = [
@@ -1539,7 +1600,7 @@ class ExposureForecastModelV2(nn.Module):
                 col_idx["graph_peer_buybox_mean13_log"],
                 col_idx["graph_peer_instock_mean13_log"],
             ]
-            print(f"Peer anchor indices (graph peer mean13): {peer_anchor_indices} | total_w={peer_total_anchor_weight} | ratio_w={peer_ratio_anchor_weight}")
+            print(f"Peer anchor indices (graph peer mean13): {peer_anchor_indices} | base_total_w={peer_total_anchor_weight} | base_ratio_w={peer_ratio_anchor_weight} | active-aware + reliability gate on")
         except KeyError as e:
             print(f"Warning: peer anchor column not found: {e}")
 
@@ -1614,6 +1675,10 @@ class ExposureForecastModelV2(nn.Module):
             peer_anchor_indices=peer_anchor_indices,
             peer_total_anchor_weight=peer_total_anchor_weight,
             peer_ratio_anchor_weight=peer_ratio_anchor_weight,
+            peer_uncertainty_power=peer_uncertainty_power,
+            peer_consistency_floor=peer_consistency_floor,
+            peer_min_level=peer_min_level,
+            peer_reliability_tau=peer_reliability_tau,
             gate_temperature=gate_temperature,
         )
 
@@ -1750,7 +1815,7 @@ def exposure_hurdle_loss(
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    # 4b) v27.5 peer-anchor ratio calibration for the hierarchical child channels.
+    # 4b) v27.6b active-aware reliable peer-anchor ratio calibration for the hierarchical child channels.
     # When total is accurate but buy_box/in_stock are systematically high, the error
     # comes from the learned child ratios. These losses keep the dynamic ratios anchored
     # without weakening the total head or zero/active discrimination.
@@ -1900,7 +1965,7 @@ def train_exposure_model_v2(
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"v27.5 peer-anchor ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | peer_total_w={getattr(model.decoder, 'peer_total_anchor_weight', float('nan')):.3f} | peer_ratio_w={getattr(model.decoder, 'peer_ratio_anchor_weight', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
+    print(f"v27.6b active-aware reliable peer-anchor ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | base_peer_total_w={getattr(model.decoder, 'peer_total_anchor_weight', float('nan')):.3f} | base_peer_ratio_w={getattr(model.decoder, 'peer_ratio_anchor_weight', float('nan')):.3f} | uncertainty_power={getattr(model.decoder, 'peer_uncertainty_power', float('nan')):.2f} | consistency_floor={getattr(model.decoder, 'peer_consistency_floor', float('nan')):.2f} | min_peer_level={getattr(model.decoder, 'peer_min_level', float('nan')):.4g} | rel_tau={getattr(model.decoder, 'peer_reliability_tau', float('nan')):.2f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
@@ -2837,7 +2902,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.4: HIER_RATIO_CAL + TOTALDIAG + SAVEHAT")
+    print("EXPOSURE MODEL V27.6b: ACTIVEAWARE RELIABLE PEERANCHOR + TOTALDIAG + SAVEHAT")
     print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
     print("=" * 100)
 
