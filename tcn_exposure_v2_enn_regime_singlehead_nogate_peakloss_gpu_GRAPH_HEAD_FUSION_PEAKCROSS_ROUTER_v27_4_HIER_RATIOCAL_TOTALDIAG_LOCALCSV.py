@@ -931,13 +931,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  router_delta_scale=0.18,
                  router_num_experts=4,
                  ratio_residual_scale=0.50,
-                 peer_anchor_indices=None,
-                 peer_total_anchor_weight=0.25,
-                 peer_ratio_anchor_weight=0.35,
-                 peer_uncertainty_power=1.0,
-                 peer_consistency_floor=0.25,
-                 peer_min_level=1e-3,
-                 peer_reliability_tau=1.0,
+                 zero_protect_enabled=True,
+                 zero_protect_threshold=0.35,
+                 zero_protect_temperature=0.10,
+                 zero_protect_min_gate=0.01,
                  use_peak_cross_attn=True,
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
@@ -959,13 +956,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.router_delta_scale = float(router_delta_scale)
         self.router_num_experts = int(router_num_experts)
         self.ratio_residual_scale = float(ratio_residual_scale)
-        self.peer_anchor_indices = peer_anchor_indices
-        self.peer_total_anchor_weight = float(peer_total_anchor_weight)
-        self.peer_ratio_anchor_weight = float(peer_ratio_anchor_weight)
-        self.peer_uncertainty_power = float(peer_uncertainty_power)
-        self.peer_consistency_floor = float(peer_consistency_floor)
-        self.peer_min_level = float(peer_min_level)
-        self.peer_reliability_tau = float(peer_reliability_tau)
+        self.zero_protect_enabled = bool(zero_protect_enabled)
+        self.zero_protect_threshold = float(zero_protect_threshold)
+        self.zero_protect_temperature = float(zero_protect_temperature)
+        self.zero_protect_min_gate = float(zero_protect_min_gate)
         self.use_peak_cross_attn = bool(use_peak_cross_attn)
         self.peak_cross_attn_scale = float(peak_cross_attn_scale)
         self.use_enn = bool(use_enn)
@@ -1328,48 +1322,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
             buy_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
             instock_anchor_log = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
 
-        # v27.6b active-aware + reliability-aware peer-scale anchor:
-        # Own historical anchors are stable but can be too low/high for sparse ASINs.
-        # Peer anchors provide the absolute scale from similar ASINs; rank/promo remains a residual signal.
-        peer_total_anchor_log = None
-        peer_buy_anchor_log = None
-        peer_instock_anchor_log = None
-        peer_total_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
-        peer_buy_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
-        peer_instock_effective_weight = torch.zeros(B, H, 1, device=future_context.device, dtype=future_context.dtype)
-        if self.peer_anchor_indices is not None:
-            try:
-                pti, pbi, pii = self.peer_anchor_indices
-                peer_total_anchor_log = future_context[:, :, pti:pti+1]
-                peer_buy_anchor_log = future_context[:, :, pbi:pbi+1]
-                peer_instock_anchor_log = future_context[:, :, pii:pii+1]
-                wt = max(0.0, min(1.0, self.peer_total_anchor_weight))
-                # Active-aware peer anchor:
-                # - If the model is confident about total active/zero (p close to 0 or 1), trust own history more.
-                # - If active signal is uncertain (p close to 0.5), use reliable peer scale as a stabilizer.
-                # - If own and peer scales disagree strongly, reduce peer trust.
-                total_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 0:1].detach() - 0.5)).clamp(0.0, 1.0)
-                total_uncertainty = total_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
-                # Reliability-aware peer anchor:
-                #   - no usable peer scale -> reliability = 0
-                #   - own/peer scale very different -> reliability smoothly decreases
-                # This prevents unreliable or non-similar peers from pulling the ASIN toward a wrong scale.
-                own_total_level_for_rel = torch.expm1(total_anchor_log.detach()).clamp(min=0.0)
-                peer_total_level_for_rel = torch.expm1(peer_total_anchor_log.detach()).clamp(min=0.0)
-                peer_total_valid = (peer_total_level_for_rel > self.peer_min_level).to(future_context.dtype)
-                total_scale_dist = torch.abs(total_anchor_log.detach() - peer_total_anchor_log.detach())
-                total_reliability = peer_total_valid * torch.exp(-total_scale_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
-
-                total_consistency = torch.exp(-total_scale_dist).clamp(0.0, 1.0)
-                total_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * total_consistency
-                peer_total_effective_weight = (wt * total_uncertainty * total_consistency * total_reliability).clamp(0.0, wt)
-                # Blend in log space for the total scale anchor, but only when peer is useful/reliable.
-                total_anchor_log = (1.0 - peer_total_effective_weight) * total_anchor_log + peer_total_effective_weight * peer_total_anchor_log
-            except Exception:
-                peer_total_anchor_log = None
-                peer_buy_anchor_log = None
-                peer_instock_anchor_log = None
-
         raw_total_log = total_anchor_log + total_residual * self.residual_scale
         raw_total_log = raw_total_log + peak_gate[:, :, 0:1] * peak_delta_log[:, :, 0:1] + router_residual_log[:, :, 0:1]
         log_total = F.softplus(raw_total_log)
@@ -1382,43 +1334,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
         hist_instock = torch.expm1(instock_anchor_log).clamp(min=0.0)
         buy_anchor_ratio = torch.where(hist_total > eps, (hist_buy / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
         instock_anchor_ratio = torch.where(hist_total > eps, (hist_instock / (hist_total + eps)).clamp(1e-4, 1.0 - 1e-4), torch.full_like(hist_total, 0.5))
-
-        # v27.6b: active-aware + reliability-aware peer-ratio anchor from similar ASINs. This anchors absolute child/total scale,
-        # while learned rank/promo residuals can still make horizon-specific adjustments.
-        if peer_total_anchor_log is not None and peer_buy_anchor_log is not None and peer_instock_anchor_log is not None:
-            peer_total = torch.expm1(peer_total_anchor_log).clamp(min=0.0)
-            peer_buy = torch.expm1(peer_buy_anchor_log).clamp(min=0.0)
-            peer_instock = torch.expm1(peer_instock_anchor_log).clamp(min=0.0)
-            peer_buy_ratio = torch.where(peer_total > eps, (peer_buy / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), buy_anchor_ratio)
-            peer_instock_ratio = torch.where(peer_total > eps, (peer_instock / (peer_total + eps)).clamp(1e-4, 1.0 - 1e-4), instock_anchor_ratio)
-            wr = max(0.0, min(1.0, self.peer_ratio_anchor_weight))
-            # Active-aware child-ratio peer weights. Strong child active/zero signal => lower peer weight.
-            buy_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 1:2].detach() - 0.5)).clamp(0.0, 1.0)
-            instock_uncertainty = (1.0 - 2.0 * torch.abs(p_active[:, :, 2:3].detach() - 0.5)).clamp(0.0, 1.0)
-            buy_uncertainty = buy_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
-            instock_uncertainty = instock_uncertainty.pow(max(self.peer_uncertainty_power, 1e-6))
-            buy_ratio_dist = torch.abs(torch.logit(buy_anchor_ratio.detach().clamp(1e-4, 1-1e-4)) - torch.logit(peer_buy_ratio.detach().clamp(1e-4, 1-1e-4)))
-            instock_ratio_dist = torch.abs(torch.logit(instock_anchor_ratio.detach().clamp(1e-4, 1-1e-4)) - torch.logit(peer_instock_ratio.detach().clamp(1e-4, 1-1e-4)))
-            buy_consistency = torch.exp(-buy_ratio_dist).clamp(0.0, 1.0)
-            instock_consistency = torch.exp(-instock_ratio_dist).clamp(0.0, 1.0)
-            buy_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * buy_consistency
-            instock_consistency = self.peer_consistency_floor + (1.0 - self.peer_consistency_floor) * instock_consistency
-
-            # Peer reliability: only use peer ratio when the peer has a usable denominator and
-            # the peer child signal is not missing/degenerate. If no reliable similar peer is
-            # available, the effective peer weight becomes near zero and the anchor falls back
-            # to own history.
-            peer_total_valid = (peer_total > self.peer_min_level).to(future_context.dtype)
-            peer_buy_valid = ((peer_total > self.peer_min_level) & (peer_buy > self.peer_min_level)).to(future_context.dtype)
-            peer_instock_valid = ((peer_total > self.peer_min_level) & (peer_instock > self.peer_min_level)).to(future_context.dtype)
-            buy_reliability = peer_total_valid * peer_buy_valid * torch.exp(-buy_ratio_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
-            instock_reliability = peer_total_valid * peer_instock_valid * torch.exp(-instock_ratio_dist / max(self.peer_reliability_tau, 1e-6)).clamp(0.0, 1.0)
-
-            peer_buy_effective_weight = (wr * buy_uncertainty * buy_consistency * buy_reliability).clamp(0.0, wr)
-            peer_instock_effective_weight = (wr * instock_uncertainty * instock_consistency * instock_reliability).clamp(0.0, wr)
-            buy_anchor_ratio = ((1.0 - peer_buy_effective_weight) * buy_anchor_ratio + peer_buy_effective_weight * peer_buy_ratio).clamp(1e-4, 1.0 - 1e-4)
-            instock_anchor_ratio = ((1.0 - peer_instock_effective_weight) * instock_anchor_ratio + peer_instock_effective_weight * peer_instock_ratio).clamp(1e-4, 1.0 - 1e-4)
-
         ratio_anchor_logit = torch.logit(torch.cat([buy_anchor_ratio, instock_anchor_ratio], dim=-1).clamp(1e-4, 1.0 - 1e-4))
 
         # Learned ASIN/horizon-specific ratio deviations.
@@ -1432,8 +1347,23 @@ class TCNDecoderWithCrossAttn(nn.Module):
         buy_ratio = ratios[:, :, 0:1]
         instock_ratio = ratios[:, :, 1:2]
 
-        buy_level = total_level * buy_ratio
-        instock_level = total_level * instock_ratio
+        # v27.7: zero-protected final gate.
+        # Goal: if the auxiliary occurrence head is very confident that a channel is zero,
+        # external graph/rank/peer residuals should not lift that channel into a non-zero exposure.
+        # This is NOT the old multiplicative active gate for all predictions: it is almost 1
+        # when p_active is moderate/high, and only suppresses clearly zero-like cases.
+        if self.zero_protect_enabled:
+            temp = max(self.zero_protect_temperature, 1e-6)
+            zg = torch.sigmoid((p_active - self.zero_protect_threshold) / temp)
+            zero_gate = self.zero_protect_min_gate + (1.0 - self.zero_protect_min_gate) * zg
+        else:
+            zero_gate = torch.ones_like(p_active)
+
+        # Preserve hierarchy after zero protection:
+        # total' = total * gate_total; children = total' * ratio * child_gate, so children <= total'.
+        total_level = total_level * zero_gate[:, :, 0:1]
+        buy_level = total_level * buy_ratio * zero_gate[:, :, 1:2]
+        instock_level = total_level * instock_ratio * zero_gate[:, :, 2:3]
         pred_level = torch.cat([total_level, buy_level, instock_level], dim=-1).clamp(min=0.0)
         log_hat = torch.log1p(pred_level)
         log_mag = log_hat
@@ -1453,6 +1383,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "pred_level": pred_level,
                 "gamma": nan_like,
                 "gate": gate,
+                "zero_gate": zero_gate,
                 "residual": residual,
                 "peak_gate": peak_gate,
                 "peak_gate_base": peak_gate_base,
@@ -1466,9 +1397,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "peak_cross_gate": peak_cross_gate,
                 "peak_cross_out": peak_cross_out,
                 "peak_cross_attn_weights": peak_cross_attn_w,
-                "peer_total_effective_weight": peer_total_effective_weight,
-                "peer_buy_effective_weight": peer_buy_effective_weight,
-                "peer_instock_effective_weight": peer_instock_effective_weight,
                 "z": z,
                 "attn_weights": attn_w,
             }
@@ -1557,12 +1485,10 @@ class ExposureForecastModelV2(nn.Module):
                  context_cols=None, use_encoder_self_attn=True,
                  use_enn=True, z_dim=8, residual_scale=2.0,
                  ratio_residual_scale=0.50,
-                 peer_total_anchor_weight=0.25,
-                 peer_ratio_anchor_weight=0.35,
-                 peer_uncertainty_power=1.0,
-                 peer_consistency_floor=0.25,
-                 peer_min_level=1e-3,
-                 peer_reliability_tau=1.0,
+                 zero_protect_enabled=True,
+                 zero_protect_threshold=0.35,
+                 zero_protect_temperature=0.10,
+                 zero_protect_min_gate=0.01,
                  gate_temperature=1.0):
         super().__init__()
         self.use_enn = use_enn
@@ -1591,18 +1517,6 @@ class ExposureForecastModelV2(nn.Module):
             print(f"Anchor indices (mean13): {anchor_indices}")
         except KeyError as e:
             print(f"Warning: anchor column not found: {e}")
-
-        # v27.6b active-aware + reliability-aware peer-scale anchor indices: similar-ASIN scale anchors in log1p space.
-        peer_anchor_indices = None
-        try:
-            peer_anchor_indices = [
-                col_idx["graph_peer_total_mean13_log"],
-                col_idx["graph_peer_buybox_mean13_log"],
-                col_idx["graph_peer_instock_mean13_log"],
-            ]
-            print(f"Peer anchor indices (graph peer mean13): {peer_anchor_indices} | base_total_w={peer_total_anchor_weight} | base_ratio_w={peer_ratio_anchor_weight} | active-aware + reliability gate on")
-        except KeyError as e:
-            print(f"Warning: peer anchor column not found: {e}")
 
         # active head专属特征索引
         active_feat_indices = []
@@ -1672,13 +1586,10 @@ class ExposureForecastModelV2(nn.Module):
             z_dim=z_dim,
             residual_scale=residual_scale,
             ratio_residual_scale=ratio_residual_scale,
-            peer_anchor_indices=peer_anchor_indices,
-            peer_total_anchor_weight=peer_total_anchor_weight,
-            peer_ratio_anchor_weight=peer_ratio_anchor_weight,
-            peer_uncertainty_power=peer_uncertainty_power,
-            peer_consistency_floor=peer_consistency_floor,
-            peer_min_level=peer_min_level,
-            peer_reliability_tau=peer_reliability_tau,
+            zero_protect_enabled=zero_protect_enabled,
+            zero_protect_threshold=zero_protect_threshold,
+            zero_protect_temperature=zero_protect_temperature,
+            zero_protect_min_gate=zero_protect_min_gate,
             gate_temperature=gate_temperature,
         )
 
@@ -1815,7 +1726,7 @@ def exposure_hurdle_loss(
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    # 4b) v27.6b active-aware reliable peer-anchor ratio calibration for the hierarchical child channels.
+    # 4b) v27.4 ratio calibration for the hierarchical child channels.
     # When total is accurate but buy_box/in_stock are systematically high, the error
     # comes from the learned child ratios. These losses keep the dynamic ratios anchored
     # without weakening the total head or zero/active discrimination.
@@ -1965,7 +1876,7 @@ def train_exposure_model_v2(
     device = get_device(device)
     model = model.to(device)
     print(f"Training on device: {device}")
-    print(f"v27.6b active-aware reliable peer-anchor ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | base_peer_total_w={getattr(model.decoder, 'peer_total_anchor_weight', float('nan')):.3f} | base_peer_ratio_w={getattr(model.decoder, 'peer_ratio_anchor_weight', float('nan')):.3f} | uncertainty_power={getattr(model.decoder, 'peer_uncertainty_power', float('nan')):.2f} | consistency_floor={getattr(model.decoder, 'peer_consistency_floor', float('nan')):.2f} | min_peer_level={getattr(model.decoder, 'peer_min_level', float('nan')):.4g} | rel_tau={getattr(model.decoder, 'peer_reliability_tau', float('nan')):.2f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
+    print(f"v27.4 ratio calibration | ratio_residual_scale={getattr(model.decoder, 'ratio_residual_scale', float('nan')):.3f} | ratio_mean_weight={ratio_mean_weight} | active_mean_weight={active_mean_weight}")
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
@@ -2094,7 +2005,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             b = batch_to_device(b, device)
             # MC inference over ENN z. Median is more robust than mean for exposure hats,
             # because mean can be pulled up by high-regime samples.
-            preds, pacts, gates, rank_gates, rank_gate_deltas = [], [], [], [], []
+            preds, pacts, gates, zero_gates, rank_gates, rank_gate_deltas = [], [], [], [], [], []
             last_aux = None
             K = max(int(mc_samples), 1)
             for _ in range(K):
@@ -2103,12 +2014,14 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 preds.append(torch.expm1(aux["log_hat"]).clamp(min=0.0))
                 pacts.append(aux["p_active"])
                 gates.append(aux.get("gate", torch.full_like(aux["p_active"], float("nan"))))
+                zero_gates.append(aux.get("zero_gate", torch.full_like(aux["p_active"], float("nan"))))
                 rank_gates.append(aux.get("rank_gate", torch.full_like(aux["p_active"], float("nan"))))
                 rank_gate_deltas.append(aux.get("rank_gate_delta", torch.full_like(aux["p_active"], float("nan"))))
 
             pred_stack = torch.stack(preds, dim=0)   # [K,B,H,3]
             pact_stack = torch.stack(pacts, dim=0)
             gate_stack = torch.stack(gates, dim=0)
+            zero_gate_stack = torch.stack(zero_gates, dim=0)
             rank_gate_stack = torch.stack(rank_gates, dim=0)
             rank_gate_delta_stack = torch.stack(rank_gate_deltas, dim=0)
 
@@ -2121,12 +2034,14 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 pred_t = pred_stack.mean(dim=0)
                 pact_t = pact_stack.mean(dim=0)
                 gate_t = gate_stack.mean(dim=0)
+                zero_gate_t = zero_gate_stack.mean(dim=0)
                 rank_gate_t = rank_gate_stack.mean(dim=0)
                 rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
             else:
                 pred_t = pred_stack.median(dim=0).values
                 pact_t = pact_stack.mean(dim=0)
                 gate_t = gate_stack.median(dim=0).values
+                zero_gate_t = zero_gate_stack.median(dim=0).values
                 rank_gate_t = rank_gate_stack.mean(dim=0)
                 rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
 
@@ -2137,6 +2052,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             pact = pact_t.cpu().numpy()
             gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
             gate_np = gate_t.cpu().numpy()
+            zero_gate_np = zero_gate_t.cpu().numpy()
             rank_gate_np = rank_gate_t.cpu().numpy()
             rank_gate_delta_np = rank_gate_delta_t.cpu().numpy()
 
@@ -2196,6 +2112,9 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                         "gate_total":        gate_np[i, h, 0],
                         "gate_buy_box":      gate_np[i, h, 1],
                         "gate_instock":      gate_np[i, h, 2],
+                        "zero_gate_total":   zero_gate_np[i, h, 0],
+                        "zero_gate_buy_box": zero_gate_np[i, h, 1],
+                        "zero_gate_instock": zero_gate_np[i, h, 2],
                         "rank_gate_total":        rank_gate_np[i, h, 0],
                         "rank_gate_buy_box":      rank_gate_np[i, h, 1],
                         "rank_gate_instock":      rank_gate_np[i, h, 2],
@@ -2428,6 +2347,64 @@ def diagnose_total_base(pred_df):
 
     return {"total_summary": total_summary, "total_by_horizon": by_h_total, "child_ratio": ratio_diag}
 
+
+def diagnose_zero_protection(pred_df, threshold=1.0):
+    """Threshold-based zero/active diagnostic for final exposure predictions.
+
+    This directly answers: among true-zero rows, how often did the model lift the
+    channel above a practical non-zero threshold? We print both pred-threshold and
+    p_active-threshold diagnostics.
+    """
+    print("\n" + "=" * 100)
+    print("ZERO-PROTECTION DIAGNOSTIC")
+    print("=" * 100)
+    rows = []
+    specs = [
+        ("total", "true_total_dph", "pred_total_dph", "p_active_total", "zero_gate_total"),
+        ("buy_box", "true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box", "zero_gate_buy_box"),
+        ("in_stock", "true_instock_dph", "pred_instock_dph", "p_active_instock", "zero_gate_instock"),
+    ]
+    for name, ycol, pcol, pacol, zgcol in specs:
+        if ycol not in pred_df.columns or pcol not in pred_df.columns:
+            continue
+        y = pd.to_numeric(pred_df[ycol], errors="coerce").fillna(0.0).values.astype(float)
+        p = pd.to_numeric(pred_df[pcol], errors="coerce").fillna(0.0).values.astype(float)
+        pa = pd.to_numeric(pred_df[pacol], errors="coerce").fillna(np.nan).values.astype(float) if pacol in pred_df.columns else np.full_like(p, np.nan)
+        zg = pd.to_numeric(pred_df[zgcol], errors="coerce").fillna(np.nan).values.astype(float) if zgcol in pred_df.columns else np.full_like(p, np.nan)
+        active = y > 0
+        pred_active = p > threshold
+        tp = int(np.sum(pred_active & active))
+        fp = int(np.sum(pred_active & (~active)))
+        fn = int(np.sum((~pred_active) & active))
+        tn = int(np.sum((~pred_active) & (~active)))
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        zero_recall = tn / max(tn + fp, 1)  # true zero kept zero
+        false_active_rate_on_zero = fp / max(np.sum(~active), 1)
+        rows.append({
+            "target": name,
+            "threshold_pred_gt": threshold,
+            "true_zero_rate": float(np.mean(~active)),
+            "pred_active_rate": float(np.mean(pred_active)),
+            "active_precision": precision,
+            "active_recall": recall,
+            "active_f1": f1,
+            "zero_recall": zero_recall,
+            "false_active_rate_on_zero": false_active_rate_on_zero,
+            "zero_pred_mean": float(np.mean(p[~active])) if np.any(~active) else np.nan,
+            "zero_pred_p90": float(np.quantile(p[~active], 0.90)) if np.any(~active) else np.nan,
+            "active_only_ratio": float(np.mean(p[active]) / (np.mean(y[active]) + 1e-8)) if np.any(active) else np.nan,
+            "p_active_zero_mean": float(np.nanmean(pa[~active])) if np.any(~active) else np.nan,
+            "p_active_active_mean": float(np.nanmean(pa[active])) if np.any(active) else np.nan,
+            "zero_gate_zero_mean": float(np.nanmean(zg[~active])) if np.any(~active) else np.nan,
+            "zero_gate_active_mean": float(np.nanmean(zg[active])) if np.any(active) else np.nan,
+        })
+    out = pd.DataFrame(rows)
+    if len(out):
+        print(out.round(4).to_string(index=False))
+    return out
+
 def print_exposure_diagnostics(pred_df):
     """
     Clean exposure diagnostics.
@@ -2451,6 +2428,7 @@ def print_exposure_diagnostics(pred_df):
     print(model_tbl.round(5).to_string(index=False))
 
     total_base_diagnostics = diagnose_total_base(pred_df)
+    zero_protection_diagnostics = diagnose_zero_protection(pred_df, threshold=1.0)
 
     print("\n" + "=" * 100)
     print("BY HORIZON: IN_STOCK_DPH")
@@ -2896,14 +2874,18 @@ def run_exposure_v2(
     peak_topk=3,
     peak_quantile=0.80,
     ratio_residual_scale=0.50,
+    zero_protect_enabled=True,
+    zero_protect_threshold=0.35,
+    zero_protect_temperature=0.10,
+    zero_protect_min_gate=0.01,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.6b: ACTIVEAWARE RELIABLE PEERANCHOR + TOTALDIAG + SAVEHAT")
-    print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
+    print("EXPOSURE MODEL V27.7: ZERO_PROTECTED_HIER + TOTALDIAG + SAVEHAT")
+    print("Preset: v27.4 fixed + zero-protected final gate for certain-zero samples")
     print("=" * 100)
 
     df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -2933,6 +2915,10 @@ def run_exposure_v2(
         dropout=dropout,
         context_cols=context_cols,
         ratio_residual_scale=ratio_residual_scale,
+        zero_protect_enabled=zero_protect_enabled,
+        zero_protect_threshold=zero_protect_threshold,
+        zero_protect_temperature=zero_protect_temperature,
+        zero_protect_min_gate=zero_protect_min_gate,
         use_encoder_self_attn=use_encoder_self_attn,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
@@ -3258,6 +3244,10 @@ def _train_one_exposure_window(
     peak_topk=3,
     peak_quantile=0.80,
     ratio_residual_scale=0.50,
+    zero_protect_enabled=True,
+    zero_protect_threshold=0.35,
+    zero_protect_temperature=0.10,
+    zero_protect_min_gate=0.01,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,
@@ -3301,6 +3291,10 @@ def _train_one_exposure_window(
         dropout=dropout,
         context_cols=context_cols,
         ratio_residual_scale=ratio_residual_scale,
+        zero_protect_enabled=zero_protect_enabled,
+        zero_protect_threshold=zero_protect_threshold,
+        zero_protect_temperature=zero_protect_temperature,
+        zero_protect_min_gate=zero_protect_min_gate,
         use_encoder_self_attn=use_encoder_self_attn,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
@@ -3391,6 +3385,10 @@ def run_exposure_v2(
     peak_topk=3,
     peak_quantile=0.80,
     ratio_residual_scale=0.50,
+    zero_protect_enabled=True,
+    zero_protect_threshold=0.35,
+    zero_protect_temperature=0.10,
+    zero_protect_min_gate=0.01,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,
@@ -3445,6 +3443,10 @@ def run_exposure_v2(
         peak_topk=peak_topk,
         peak_quantile=peak_quantile,
         ratio_residual_scale=ratio_residual_scale,
+        zero_protect_enabled=zero_protect_enabled,
+        zero_protect_threshold=zero_protect_threshold,
+        zero_protect_temperature=zero_protect_temperature,
+        zero_protect_min_gate=zero_protect_min_gate,
         ratio_mean_weight=ratio_mean_weight,
         active_mean_weight=active_mean_weight,
         dropout=dropout,
@@ -4059,6 +4061,10 @@ def run_exposure_v2_final_scot_5000(
     exposure_hat_scale=1.0,
     exposure_hat_blend_q70_weight=0.30,
     ratio_residual_scale=0.50,
+    zero_protect_enabled=True,
+    zero_protect_threshold=0.35,
+    zero_protect_temperature=0.10,
+    zero_protect_min_gate=0.01,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
 ):
@@ -4084,6 +4090,10 @@ def run_exposure_v2_final_scot_5000(
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
         ratio_residual_scale=ratio_residual_scale,
+        zero_protect_enabled=zero_protect_enabled,
+        zero_protect_threshold=zero_protect_threshold,
+        zero_protect_temperature=zero_protect_temperature,
+        zero_protect_min_gate=zero_protect_min_gate,
         ratio_mean_weight=ratio_mean_weight,
         active_mean_weight=active_mean_weight,
     )
