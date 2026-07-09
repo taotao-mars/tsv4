@@ -2084,6 +2084,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             # MC inference over ENN z. Median is more robust than mean for exposure hats,
             # because mean can be pulled up by high-regime samples.
             preds, pacts, gates, zero_gates, rank_gates, rank_gate_deltas = [], [], [], [], [], []
+            decoder_zero_factors, decoder_zero_suppresses = [], []
             last_aux = None
             K = max(int(mc_samples), 1)
             for _ in range(K):
@@ -2095,6 +2096,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 zero_gates.append(aux.get("zero_gate", torch.full_like(aux["p_active"], float("nan"))))
                 rank_gates.append(aux.get("rank_gate", torch.full_like(aux["p_active"], float("nan"))))
                 rank_gate_deltas.append(aux.get("rank_gate_delta", torch.full_like(aux["p_active"], float("nan"))))
+                decoder_zero_factors.append(aux.get("decoder_zero_factor", torch.ones_like(aux["p_active"])))
+                decoder_zero_suppresses.append(aux.get("decoder_zero_suppress", torch.zeros_like(aux["p_active"])))
 
             pred_stack = torch.stack(preds, dim=0)   # [K,B,H,3]
             pact_stack = torch.stack(pacts, dim=0)
@@ -2102,6 +2105,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             zero_gate_stack = torch.stack(zero_gates, dim=0)
             rank_gate_stack = torch.stack(rank_gates, dim=0)
             rank_gate_delta_stack = torch.stack(rank_gate_deltas, dim=0)
+            decoder_zero_factor_stack = torch.stack(decoder_zero_factors, dim=0)
+            decoder_zero_suppress_stack = torch.stack(decoder_zero_suppresses, dim=0)
 
             # Keep MC quantiles so we can inspect whether exposure hats also need an upper shift.
             pred_q50_t = torch.quantile(pred_stack, 0.50, dim=0)
@@ -2115,6 +2120,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 zero_gate_t = zero_gate_stack.mean(dim=0)
                 rank_gate_t = rank_gate_stack.mean(dim=0)
                 rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
+                decoder_zero_factor_t = decoder_zero_factor_stack.mean(dim=0)
+                decoder_zero_suppress_t = decoder_zero_suppress_stack.mean(dim=0)
             else:
                 pred_t = pred_stack.median(dim=0).values
                 pact_t = pact_stack.mean(dim=0)
@@ -2122,6 +2129,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                 zero_gate_t = zero_gate_stack.median(dim=0).values
                 rank_gate_t = rank_gate_stack.mean(dim=0)
                 rank_gate_delta_t = rank_gate_delta_stack.mean(dim=0)
+                decoder_zero_factor_t = decoder_zero_factor_stack.median(dim=0).values
+                decoder_zero_suppress_t = decoder_zero_suppress_stack.mean(dim=0)
 
             pred = pred_t.cpu().numpy()
             pred_q50 = pred_q50_t.cpu().numpy()
@@ -2133,6 +2142,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
             zero_gate_np = zero_gate_t.cpu().numpy()
             rank_gate_np = rank_gate_t.cpu().numpy()
             rank_gate_delta_np = rank_gate_delta_t.cpu().numpy()
+            decoder_zero_factor_np = decoder_zero_factor_t.cpu().numpy()
+            decoder_zero_suppress_np = decoder_zero_suppress_t.cpu().numpy()
 
             if apply_funnel_constraint:
                 for arr in [pred, pred_q50, pred_q70, pred_q90]:
