@@ -1058,7 +1058,11 @@ class TCNDecoderWithCrossAttn(nn.Module):
             self.graph_proj = None
             self.graph_norm = None
 
-        # v27.8 decoder-side zero attention / zero context suppressor.
+        # Shared head input extras. Must be defined before decoder-side zero attention.
+        z_extra = d_model if self.use_enn else 0
+        graph_extra = d_model if self.graph_feat_dim > 0 else 0
+
+        # v27.8b decoder-side zero attention / zero context suppressor.
         # This branch explicitly retrieves historical zero-regime context from encoder outputs.
         # It is active-protected: if p_active / peak evidence is strong, suppression is near zero.
         # It is also zero-start / conservative, so the model begins close to v27.7 and learns only if useful.
@@ -1080,8 +1084,6 @@ class TCNDecoderWithCrossAttn(nn.Module):
             self.decoder_zero_suppress_head = None
 
         # Auxiliary occurrence head. With ENN, z controls the 20-week active/zero regime.
-        z_extra = d_model if self.use_enn else 0
-        graph_extra = d_model if self.graph_feat_dim > 0 else 0
         active_in = d_model + z_extra + graph_extra + max(active_feat_dim, 0)
         self.active_head = nn.Sequential(
             nn.Linear(active_in, hidden),
