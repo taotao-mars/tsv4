@@ -1,5 +1,5 @@
 # ============================================================
-# TCN Exposure Model V2 - v27.1 rank-gate + lift diagnostics
+# TCN Exposure Model V2 - v27.8 decoder zero-attention active-protected
 # v27.3 Hierarchical exposure update + category_code static features:
 #   - start from v27.1 RankGate
 #   - predict total_dph first
@@ -935,6 +935,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  zero_protect_threshold=0.35,
                  zero_protect_temperature=0.10,
                  zero_protect_min_gate=0.01,
+                 use_decoder_zero_attn=True,
+                 decoder_zero_attn_scale=0.35,
+                 decoder_zero_attn_min_factor=0.60,
                  use_peak_cross_attn=True,
                  peak_cross_attn_scale=0.05,
                  use_enn=True,
@@ -960,6 +963,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
         self.zero_protect_threshold = float(zero_protect_threshold)
         self.zero_protect_temperature = float(zero_protect_temperature)
         self.zero_protect_min_gate = float(zero_protect_min_gate)
+        self.use_decoder_zero_attn = bool(use_decoder_zero_attn)
+        self.decoder_zero_attn_scale = float(decoder_zero_attn_scale)
+        self.decoder_zero_attn_min_factor = float(decoder_zero_attn_min_factor)
         self.use_peak_cross_attn = bool(use_peak_cross_attn)
         self.peak_cross_attn_scale = float(peak_cross_attn_scale)
         self.use_enn = bool(use_enn)
@@ -1051,6 +1057,27 @@ class TCNDecoderWithCrossAttn(nn.Module):
         else:
             self.graph_proj = None
             self.graph_norm = None
+
+        # v27.8 decoder-side zero attention / zero context suppressor.
+        # This branch explicitly retrieves historical zero-regime context from encoder outputs.
+        # It is active-protected: if p_active / peak evidence is strong, suppression is near zero.
+        # It is also zero-start / conservative, so the model begins close to v27.7 and learns only if useful.
+        zero_ctx_extra = 3 * d_model
+        zero_in_dim = d_model + zero_ctx_extra + z_extra + graph_extra + max(active_feat_dim, 0) + max(peak_feat_dim, 0)
+        if self.use_decoder_zero_attn:
+            self.decoder_zero_suppress_head = nn.Sequential(
+                nn.Linear(zero_in_dim, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, 3),
+            )
+            nn.init.zeros_(self.decoder_zero_suppress_head[-1].weight)
+            nn.init.constant_(self.decoder_zero_suppress_head[-1].bias, -2.0)
+        else:
+            self.decoder_zero_suppress_head = None
 
         # Auxiliary occurrence head. With ENN, z controls the 20-week active/zero regime.
         z_extra = d_model if self.use_enn else 0
@@ -1161,7 +1188,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
             with torch.no_grad():
                 self.router_gate_head[-1].bias[1] = 1.0
 
-    def forward(self, enc_out, future_context, return_aux=False, z=None):
+    def forward(self, enc_out, future_context, return_aux=False, z=None, x_raw=None):
         B, H, _ = future_context.shape
 
         h_idx = torch.arange(H, device=future_context.device).float()
@@ -1204,6 +1231,20 @@ class TCNDecoderWithCrossAttn(nn.Module):
         else:
             z = None
             z_rep = None
+
+        # v27.8: build decoder-side historical zero context from raw history.
+        # x_raw indices follow ExposureAwareEncoderSelfAttention: 2=total, 3=buy_box, 4=in_stock log1p DPH.
+        # zero_ctx_flat is a channel-wise attention pooling of encoder states over historical zero weeks.
+        zero_ctx_flat = None
+        hist_zero_rate_h = None
+        if self.use_decoder_zero_attn and x_raw is not None and x_raw.shape[-1] >= 5:
+            hist_logs = x_raw[:, :, [2, 3, 4]]
+            hist_zero = (hist_logs <= 1e-6).float()              # [B,T,3]
+            hist_zero_rate = hist_zero.mean(dim=1)              # [B,3]
+            zero_w = hist_zero / (hist_zero.sum(dim=1, keepdim=True) + 1e-6)
+            zero_ctx = torch.einsum("btc,btd->bcd", zero_w, enc_out)  # [B,3,D]
+            zero_ctx_flat = zero_ctx.reshape(B, 1, -1).expand(B, H, -1)
+            hist_zero_rate_h = hist_zero_rate[:, None, :].expand(B, H, -1)
 
         # v26 decoder-side peak cross-attention residual.
         # Q = horizon decoder state + known future peak features + graph context + ENN z scenario.
@@ -1347,7 +1388,32 @@ class TCNDecoderWithCrossAttn(nn.Module):
         buy_ratio = ratios[:, :, 0:1]
         instock_ratio = ratios[:, :, 1:2]
 
-        # v27.7: zero-protected final gate.
+        # v27.8: decoder-side zero-attention suppressor.
+        # It uses historical zero context retrieved from encoder states, but is active-protected:
+        # high p_active or peak evidence prevents zero attention from creating underforecast.
+        decoder_zero_factor = torch.ones_like(p_active)
+        decoder_zero_suppress = torch.zeros_like(p_active)
+        if self.use_decoder_zero_attn and self.decoder_zero_suppress_head is not None and zero_ctx_flat is not None:
+            zero_parts = [z_out, zero_ctx_flat]
+            if z_rep is not None:
+                zero_parts.append(z_rep)
+            if graph_emb is not None:
+                zero_parts.append(graph_emb)
+            if active_feats is not None:
+                zero_parts.append(active_feats)
+            if peak_feats is not None:
+                zero_parts.append(peak_feats)
+            zero_in = torch.cat(zero_parts, dim=-1)
+            zero_raw = torch.sigmoid(self.decoder_zero_suppress_head(zero_in))
+            # Active evidence protects true-active horizons from being suppressed.
+            active_evidence = torch.maximum(p_active, peak_gate.detach())
+            if hist_zero_rate_h is None:
+                hist_zero_rate_h = torch.zeros_like(p_active)
+            decoder_zero_suppress = zero_raw * hist_zero_rate_h * (1.0 - active_evidence).clamp(0.0, 1.0)
+            decoder_zero_factor = 1.0 - self.decoder_zero_attn_scale * decoder_zero_suppress
+            decoder_zero_factor = decoder_zero_factor.clamp(min=self.decoder_zero_attn_min_factor, max=1.0)
+
+        # v27.7/v27.8: zero-protected final gate.
         # Goal: if the auxiliary occurrence head is very confident that a channel is zero,
         # external graph/rank/peer residuals should not lift that channel into a non-zero exposure.
         # This is NOT the old multiplicative active gate for all predictions: it is almost 1
@@ -1358,6 +1424,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
             zero_gate = self.zero_protect_min_gate + (1.0 - self.zero_protect_min_gate) * zg
         else:
             zero_gate = torch.ones_like(p_active)
+        zero_gate = zero_gate * decoder_zero_factor
 
         # Preserve hierarchy after zero protection:
         # total' = total * gate_total; children = total' * ratio * child_gate, so children <= total'.
@@ -1384,6 +1451,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "gamma": nan_like,
                 "gate": gate,
                 "zero_gate": zero_gate,
+                "decoder_zero_factor": decoder_zero_factor,
+                "decoder_zero_suppress": decoder_zero_suppress,
+                "hist_zero_rate_h": hist_zero_rate_h if hist_zero_rate_h is not None else torch.zeros_like(p_active),
                 "residual": residual,
                 "peak_gate": peak_gate,
                 "peak_gate_base": peak_gate_base,
@@ -1489,6 +1559,9 @@ class ExposureForecastModelV2(nn.Module):
                  zero_protect_threshold=0.35,
                  zero_protect_temperature=0.10,
                  zero_protect_min_gate=0.01,
+                 use_decoder_zero_attn=True,
+                 decoder_zero_attn_scale=0.35,
+                 decoder_zero_attn_min_factor=0.60,
                  gate_temperature=1.0):
         super().__init__()
         self.use_enn = use_enn
@@ -1590,12 +1663,15 @@ class ExposureForecastModelV2(nn.Module):
             zero_protect_threshold=zero_protect_threshold,
             zero_protect_temperature=zero_protect_temperature,
             zero_protect_min_gate=zero_protect_min_gate,
+            use_decoder_zero_attn=use_decoder_zero_attn,
+            decoder_zero_attn_scale=decoder_zero_attn_scale,
+            decoder_zero_attn_min_factor=decoder_zero_attn_min_factor,
             gate_temperature=gate_temperature,
         )
 
     def forward(self, x, future_context, return_aux=False, z=None):
         enc_out = self.encoder(x)
-        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
+        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z, x_raw=x)
 
 
 # ============================================================
@@ -2115,6 +2191,12 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None,
                         "zero_gate_total":   zero_gate_np[i, h, 0],
                         "zero_gate_buy_box": zero_gate_np[i, h, 1],
                         "zero_gate_instock": zero_gate_np[i, h, 2],
+                        "decoder_zero_factor_total":   decoder_zero_factor_np[i, h, 0],
+                        "decoder_zero_factor_buy_box": decoder_zero_factor_np[i, h, 1],
+                        "decoder_zero_factor_instock": decoder_zero_factor_np[i, h, 2],
+                        "decoder_zero_suppress_total":   decoder_zero_suppress_np[i, h, 0],
+                        "decoder_zero_suppress_buy_box": decoder_zero_suppress_np[i, h, 1],
+                        "decoder_zero_suppress_instock": decoder_zero_suppress_np[i, h, 2],
                         "rank_gate_total":        rank_gate_np[i, h, 0],
                         "rank_gate_buy_box":      rank_gate_np[i, h, 1],
                         "rank_gate_instock":      rank_gate_np[i, h, 2],
@@ -2360,17 +2442,19 @@ def diagnose_zero_protection(pred_df, threshold=1.0):
     print("=" * 100)
     rows = []
     specs = [
-        ("total", "true_total_dph", "pred_total_dph", "p_active_total", "zero_gate_total"),
-        ("buy_box", "true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box", "zero_gate_buy_box"),
-        ("in_stock", "true_instock_dph", "pred_instock_dph", "p_active_instock", "zero_gate_instock"),
+        ("total", "true_total_dph", "pred_total_dph", "p_active_total", "zero_gate_total", "decoder_zero_factor_total", "decoder_zero_suppress_total"),
+        ("buy_box", "true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box", "zero_gate_buy_box", "decoder_zero_factor_buy_box", "decoder_zero_suppress_buy_box"),
+        ("in_stock", "true_instock_dph", "pred_instock_dph", "p_active_instock", "zero_gate_instock", "decoder_zero_factor_instock", "decoder_zero_suppress_instock"),
     ]
-    for name, ycol, pcol, pacol, zgcol in specs:
+    for name, ycol, pcol, pacol, zgcol, dzfcol, dzscol in specs:
         if ycol not in pred_df.columns or pcol not in pred_df.columns:
             continue
         y = pd.to_numeric(pred_df[ycol], errors="coerce").fillna(0.0).values.astype(float)
         p = pd.to_numeric(pred_df[pcol], errors="coerce").fillna(0.0).values.astype(float)
         pa = pd.to_numeric(pred_df[pacol], errors="coerce").fillna(np.nan).values.astype(float) if pacol in pred_df.columns else np.full_like(p, np.nan)
         zg = pd.to_numeric(pred_df[zgcol], errors="coerce").fillna(np.nan).values.astype(float) if zgcol in pred_df.columns else np.full_like(p, np.nan)
+        dzf = pd.to_numeric(pred_df[dzfcol], errors="coerce").fillna(np.nan).values.astype(float) if dzfcol in pred_df.columns else np.full_like(p, np.nan)
+        dzs = pd.to_numeric(pred_df[dzscol], errors="coerce").fillna(np.nan).values.astype(float) if dzscol in pred_df.columns else np.full_like(p, np.nan)
         active = y > 0
         pred_active = p > threshold
         tp = int(np.sum(pred_active & active))
@@ -2399,6 +2483,10 @@ def diagnose_zero_protection(pred_df, threshold=1.0):
             "p_active_active_mean": float(np.nanmean(pa[active])) if np.any(active) else np.nan,
             "zero_gate_zero_mean": float(np.nanmean(zg[~active])) if np.any(~active) else np.nan,
             "zero_gate_active_mean": float(np.nanmean(zg[active])) if np.any(active) else np.nan,
+            "decoder_zero_factor_zero_mean": float(np.nanmean(dzf[~active])) if np.any(~active) else np.nan,
+            "decoder_zero_factor_active_mean": float(np.nanmean(dzf[active])) if np.any(active) else np.nan,
+            "decoder_zero_suppress_zero_mean": float(np.nanmean(dzs[~active])) if np.any(~active) else np.nan,
+            "decoder_zero_suppress_active_mean": float(np.nanmean(dzs[active])) if np.any(active) else np.nan,
         })
     out = pd.DataFrame(rows)
     if len(out):
@@ -2878,14 +2966,17 @@ def run_exposure_v2(
     zero_protect_threshold=0.35,
     zero_protect_temperature=0.10,
     zero_protect_min_gate=0.01,
+    use_decoder_zero_attn=True,
+    decoder_zero_attn_scale=0.35,
+    decoder_zero_attn_min_factor=0.60,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.7: ZERO_PROTECTED_HIER + TOTALDIAG + SAVEHAT")
-    print("Preset: v27.4 fixed + zero-protected final gate for certain-zero samples")
+    print("EXPOSURE MODEL V27.8: DECODER_ZERO_ATTN_ACTIVEPROTECTED + TOTALDIAG + SAVEHAT")
+    print("Preset: v27.7 zero gate + decoder-side zero-attention, active-protected")
     print("=" * 100)
 
     df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -2919,6 +3010,9 @@ def run_exposure_v2(
         zero_protect_threshold=zero_protect_threshold,
         zero_protect_temperature=zero_protect_temperature,
         zero_protect_min_gate=zero_protect_min_gate,
+        use_decoder_zero_attn=use_decoder_zero_attn,
+        decoder_zero_attn_scale=decoder_zero_attn_scale,
+        decoder_zero_attn_min_factor=decoder_zero_attn_min_factor,
         use_encoder_self_attn=use_encoder_self_attn,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
@@ -3248,6 +3342,9 @@ def _train_one_exposure_window(
     zero_protect_threshold=0.35,
     zero_protect_temperature=0.10,
     zero_protect_min_gate=0.01,
+    use_decoder_zero_attn=True,
+    decoder_zero_attn_scale=0.35,
+    decoder_zero_attn_min_factor=0.60,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,
@@ -3295,6 +3392,9 @@ def _train_one_exposure_window(
         zero_protect_threshold=zero_protect_threshold,
         zero_protect_temperature=zero_protect_temperature,
         zero_protect_min_gate=zero_protect_min_gate,
+        use_decoder_zero_attn=use_decoder_zero_attn,
+        decoder_zero_attn_scale=decoder_zero_attn_scale,
+        decoder_zero_attn_min_factor=decoder_zero_attn_min_factor,
         use_encoder_self_attn=use_encoder_self_attn,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
@@ -3389,6 +3489,9 @@ def run_exposure_v2(
     zero_protect_threshold=0.35,
     zero_protect_temperature=0.10,
     zero_protect_min_gate=0.01,
+    use_decoder_zero_attn=True,
+    decoder_zero_attn_scale=0.35,
+    decoder_zero_attn_min_factor=0.60,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
     dropout=0.20,
@@ -3397,7 +3500,7 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V27.4: HIER + ratio shrink/calibration + TOTALDIAG + LOCAL CSV")
+    print("EXPOSURE MODEL V27.8: DECODER_ZERO_ATTN_ACTIVEPROTECTED + TOTALDIAG + LOCAL CSV")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -3447,6 +3550,9 @@ def run_exposure_v2(
         zero_protect_threshold=zero_protect_threshold,
         zero_protect_temperature=zero_protect_temperature,
         zero_protect_min_gate=zero_protect_min_gate,
+        use_decoder_zero_attn=use_decoder_zero_attn,
+        decoder_zero_attn_scale=decoder_zero_attn_scale,
+        decoder_zero_attn_min_factor=decoder_zero_attn_min_factor,
         ratio_mean_weight=ratio_mean_weight,
         active_mean_weight=active_mean_weight,
         dropout=dropout,
@@ -4065,6 +4171,9 @@ def run_exposure_v2_final_scot_5000(
     zero_protect_threshold=0.35,
     zero_protect_temperature=0.10,
     zero_protect_min_gate=0.01,
+    use_decoder_zero_attn=True,
+    decoder_zero_attn_scale=0.35,
+    decoder_zero_attn_min_factor=0.60,
     ratio_mean_weight=0.05,
     active_mean_weight=0.03,
 ):
@@ -4094,6 +4203,9 @@ def run_exposure_v2_final_scot_5000(
         zero_protect_threshold=zero_protect_threshold,
         zero_protect_temperature=zero_protect_temperature,
         zero_protect_min_gate=zero_protect_min_gate,
+        use_decoder_zero_attn=use_decoder_zero_attn,
+        decoder_zero_attn_scale=decoder_zero_attn_scale,
+        decoder_zero_attn_min_factor=decoder_zero_attn_min_factor,
         ratio_mean_weight=ratio_mean_weight,
         active_mean_weight=active_mean_weight,
     )
